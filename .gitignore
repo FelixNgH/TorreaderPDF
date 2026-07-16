@@ -1,0 +1,25 @@
+# Build output (anchored to repo root — do NOT use bare "bin/", it would also
+# match third_party/pdfium/bin/ which must stay tracked)
+/build/
+/build-*/
+
+# Rust (formibpdf)
+src/formibpdf/target/
+Cargo.lock
+
+# CMake / IDE
+CMakeCache.txt
+CMakeFiles/
+.vs/
+.vscode/
+*.user
+compile_commands.json
+
+# Packaging output
+*.zip
+*.AppImage
+TR_AppDir/
+
+# OS junk
+.DS_Store
+Thumbs.db

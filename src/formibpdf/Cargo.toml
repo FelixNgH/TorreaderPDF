@@ -1,0 +1,19 @@
+[package]
+name = "formibpdf"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+rayon   = "1.10"
+flate2  = "1.1"
+fontdue = "0.9"
+image   = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+lcms2   = "6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
