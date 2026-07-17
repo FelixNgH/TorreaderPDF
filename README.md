@@ -40,7 +40,6 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 - **Sign PDF** — digital signature, PKCS#7 detached, SHA-256, using your own `.pfx`/`.p12` certificate
 - **Translate PDF (free)** — Ctrl+drag over text to translate it in place, cached locally
 - **Delete / Reorder pages**, reorder bookmarks
-- **Annotations** — sticky notes, highlight, underline, strikethrough, shapes, freehand, stamp
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
 - **Safe save model** — edits (insert/delete/reorder/merge) apply to an in-memory working copy first; your original file is only overwritten when you press **Ctrl+S**
 
