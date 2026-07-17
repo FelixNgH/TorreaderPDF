@@ -1,11 +1,29 @@
 # TorReader PDF
 
-Free, portable PDF reader and editor for **Windows** and **Linux**. Open
+[![Release](https://img.shields.io/github/v/release/FelixNgH/TorreaderPDF)](https://github.com/FelixNgH/TorreaderPDF/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/FelixNgH/TorreaderPDF/total)](https://github.com/FelixNgH/TorreaderPDF/releases)
+[![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
+
+Portable PDF reader and editor for **Windows** and **Linux**. Open
 200MB files in seconds, merge/split while keeping bookmarks intact, insert
 pages Adobe-style, translate inline, and digitally sign — all processed
 **locally on your machine**, with no installation required.
 
-Prebuilt downloads: **[torreader.cloud](https://torreader.cloud)**
+### ⬇ Download
+
+| Platform | Download |
+|----------|----------|
+| **Windows** (x64) | [`TorReader-PDF-Portable-v2.1.3.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Linux** (x86_64) | [`TorReaderPDF-2.1.3-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run |
+
+See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
+
+<!-- 📸 TODO: add a screenshot or GIF here — biggest single boost to first-impression.
+     Chụp app đang mở 1 file, hoặc GIF thao tác merge giữ bookmark. Đặt vào docs/screenshot.png rồi:
+     ![TorReader PDF](docs/screenshot.png) -->
+
+<!-- Prebuilt binaries and the web version are also at torreader.cloud -->
 
 ## Features
 
@@ -20,11 +38,6 @@ Prebuilt downloads: **[torreader.cloud](https://torreader.cloud)**
 - **Annotations** — sticky notes, highlight, underline, strikethrough, shapes, freehand, stamp
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
 - **Save model**: edits (insert/delete/reorder/merge) apply to an in-memory working copy first — your original file is only overwritten when you press **Ctrl+S**
-
-## Download prebuilt binaries
-
-Windows (.zip, portable) and Linux (.AppImage) builds are published at
-**[torreader.cloud](https://torreader.cloud)** — no build required for normal use.
 
 ## Building from source
 
