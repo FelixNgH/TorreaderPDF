@@ -24,7 +24,8 @@ public:
     ~ThumbnailPanel() override;
 
     void setDocument(PdfDocument* doc, PdfRenderer* renderer,
-                     ThumbnailRenderPool* pool = nullptr);
+                     ThumbnailRenderPool* pool = nullptr,
+                     bool forceRebuild = false);
     void setCurrentPage(int pageIndex);
     void clearThumbnails();
     void setDarkMode(bool dark);

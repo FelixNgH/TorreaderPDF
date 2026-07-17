@@ -800,14 +800,14 @@ void MainWindow::onPrintFile() {
 
 // ── Sidebar sync ─────────────────────────────────────────────────────────────
 
-void MainWindow::syncSidebarToTab(int docIdx) {
+void MainWindow::syncSidebarToTab(int docIdx, bool forceRebuild) {
     if (docIdx < 0 || docIdx >= m_openDocs.size()) {
         m_thumbPanel->clearThumbnails();
         return;
     }
     auto* t = m_openDocs[docIdx];
     m_thumbPanel->setDocument(t->doc.get(), t->renderer.get(),
-                              t->thumbPool.get());
+                              t->thumbPool.get(), forceRebuild);
     m_thumbPanel->setCurrentPage(t->currentPage);
 }
 
@@ -848,7 +848,9 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path) {
 
     t->renderer->requestPage(t->currentPage, t->zoom);
     if (t == currentTab()) {
-        syncSidebarToTab(m_openDocs.indexOf(t));
+        // File vừa được mở lại (edit/save) trên cùng con trỏ doc → ép sidebar
+        // dựng lại thumbnail + bookmark, nếu không panel giữ nội dung cũ.
+        syncSidebarToTab(m_openDocs.indexOf(t), /*forceRebuild=*/true);
         if (m_continuousMode && m_continuousView)
             m_continuousView->setDocument(t->doc.get(), t->renderer.get());
     }

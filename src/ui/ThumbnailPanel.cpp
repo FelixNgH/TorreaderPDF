@@ -310,8 +310,11 @@ ThumbnailPanel::~ThumbnailPanel() {
 
 // ── setDocument ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
-                                  ThumbnailRenderPool* pool) {
-    if (doc == m_doc && renderer == m_renderer && m_list->count() > 0) return;
+                                  ThumbnailRenderPool* pool, bool forceRebuild) {
+    // forceRebuild: sau khi sửa file (insert/delete/reorder…) doc được mở lại
+    // TRÊN CÙNG con trỏ — phải dựng lại thumbnail + bookmark, không được early-return.
+    if (!forceRebuild && doc == m_doc && renderer == m_renderer && m_list->count() > 0)
+        return;
 
     m_doc = doc;
     if (m_renderer) disconnect(m_rendererConn);

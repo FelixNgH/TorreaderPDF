@@ -75,7 +75,7 @@ private slots:
 private:
     void setupActionBar();
     void applyTheme(bool dark);
-    void syncSidebarToTab(int idx);
+    void syncSidebarToTab(int idx, bool forceRebuild = false);
     DocTab* currentTab() const;
     void showThumbnailContextMenu(int pageIndex, QPoint globalPos);
     void reloadTab(DocTab* t, const QString& filePath, const QString& tmpPath);

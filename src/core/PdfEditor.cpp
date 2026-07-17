@@ -18,6 +18,7 @@
 #include <QDir>
 #include <QMutexLocker>
 #include <QSet>
+#include <QRegularExpression>
 #include <numeric>
 #include <map>
 #include <functional>
@@ -276,6 +277,18 @@ void PdfEditor::writeOutlineTree(const QString& path, const QList<OutlineNode>& 
     } catch (const std::exception& e) {
         QFile::remove(tmpPath);
         qWarning() << "[PdfEditor] Outline post-pass failed:" << e.what();
+    }
+}
+
+// Xoá tiêu đề của các bookmark "Page N" tự-sinh (đệ quy) để buildPagedOutline
+// đánh số lại từ đầu; bookmark có tên THẬT (chương sách…) được giữ nguyên.
+static void stripAutoPageTitles(QList<OutlineNode>& nodes) {
+    static const QRegularExpression re(QStringLiteral("^\\s*Page\\s+\\d+\\s*$"),
+                                       QRegularExpression::CaseInsensitiveOption);
+    for (auto& n : nodes) {
+        if (re.match(n.title).hasMatch())
+            n.title.clear();
+        stripAutoPageTitles(n.children);
     }
 }
 
@@ -684,6 +697,10 @@ bool PdfEditor::insertPageFrom(const QString& targetFile, int targetInsertBefore
 
     int insertAt = qBound(0, targetInsertBefore, tgtCount);
 
+    // Đọc outline gốc TRƯỚC khi đóng doc (page index ở không gian file gốc).
+    QList<OutlineNode> tgtTree = readOutlineTree(ldTgt.doc, 0);
+    QList<OutlineNode> srcTree = readOutlineTree(ldSrc.doc, 0);
+
     FPDF_DOCUMENT output = FPDF_CreateNewDocument();
     if (!output) { m_lastError = "Failed to create output document"; ldSrc.close(); ldTgt.close(); return false; }
 
@@ -722,6 +739,21 @@ bool PdfEditor::insertPageFrom(const QString& targetFile, int targetInsertBefore
     FPDF_CloseDocument(output);
     ldSrc.close();
     ldTgt.close();
+
+    if (ok) {
+        // Remap trang về layout sau khi chèn 1 trang nguồn tại insertAt, rồi
+        // dựng lại outline theo trang (giống merge) — count == số trang mới.
+        QMap<int,int> tgtMap;
+        for (int p = 0; p < tgtCount; ++p)
+            tgtMap[p] = (p < insertAt) ? p : p + 1;
+        QMap<int,int> srcMap;
+        srcMap[sourcePageIndex] = insertAt;
+
+        QList<OutlineNode> combined = filterOutlineTree(tgtTree, tgtMap);
+        combined.append(filterOutlineTree(srcTree, srcMap));
+        stripAutoPageTitles(combined);
+        writeOutlineTree(outputPath, buildPagedOutline(combined, tgtCount + 1));
+    }
     return ok;
 }
 
@@ -741,6 +773,10 @@ bool PdfEditor::insertPdf(const QString& targetFile, int insertBefore,
     int tgtCount = FPDF_GetPageCount(ldTgt.doc);
     if (srcCount <= 0) { m_lastError = "Source PDF has no pages"; ldSrc.close(); ldTgt.close(); return false; }
     int insertAt = qBound(0, insertBefore, tgtCount);
+
+    // Đọc outline gốc TRƯỚC khi đóng doc (page index ở không gian file gốc).
+    QList<OutlineNode> tgtTree = readOutlineTree(ldTgt.doc, 0);
+    QList<OutlineNode> srcTree = readOutlineTree(ldSrc.doc, 0);
 
     FPDF_DOCUMENT output = FPDF_CreateNewDocument();
     if (!output) { m_lastError = "Failed to create output document"; ldSrc.close(); ldTgt.close(); return false; }
@@ -776,5 +812,24 @@ bool PdfEditor::insertPdf(const QString& targetFile, int insertBefore,
     FPDF_CloseDocument(output);
     ldSrc.close();
     ldTgt.close();
+
+    if (ok) {
+        // Remap trang về layout sau khi chèn srcCount trang tại insertAt:
+        //   target p < insertAt  → p              (giữ nguyên)
+        //   target p >= insertAt → p + srcCount   (dời xuống)
+        //   source p             → p + insertAt   (nằm trong đoạn chèn)
+        // Dựng lại outline theo trang (giống merge) — count == số trang mới.
+        QMap<int,int> tgtMap;
+        for (int p = 0; p < tgtCount; ++p)
+            tgtMap[p] = (p < insertAt) ? p : p + srcCount;
+        QMap<int,int> srcMap;
+        for (int p = 0; p < srcCount; ++p)
+            srcMap[p] = p + insertAt;
+
+        QList<OutlineNode> combined = filterOutlineTree(tgtTree, tgtMap);
+        combined.append(filterOutlineTree(srcTree, srcMap));
+        stripAutoPageTitles(combined);
+        writeOutlineTree(outputPath, buildPagedOutline(combined, tgtCount + srcCount));
+    }
     return ok;
 }
