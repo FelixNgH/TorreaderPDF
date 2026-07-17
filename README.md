@@ -5,10 +5,15 @@
 [![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 
-Portable PDF reader and editor for **Windows** and **Linux**. Open
-200MB files in seconds, merge/split while keeping bookmarks intact, insert
-pages Adobe-style, translate inline, and digitally sign — all processed
-**locally on your machine**, with no installation required.
+**TorReader is a lightweight, portable PDF app for Windows and Linux** — a fast
+PDF viewer that also handles the everyday jobs quickly: **merge, extract, split,
+and insert** pages, **sign PDFs** digitally, and **translate PDFs for free**.
+Everything runs **locally on your machine**, with **no installation required** —
+unzip (or `chmod +x`) and run.
+
+Open a 200MB PDF in a second or two, combine files **without losing bookmarks**,
+pull out or split pages, insert pages from another PDF, add a digital signature,
+and translate text in place — free and open-source (MIT).
 
 ### ⬇ Download
 
@@ -27,17 +32,38 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 
 ## Features
 
-- **Fast rendering** — memory-mapped loading, opens 200MB files in 1–2s
-- **Continuous scroll** — for long technical drawings, RAM-efficient (off-screen pages are evicted)
-- **Sharp at any zoom** — mixed page sizes (A4 + A0–A3 drawings) in one merged file render crisply at every zoom level
-- **Merge PDFs** — keeps each source file's bookmarks, remapped to the new page numbers; unbookmarked pages get an auto "Page N" entry
-- **Insert Pages from File** — Adobe-style, right-click a thumbnail to pull pages from another PDF, no drag-and-drop
-- **Extract / Split / Delete / Reorder pages**, reorder bookmarks
-- **Digital signature** (optional feature) — PKCS#7 detached, SHA-256, via your own `.pfx`/`.p12` certificate
-- **Inline translation** — Ctrl+drag over text to translate in place, with local caching
+- **Fast PDF viewer** — memory-mapped loading opens 200MB files in 1–2s; continuous scroll (RAM-efficient), sharp at every zoom even with mixed page sizes (A4 + A0–A3 in one file)
+- **Merge PDF** — combine files while **keeping every bookmark**, remapped to the new page numbers (most tools drop them); unbookmarked pages get an auto "Page N" entry
+- **Split PDF** — split a document into parts by page count or size
+- **Extract pages** — pull any page or range out into a new PDF
+- **Insert pages** — Adobe-style, right-click a thumbnail to insert pages from another PDF; bookmarks renumber to match
+- **Sign PDF** — digital signature, PKCS#7 detached, SHA-256, using your own `.pfx`/`.p12` certificate
+- **Translate PDF (free)** — Ctrl+drag over text to translate it in place, cached locally
+- **Delete / Reorder pages**, reorder bookmarks
 - **Annotations** — sticky notes, highlight, underline, strikethrough, shapes, freehand, stamp
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
-- **Save model**: edits (insert/delete/reorder/merge) apply to an in-memory working copy first — your original file is only overwritten when you press **Ctrl+S**
+- **Safe save model** — edits (insert/delete/reorder/merge) apply to an in-memory working copy first; your original file is only overwritten when you press **Ctrl+S**
+
+## FAQ
+
+**Is TorReader free?** Yes — free and open-source (MIT). No ads, no account, no watermark.
+
+**Do I need to install it?** No. It's a portable app: on Windows, unzip and run
+`TorReader.exe`; on Linux, `chmod +x` the AppImage and run it.
+
+**Does it work offline?** Yes — all PDF viewing and editing (merge, split, extract,
+insert, sign) happens locally on your machine. Only the optional translate feature
+calls an online translation service when you use it.
+
+**Can it merge PDFs without losing bookmarks?** Yes. Merging (and inserting pages)
+keeps every bookmark and remaps it to the new page numbers — a common problem with
+other free tools.
+
+**What platforms are supported?** Windows 10/11 (x64) and Linux (x86_64, AppImage).
+
+**Is it a free alternative to Adobe Acrobat, PDFsam or Foxit?** For viewing, merging,
+splitting, extracting, inserting, signing and translating PDFs — yes, TorReader
+covers those jobs in a single lightweight, portable app.
 
 ## Building from source
 
