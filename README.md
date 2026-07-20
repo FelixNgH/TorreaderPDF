@@ -24,9 +24,19 @@ and translate text in place — free and open-source (MIT).
 
 See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
 
-<!-- 📸 TODO: add a screenshot or GIF here — biggest single boost to first-impression.
-     Chụp app đang mở 1 file, hoặc GIF thao tác merge giữ bookmark. Đặt vào docs/screenshot.png rồi:
-     ![TorReader PDF](docs/screenshot.png) -->
+![TorReader PDF demo](docs/screenshots/demo.gif)
+
+<details>
+<summary>More screenshots (viewer, dark mode, markup, digital signature, merge)</summary>
+<br>
+
+| | |
+|---|---|
+| ![Viewer](docs/screenshots/01_main_viewer.png) | ![Dark mode](docs/screenshots/02_dark_mode.png) |
+| ![Markup annotations](docs/screenshots/05_markup.png) | ![Digital signature](docs/screenshots/06_sign_dialog.png) |
+| ![Continuous scroll](docs/screenshots/07_continuous.png) | ![Merge PDFs](docs/screenshots/09_merge_dialog.png) |
+
+</details>
 
 <!-- Prebuilt binaries and the web version are also at torreader.cloud -->
 
