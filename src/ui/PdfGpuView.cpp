@@ -53,6 +53,7 @@ PdfGpuView::PdfGpuView(QWidget* parent)
     connect(m_zoomTimer, &QTimer::timeout, this, [this]{
         emit zoomChanged(m_zoom);
     });
+    setFocusPolicy(Qt::StrongFocus);
 }
 
 PdfGpuView::~PdfGpuView() {
@@ -226,6 +227,17 @@ void PdfGpuView::paintGL() {
             p.restore();
         }
 
+        // Selection rectangle
+        if (m_hasSel) {
+            QPointF a = pdfToWidget(m_selRect.topLeft());
+            QPointF b = pdfToWidget(m_selRect.bottomRight());
+            QRectF wr = QRectF(a, b).normalized().adjusted(-3, -3, 3, 3);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(QColor(0, 120, 215), 1.5, Qt::DashLine));
+            p.drawRect(wr);
+        }
+
         // Annotation overlays
         if (!m_annotOverlays.isEmpty()) {
             double pageH = m_pageSizePt.height();
@@ -261,6 +273,31 @@ void PdfGpuView::paintGL() {
         p.drawRect(sel);
     }
 
+    // Shape preview while dragging
+    if (m_drawingShape) {
+        p.save();
+        QPen dashPen(Qt::blue, 2, Qt::DashLine);
+        p.setPen(dashPen);
+        p.setBrush(Qt::NoBrush);
+        QRectF sr(m_shapeStart, m_shapeEnd);
+        if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow) {
+            p.drawLine(m_shapeStart, m_shapeEnd);
+        } else if (m_tool == ViewTool::Rectangle || m_tool == ViewTool::FreeText || m_tool == ViewTool::Cloud) {
+            p.drawRect(sr.normalized());
+        } else if (m_tool == ViewTool::Ellipse) {
+            p.drawEllipse(sr.normalized());
+        }
+        p.restore();
+    }
+
+    // Signature rubber-band
+    if (m_sigPickMode && m_sigActive) {
+        p.setPen(QPen(QColor(0, 90, 200), 1, Qt::DashLine));
+        p.setBrush(QColor(0, 90, 200, 40));
+        p.drawRect(QRectF(m_sigStart, m_sigEnd));
+        p.setBrush(Qt::NoBrush);
+    }
+
     // Show loading overlay only when no existing image — keeps old page visible
     // while new page is rendering (no grey flash on navigation).
     if (m_loading && !m_hasImage) {
@@ -276,6 +313,9 @@ void PdfGpuView::paintGL() {
 void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt) {
     // Treat first load (!m_hasImage) same as new page so pan resets properly.
     bool newPage = (pageIndex != m_pageIndex) || !m_hasImage;
+    if (!newPage && m_hasImage && !pageImage.isNull() &&
+        !m_lastImage.isNull() && pageImage.width() < m_lastImage.width())
+        return;   // don't downgrade a sharper render with a blurrier one
     qDebug() << "[GpuView] setPage idx=" << pageIndex
              << "newPage=" << newPage
              << "imgSize=" << pageImage.size()
@@ -285,6 +325,7 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
     m_pageSizePt = pageSizePt;
     m_loading    = false;
     m_hasImage   = !pageImage.isNull();
+    if (!pageImage.isNull()) m_lastImage = pageImage;
     if (!pageImage.isNull()) {
         m_pendingImage = pageImage;
         m_textureDirty = true;
@@ -292,6 +333,7 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
     if (newPage) {
         m_panOffset = {};
         m_highlights.clear();
+        m_hasSel = false;
     }
     update();
 }
@@ -334,8 +376,29 @@ void PdfGpuView::setDarkMode(bool dark) {
 }
 
 void PdfGpuView::setTool(ViewTool tool) {
+    if (m_sigPickMode) { m_sigPickMode = false; m_sigActive = false; unsetCursor(); }
     m_tool = tool;
-    setCursor(tool == ViewTool::PlaceNote ? Qt::CrossCursor : Qt::ArrowCursor);
+    m_hasSel = false;
+    setCursor(tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+    update();
+}
+
+void PdfGpuView::beginSignaturePick() {
+    m_sigPickMode = true;
+    m_sigActive = false;
+    setCursor(Qt::CrossCursor);
+    update();
+}
+
+void PdfGpuView::setSelectedAnnot(const QRectF& rectPdf) {
+    m_selRect = rectPdf;
+    m_hasSel = true;
+    update();
+}
+
+void PdfGpuView::clearSelectedAnnot() {
+    m_hasSel = false;
+    update();
 }
 
 void PdfGpuView::setHighlights(const QList<QRectF>& rects) {
@@ -374,6 +437,14 @@ QRectF PdfGpuView::pdfRectToWidget(const QRectF& r) const {
 
 // ── Input ─────────────────────────────────────────────────────────────────────
 
+void PdfGpuView::keyPressEvent(QKeyEvent* e) {
+    if (m_sigPickMode && e->key() == Qt::Key_Escape) {
+        m_sigPickMode = false; m_sigActive = false; unsetCursor(); update();
+        return;
+    }
+    QOpenGLWidget::keyPressEvent(e);
+}
+
 void PdfGpuView::wheelEvent(QWheelEvent* e) {
     if (e->modifiers() & Qt::ControlModifier) {
         double delta   = e->angleDelta().y() / 1200.0;
@@ -389,21 +460,36 @@ void PdfGpuView::wheelEvent(QWheelEvent* e) {
         m_zoomTimer->start();
     } else {
         double dy = e->angleDelta().y() * 0.6;
-        m_panOffset.ry() += dy;
-
         double pageHpx = m_pageSizePt.height() * m_zoom;
-        // Minimum margin: 12% of viewport height (≈ 1-2 mouse wheel notches).
-        // This ensures the user can always scroll a meaningful amount before
-        // switching pages — critical when auto-fit zoom makes pageHpx ≈ height().
-        double margin  = qMax(height() * 0.12,
-                              (pageHpx > height())
-                                  ? (pageHpx - height()) / 2.0 + height() * 0.05
-                                  : pageHpx * 0.12);
 
-        if (m_panOffset.y() > margin) {
+        // Debounce flips with a short time cooldown so one wheel gesture flips one
+        // page. Time-based (not a loading flag) so it can never get stuck.
+        auto canFlip = [this]{
+            return !m_flipCooldown.isValid() || m_flipCooldown.elapsed() > 220;
+        };
+
+        if (pageHpx <= height() + 1.0) {
+            // Fitted page: a single notch flips.
+            if (canFlip()) {
+                if (dy > 0)      { m_flipCooldown.restart(); emit scrolledToPage(m_pageIndex - 1); }
+                else if (dy < 0) { m_flipCooldown.restart(); emit scrolledToPage(m_pageIndex + 1); }
+            }
+            e->accept();
+            return;
+        }
+
+        // Taller page: pan, and flip when scrolled past the edge.
+        m_panOffset.ry() += dy;
+        double margin = qMax(height() * 0.12,
+                             (pageHpx > height())
+                                 ? (pageHpx - height()) / 2.0 + height() * 0.05
+                                 : pageHpx * 0.12);
+        if (m_panOffset.y() > margin && canFlip()) {
+            m_flipCooldown.restart();
             m_panOffset.setY(0.0);
             emit scrolledToPage(m_pageIndex - 1);
-        } else if (m_panOffset.y() < -margin) {
+        } else if (m_panOffset.y() < -margin && canFlip()) {
+            m_flipCooldown.restart();
             m_panOffset.setY(0.0);
             emit scrolledToPage(m_pageIndex + 1);
         }
@@ -412,10 +498,46 @@ void PdfGpuView::wheelEvent(QWheelEvent* e) {
 }
 
 void PdfGpuView::mousePressEvent(QMouseEvent* e) {
-    if (m_tool == ViewTool::PlaceNote && e->button() == Qt::LeftButton) {
-        if (m_hasImage)
-            emit noteRequested(m_pageIndex, widgetToPdf(e->position()));
+    if (m_sigPickMode && e->button() == Qt::LeftButton) {
+        m_sigActive = true;
+        m_sigStart = e->position();
+        m_sigEnd = e->position();
+        update();
         return;
+    }
+    if (m_tool == ViewTool::Pan && m_hasImage) {
+        if (e->button() == Qt::RightButton) {
+            emit annotationContextRequested(m_pageIndex, widgetToPdf(e->position()), e->globalPosition().toPoint());
+            return;
+        }
+        if (e->button() == Qt::LeftButton) {
+            if (m_hasSel) {
+                QPointF a = pdfToWidget(m_selRect.topLeft());
+                QPointF b = pdfToWidget(m_selRect.bottomRight());
+                QRectF wsel = QRectF(a, b).normalized().adjusted(-3, -3, 3, 3);
+                if (wsel.contains(e->position())) {
+                    m_draggingAnnot = true;
+                    m_dragStart = e->position();
+                    m_dragOrigRect = m_selRect;
+                    return;
+                }
+            }
+            emit annotationPickRequested(m_pageIndex, widgetToPdf(e->position()));
+        }
+    }
+    if (e->button() == Qt::LeftButton && m_hasImage) {
+        if (m_tool == ViewTool::PlaceNote) {
+            emit noteRequested(m_pageIndex, widgetToPdf(e->position()));
+            return;
+        }
+        if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow ||
+            m_tool == ViewTool::Rectangle || m_tool == ViewTool::Ellipse ||
+            m_tool == ViewTool::Cloud || m_tool == ViewTool::FreeText) {
+            m_drawingShape = true;
+            m_shapeStart = e->position();
+            m_shapeEnd = e->position();
+            return;
+        }
     }
     // Ctrl+Left drag = text selection for translation
     if ((e->modifiers() & Qt::ControlModifier) && e->button() == Qt::LeftButton) {
@@ -434,6 +556,22 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
 }
 
 void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
+    if (m_sigPickMode && m_sigActive) {
+        m_sigEnd = e->position();
+        update();
+        return;
+    }
+    if (m_draggingAnnot) {
+        QPointF d = (e->position() - m_dragStart) / m_zoom;
+        m_selRect = m_dragOrigRect.translated(d);
+        update();
+        return;
+    }
+    if (m_drawingShape) {
+        m_shapeEnd = e->position();
+        update();
+        return;
+    }
     if (m_selecting) {
         m_selEnd = e->position();
         update();
@@ -447,9 +585,67 @@ void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
 }
 
 void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
+    if (m_sigPickMode && m_sigActive && e->button() == Qt::LeftButton) {
+        m_sigActive = false;
+        m_sigPickMode = false;
+        unsetCursor();
+        double dx = qAbs(m_sigEnd.x() - m_sigStart.x());
+        double dy = qAbs(m_sigEnd.y() - m_sigStart.y());
+        if (dx < 8.0 || dy < 8.0) { update(); return; }
+        QPointF a = widgetToPdf(m_sigStart);
+        QPointF b = widgetToPdf(m_sigEnd);
+        double L = qMin(a.x(), b.x());
+        double R = qMax(a.x(), b.x());
+        double topY = qMin(a.y(), b.y());
+        double botY = qMax(a.y(), b.y());
+        double Wd = R - L;
+        double Hd = botY - topY;
+        double pageH = m_pageSizePt.height();
+        double pageW = m_pageSizePt.width();
+        QRectF rectPt(qMax(0.0, L), qMax(0.0, pageH - botY), qMin(Wd, pageW), qMin(Hd, pageH));
+        emit signatureRectPicked(m_pageIndex, rectPt);
+        update();
+        return;
+    }
+    if (m_draggingAnnot) {
+        m_draggingAnnot = false;
+        double dx = (e->position().x() - m_dragStart.x()) / m_zoom;
+        double dy = -(e->position().y() - m_dragStart.y()) / m_zoom;
+        if (qAbs(dx) > 1.0 || qAbs(dy) > 1.0)
+            emit annotationMoveRequested(m_pageIndex, dx, dy);
+        return;
+    }
+    if (m_drawingShape) {
+        if (e->button() == Qt::LeftButton) {
+            m_drawingShape = false;
+            QPointF startPdf = widgetToPdf(m_shapeStart);
+            QPointF endPdf   = widgetToPdf(m_shapeEnd);
+            if (m_tool == ViewTool::FreeText) {
+                QRectF r = ((endPdf - startPdf).manhattanLength() > 5.0)
+                           ? QRectF(startPdf, endPdf).normalized()
+                           : QRectF(startPdf, QSizeF(160.0, 40.0));
+                emit textBoxRequested(m_pageIndex, r);
+            } else if ((endPdf - startPdf).manhattanLength() > 5.0) {
+                AnnotTool at = AnnotTool::Line;
+                switch (m_tool) {
+                    case ViewTool::Arrow:     at = AnnotTool::Arrow; break;
+                    case ViewTool::Rectangle: at = AnnotTool::Rectangle; break;
+                    case ViewTool::Ellipse:   at = AnnotTool::Ellipse; break;
+                    case ViewTool::Cloud:     at = AnnotTool::Cloud; break;
+                    default:                  at = AnnotTool::Line; break;
+                }
+                emit shapeCommitRequested(m_pageIndex, at, startPdf, endPdf);
+            }
+        } else {
+            m_drawingShape = false;
+        }
+        setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+        update();
+        return;
+    }
     if (m_selecting && e->button() == Qt::LeftButton) {
         m_selecting = false;
-        setCursor(m_tool == ViewTool::PlaceNote ? Qt::CrossCursor : Qt::ArrowCursor);
+        setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
 
         QPointF p0(qMin(m_selStart.x(), m_selEnd.x()), qMin(m_selStart.y(), m_selEnd.y()));
         QPointF p1(qMax(m_selStart.x(), m_selEnd.x()), qMax(m_selStart.y(), m_selEnd.y()));
@@ -480,5 +676,5 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         return;
     }
     m_panning = false;
-    setCursor(m_tool == ViewTool::PlaceNote ? Qt::CrossCursor : Qt::ArrowCursor);
+    setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
 }

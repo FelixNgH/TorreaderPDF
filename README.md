@@ -19,8 +19,8 @@ and translate text in place — free and open-source (MIT).
 
 | Platform | Download |
 |----------|----------|
-| **Windows** (x64) | [`TorReader-PDF-Portable-v2.1.3.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
-| **Linux** (x86_64) | [`TorReaderPDF-2.1.3-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run |
+| **Windows** (x64) | [`TorReaderPDF-2.2-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Linux** (x86_64) | [`TorReaderPDF-2.2-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run |
 
 See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
 

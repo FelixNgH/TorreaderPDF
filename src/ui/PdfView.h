@@ -8,10 +8,12 @@
 #include <QString>
 #include <QTimer>
 
+#include "annotations/AnnotationTypes.h"
+
 class PdfView : public QWidget {
     Q_OBJECT
 public:
-    enum class ViewTool { Pan, PlaceNote };
+    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText };
     enum class ViewMode { Single, Double };
 
     struct AnnotOverlay {
@@ -55,6 +57,7 @@ signals:
     void scrolledToPage(int pageIndex);
     void noteRequested(int pageIndex, QPointF pdfPoint);
     void noteEditRequested(int pageIndex, int annotIndex);
+    void shapeCommitRequested(int pageIndex, AnnotTool tool, QPointF start, QPointF end);
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -84,6 +87,11 @@ private:
     ViewMode     m_viewMode    = ViewMode::Single;
     QList<QRectF>       m_highlights;
     QList<AnnotOverlay> m_annotOverlays;
+
+    // Shape drawing
+    bool    m_drawingShape = false;
+    QPointF m_shapeStart;
+    QPointF m_shapeEnd;
 
     QTimer*  m_zoomTimer   = nullptr;
 };

@@ -8,6 +8,8 @@
 #include <QThread>
 #include <QDebug>
 #include <fpdf_annot.h>
+#include <fpdf_formfill.h>
+#include <cstring>
 
 // s_pdfiumMutex defined in PdfDocument.cpp — serializes all PDFium calls.
 extern QMutex s_pdfiumMutex;
@@ -178,6 +180,18 @@ void PageRenderTask::run() {
         FPDF_BITMAP bmp = FPDFBitmap_CreateEx(imgW, imgH, FPDFBitmap_BGRA,
                                                image.bits(), image.bytesPerLine());
         FPDF_RenderPageBitmap(bmp, page, 0, 0, imgW, imgH, 0, FPDF_ANNOT);
+        if (FPDF_GetFormType(m_doc) != FORMTYPE_NONE) {
+            FPDF_FORMFILLINFO ffi;
+            memset(&ffi, 0, sizeof(ffi));
+            ffi.version = 2;
+            FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(m_doc, &ffi);
+            if (form) {
+                FORM_OnAfterLoadPage(page, form);
+                FPDF_FFLDraw(form, bmp, page, 0, 0, imgW, imgH, 0, FPDF_ANNOT);
+                FORM_OnBeforeClosePage(page, form);
+                FPDFDOC_ExitFormFillEnvironment(form);
+            }
+        }
         FPDFBitmap_Destroy(bmp);
         FPDF_ClosePage(page);
     }
@@ -238,6 +252,20 @@ void RegionRenderTask::run() {
     FPDF_RenderPageBitmap(bmp, page,
                           -m_regionPx.x(), -m_regionPx.y(),
                           fullW, fullH, 0, FPDF_ANNOT);
+    if (FPDF_GetFormType(m_doc) != FORMTYPE_NONE) {
+        FPDF_FORMFILLINFO ffi;
+        memset(&ffi, 0, sizeof(ffi));
+        ffi.version = 2;
+        FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(m_doc, &ffi);
+        if (form) {
+            FORM_OnAfterLoadPage(page, form);
+            FPDF_FFLDraw(form, bmp, page,
+                         -m_regionPx.x(), -m_regionPx.y(),
+                         fullW, fullH, 0, FPDF_ANNOT);
+            FORM_OnBeforeClosePage(page, form);
+            FPDFDOC_ExitFormFillEnvironment(form);
+        }
+    }
     FPDFBitmap_Destroy(bmp);
     FPDF_ClosePage(page);
 
@@ -311,6 +339,18 @@ void PdfRenderer::clearStalePending() {
     // re-requested. Clearing the set on each scroll tick unblocks them; running
     // tasks that eventually emit finished call remove() which is a safe no-op.
     m_pendingRequests.clear();
+}
+
+QImage PdfRenderer::bestCachedForPage(int pageIndex) const {
+    const qint64 lo = static_cast<qint64>(pageIndex) * 10000LL;
+    const qint64 hi = lo + 9999LL;
+    QImage best;
+    for (auto it = m_cache.cbegin(); it != m_cache.cend(); ++it) {
+        if (it.key() >= lo && it.key() <= hi &&
+            (best.isNull() || it.value().width() > best.width()))
+            best = it.value();
+    }
+    return best;
 }
 
 // Single O(n log n) pass: sort entries by distance from current page, evict farthest first.
@@ -414,9 +454,46 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
     // Skip if an identical request is already in the queue.
     if (m_pendingRequests.contains(key)) return;
 
-    // No progressive/blurry placeholder — show white until the correct-zoom
-    // render is ready. Blurry placeholders cause text to look garbled and then
-    // "jump" to sharp, which looks worse than a brief white flash.
+    // Progressive (SumatraPDF-style): if a lower-res render of this page is already
+    // cached (e.g. from preloadAdjacent), show it instantly so the flip is immediate;
+    // the sharp full-res render issued below replaces it when ready.
+    {
+        QImage placeholder = bestCachedForPage(pageIndex);
+        if (!placeholder.isNull()) {
+            emit pageReady(pageIndex, placeholder);
+        } else {
+            // Nothing cached — render a fast low-res version first for an instant
+            // blurry placeholder; the sharp full-res render (below) replaces it.
+            double loScale = scale;
+            QSizeF ps = m_doc->pageSize(pageIndex);
+            if (!ps.isEmpty()) {
+                double longPx = qMax(ps.width(), ps.height()) * scale;
+                const double kLoMaxPx = 800.0;
+                if (longPx > kLoMaxPx) loScale = scale * (kLoMaxPx / longPx);
+            }
+            if (loScale < scale * 0.9) {
+                qint64 loKey = cacheKey(pageIndex, quantize(loScale));
+                if (!m_cache.contains(loKey) && !m_pendingRequests.contains(loKey)) {
+                    m_pendingRequests.insert(loKey);
+                    int lgen = m_generation->loadRelaxed();
+                    RenderRequest lreq{pageIndex, loScale, false, lgen};
+                    auto* ltask = new PageRenderTask(m_doc->raw(), m_doc, lreq, this,
+                                                     m_generation, m_formibDoc, m_formibGate);
+                    connect(ltask, &PageRenderTask::finished, this,
+                            [this, loKey](int idx, QImage img) {
+                        m_pendingRequests.remove(loKey);
+                        if (!img.isNull() && !m_cache.contains(loKey)) {
+                            m_cacheBytes += static_cast<qint64>(img.sizeInBytes());
+                            m_cache.insert(loKey, img);
+                            evictCache();
+                        }
+                        emit pageReady(idx, img);
+                    });
+                    m_mainPool.start(ltask, 20);   // higher priority than full-res so it lands first
+                }
+            }
+        }
+    }
 
     m_pendingRequests.insert(key);
 

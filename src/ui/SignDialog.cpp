@@ -6,6 +6,8 @@
 #include <QLineEdit>
 #include <QLabel>
 #include <QPushButton>
+#include <QSpinBox>
+#include <QColorDialog>
 #include <QFileDialog>
 #include <QFile>
 #include <QMessageBox>
@@ -84,6 +86,37 @@ SignDialog::SignDialog(QWidget* parent)
     m_location->setPlaceholderText("e.g. Hanoi (optional)");
     form->addRow("Location:", m_location);
 
+    m_visibleChk = new QCheckBox("Show a visible signature stamp on the page (you will draw a box after clicking Sign)", this);
+    form->addRow("", m_visibleChk);
+
+    m_textColorBtn = new QPushButton(this);
+    m_textColorBtn->setFixedWidth(60);
+    m_textColorBtn->setStyleSheet("background: " + m_textColor.name() + "; border: 1px solid #999;");
+    connect(m_textColorBtn, &QPushButton::clicked, this, [this]() {
+        QColor c = QColorDialog::getColor(m_textColor, this, "Text Color");
+        if (c.isValid()) { m_textColor = c; m_textColorBtn->setStyleSheet("background: " + m_textColor.name() + "; border: 1px solid #999;"); }
+    });
+    form->addRow("Text color:", m_textColorBtn);
+
+    m_fontSpin = new QSpinBox(this);
+    m_fontSpin->setRange(0, 48);
+    m_fontSpin->setValue(0);
+    m_fontSpin->setSuffix(" pt");
+    m_fontSpin->setSpecialValueText("Auto");
+    form->addRow("Font size:", m_fontSpin);
+
+    m_fillChk = new QCheckBox("Fill background", this);
+    form->addRow("", m_fillChk);
+
+    m_fillColorBtn = new QPushButton(this);
+    m_fillColorBtn->setFixedWidth(60);
+    m_fillColorBtn->setStyleSheet("background: " + m_fillColor.name() + "; border: 1px solid #999;");
+    connect(m_fillColorBtn, &QPushButton::clicked, this, [this]() {
+        QColor c = QColorDialog::getColor(m_fillColor, this, "Fill Color");
+        if (c.isValid()) { m_fillColor = c; m_fillColorBtn->setStyleSheet("background: " + m_fillColor.name() + "; border: 1px solid #999;"); }
+    });
+    form->addRow("Fill color:", m_fillColorBtn);
+
     auto* btnLayout = new QHBoxLayout;
     m_okBtn = new QPushButton("Sign", this);
     m_okBtn->setDefault(true);
@@ -111,6 +144,10 @@ SignParams SignDialog::params() const
     p.password = m_password->text();
     p.reason   = m_reason->text().trimmed();
     p.location = m_location->text().trimmed();
+    p.textR = m_textColor.red();  p.textG = m_textColor.green();  p.textB = m_textColor.blue();
+    p.stampFont = m_fontSpin->value();
+    p.fillBg = m_fillChk->isChecked();
+    p.fillR = m_fillColor.red();  p.fillG = m_fillColor.green();  p.fillB = m_fillColor.blue();
     return p;
 }
 

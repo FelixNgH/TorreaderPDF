@@ -151,6 +151,7 @@ private:
                + static_cast<int>(qscale * 100.0);
     }
 
+    QImage bestCachedForPage(int pageIndex) const;
     void evictCache();
     /// Insert into m_cache with single-zoom eviction: when page P is cached at
     /// zoom Z, remove all other zoom levels for page P. Keeps only the most

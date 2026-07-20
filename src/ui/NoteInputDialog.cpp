@@ -6,8 +6,8 @@
 #include <QLineEdit>
 #include <QDialogButtonBox>
 
-NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent)
-    : QDialog(parent) {
+NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent, bool singleLine)
+    : QDialog(parent), m_singleLine(singleLine) {
     setWindowTitle("Add Note");
     setMinimumWidth(420);
     setStyleSheet(
@@ -25,10 +25,19 @@ NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent)
     layout->setContentsMargins(12, 12, 12, 12);
 
     layout->addWidget(new QLabel("Note:"));
-    m_text = new QTextEdit;
-    m_text->setPlainText(initialText);
-    m_text->setMinimumHeight(100);
-    layout->addWidget(m_text);
+    if (singleLine) {
+        m_lineEdit = new QLineEdit;
+        m_lineEdit->setText(initialText);
+        m_lineEdit->setMinimumWidth(280);
+        layout->addWidget(m_lineEdit);
+        m_lineEdit->setFocus();
+    } else {
+        m_textEdit = new QTextEdit;
+        m_textEdit->setPlainText(initialText);
+        m_textEdit->setMinimumHeight(100);
+        layout->addWidget(m_textEdit);
+        m_textEdit->setFocus();
+    }
 
     layout->addWidget(new QLabel("Author (optional):"));
     m_author = new QLineEdit;
@@ -38,9 +47,7 @@ NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent)
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
-
-    m_text->setFocus();
 }
 
-QString NoteInputDialog::text()   const { return m_text->toPlainText(); }
+QString NoteInputDialog::text()   const { return m_singleLine ? m_lineEdit->text() : m_textEdit->toPlainText(); }
 QString NoteInputDialog::author() const { return m_author->text(); }

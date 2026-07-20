@@ -10,11 +10,17 @@
 #include "core/TileCacheFile.h"
 #include "core/ThumbnailRenderPool.h"
 #include "core/TextSearch.h"
+#ifdef TORREADER_ENABLE_SIGNER
+#include "core/PdfSigner.h"
+#endif
 #include "PdfView.h"
 #include "PdfGpuView.h"
 #include "annotations/AnnotationManager.h"
+#include "annotations/AnnotationLayer.h"
+#include "annotations/AnnotationTypes.h"
 
 class QMimeData;
+class QLabel;
 class PdfEditor;
 class ThumbnailPanel;
 class ContinuousView;
@@ -28,6 +34,7 @@ struct DocTab {
     std::unique_ptr<PdfDocument>       doc;
     std::unique_ptr<PdfRenderer>       renderer;
     std::unique_ptr<AnnotationManager> annotMgr;
+    std::unique_ptr<AnnotationLayer>   annotLayer;
     std::unique_ptr<TileCacheFile>        tileCache;
     std::unique_ptr<ThumbnailRenderPool>  thumbPool;
     PdfGpuView* view        = nullptr;
@@ -81,6 +88,17 @@ private:
     void reloadTab(DocTab* t, const QString& filePath, const QString& tmpPath);
     void loadTabFile(DocTab* t, const QString& path);
     void updateTabDirty(DocTab* t);
+#ifdef TORREADER_ENABLE_SIGNER
+    void performSign(DocTab* t, SignParams sp);
+    void onFinalizeSignature();
+    void onCancelSignature();
+
+    SignParams m_pendSp;
+    int  m_pendPage = -1;
+    bool m_pendActive = false;
+    QAction* m_finalizeSigAct = nullptr;
+    QAction* m_cancelSigAct   = nullptr;
+#endif
 
     QTabWidget*      m_docTabs       = nullptr;
     QList<DocTab*>   m_openDocs;
@@ -105,4 +123,35 @@ private:
     QPoint             m_lastTransPos;
 
     void repositionNotifBar();
+
+    int m_selPage = -1;
+    int m_selIdx  = -1;
+    AnnotStyle m_annotStyle;
+
+    struct DrawAction {
+        enum Kind { Add, Delete, Move };
+        Kind kind = Add;
+        int        page = 0;
+        bool       isText = false;
+        AnnotTool  tool = AnnotTool::Line;
+        AnnotStyle style;
+        QPointF    a, b;
+        QString    text, author;
+        bool       textBg = true;
+        bool       isNote = false;
+        AnnotSnapshot snap;
+        AnnotSnapshot snapAfter;
+    };
+    QList<DrawAction> m_undoStack;
+    QList<DrawAction> m_redoStack;
+    void doUndo();
+    void doRedo();
+    void deleteSelectedAnnot(int page, int index);
+    void editSelectedAnnot(int page, int index);
+    void showNotePopup(const QString& text, const QString& author);
+    void hideNotePopup();
+    QLabel* m_notePopup = nullptr;
+#ifdef TORREADER_ENABLE_SIGNER
+    QMetaObject::Connection m_sigPickConn;
+#endif
 };

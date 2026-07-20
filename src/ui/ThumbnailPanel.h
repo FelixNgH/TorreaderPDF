@@ -9,6 +9,7 @@
 #include <QSet>
 #include <QRectF>
 #include <QString>
+#include "annotations/AnnotationManager.h"
 #include "core/PdfDocument.h"
 #include "core/PdfRenderer.h"
 #include "core/ThumbnailRenderPool.h"
@@ -16,6 +17,7 @@
 #include <fpdfview.h>
 
 class SearchPanel;
+class QPushButton;
 
 class ThumbnailPanel : public QWidget {
     Q_OBJECT
@@ -26,6 +28,7 @@ public:
     void setDocument(PdfDocument* doc, PdfRenderer* renderer,
                      ThumbnailRenderPool* pool = nullptr,
                      bool forceRebuild = false);
+    void setComments(const QList<AnnotInfo>& comments);
     void setCurrentPage(int pageIndex);
     void clearThumbnails();
     void setDarkMode(bool dark);
@@ -43,6 +46,9 @@ signals:
     void searchResultSelected(int pageIndex, QRectF boundingBox);
     void pagesReordered(QList<int> newOrder);
     void bookmarksReordered(QList<int> newOrder);
+    void annotToolSelected(int toolId);
+    void commentActivated(int pageIndex);
+    void annotStyleChanged(QColor color, double width, bool fill);
 
 private slots:
     void onPageReady(int pageIndex, const QImage& image);
@@ -57,6 +63,8 @@ private:
     QStackedWidget* m_stack          = nullptr;
     QButtonGroup*   m_tabGroup       = nullptr;
 
+    QWidget*      m_commentsPanel   = nullptr;
+    QListWidget*  m_commentsList    = nullptr;
     QListWidget*  m_list            = nullptr;
     QTreeWidget*  m_outline         = nullptr;
     QTreeWidget*  m_contentTree     = nullptr;
@@ -72,4 +80,8 @@ private:
     QAtomicInt    m_contentGen{0};
     QAtomicInt    m_bookmarkGen{0};
     QAtomicInt    m_propsGen{0};
+    QColor       m_annColor = Qt::red;
+    double       m_annWidth = 2.0;
+    bool         m_annFill  = false;
+    QPushButton* m_colorBtn = nullptr;
 };

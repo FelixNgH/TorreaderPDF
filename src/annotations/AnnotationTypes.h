@@ -16,6 +16,8 @@ enum class AnnotTool {
     Line,
     Freehand,
     Stamp,
+    Cloud,
+    FreeText,
 };
 
 struct AnnotStyle {

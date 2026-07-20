@@ -10,11 +10,15 @@
 #include <QtConcurrent>
 #include <QMenu>
 #include <QPushButton>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QColorDialog>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QDragMoveEvent>
 #include <fpdf_doc.h>
 #include <fpdf_text.h>
+#include <QFrame>
 #include <QKeySequence>
 #include <QShortcut>
 #include <QClipboard>
@@ -230,7 +234,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
 
     auto* thumbBtn = makeTabBtn("Thumbnails");
     auto* booksBtn = makeTabBtn("Bookmarks");
-    auto* contBtn  = makeTabBtn("Content");
+    auto* contBtn  = makeTabBtn("Comments");
     auto* propBtn  = makeTabBtn("Properties");
     thumbBtn->setChecked(true);
 
@@ -252,17 +256,83 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     gl->addWidget(contBtn,  1, 0);
     gl->addWidget(propBtn,  1, 1);
 
+    // Comments panel (idx 2): markup tools on top + list of PDF comments below
+    m_commentsPanel = new QWidget;
+    {
+        auto* cpLay = new QVBoxLayout(m_commentsPanel);
+        cpLay->setContentsMargins(4, 4, 4, 4);
+        cpLay->setSpacing(4);
+        auto* toolWrap = new QWidget;
+        auto* tgl = new QGridLayout(toolWrap);
+        tgl->setContentsMargins(0, 0, 0, 0);
+        tgl->setSpacing(2);
+        struct ToolDef { const char* label; int id; };
+        const ToolDef tools[] = {
+            {"Select", 0}, {"Line", 2}, {"Arrow", 3}, {"Rect", 4},
+            {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7}, {"Note", 1}
+        };
+        int r = 0, c = 0;
+        for (const auto& td : tools) {
+            auto* b = new QPushButton(QString::fromUtf8(td.label));
+            b->setFixedHeight(24);
+            const int id = td.id;
+            connect(b, &QPushButton::clicked, this, [this, id]{ emit annotToolSelected(id); });
+            tgl->addWidget(b, r, c);
+            if (++c == 2) { c = 0; ++r; }
+        }
+        cpLay->addWidget(toolWrap);
+        auto* propWrap = new QWidget;
+        auto* pgl = new QGridLayout(propWrap);
+        pgl->setContentsMargins(0, 2, 0, 2);
+        pgl->setSpacing(3);
+        auto* widthCombo = new QComboBox;
+        widthCombo->addItems({ "1 px", "2 px", "3 px", "4 px", "5 px", "6 px",
+                               "8 px", "10 px", "12 px", "16 px", "20 px", "24 px" });
+        widthCombo->setCurrentIndex(1);
+        m_colorBtn = new QPushButton("Color");
+        m_colorBtn->setStyleSheet("background:red; color:white;");
+        auto* fillChk = new QCheckBox("Fill");
+        pgl->addWidget(widthCombo, 0, 0);
+        pgl->addWidget(m_colorBtn, 0, 1);
+        pgl->addWidget(fillChk,    0, 2);
+        cpLay->addWidget(propWrap);
+        auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill); };
+        connect(widthCombo, &QComboBox::currentIndexChanged, this, [this, emitStyle](int i){
+            const double w[] = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0 };
+            m_annWidth = w[qBound(0, i, 11)];
+            emitStyle();
+        });
+        connect(m_colorBtn, &QPushButton::clicked, this, [this, emitStyle]{
+            QColor c = QColorDialog::getColor(m_annColor, this, "Markup color");
+            if (c.isValid()) {
+                m_annColor = c;
+                m_colorBtn->setStyleSheet(QString("background:%1; color:white;").arg(c.name()));
+                emitStyle();
+            }
+        });
+        connect(fillChk, &QCheckBox::toggled, this, [this, emitStyle](bool on){
+            m_annFill = on;
+            emitStyle();
+        });
+        auto* sep = new QFrame;
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        cpLay->addWidget(sep);
+        m_commentsList = new QListWidget;
+        connect(m_commentsList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it){
+            if (it) emit commentActivated(it->data(Qt::UserRole).toInt());
+        });
+        cpLay->addWidget(m_commentsList, 1);
+    }
+
     m_stack = new QStackedWidget;
     m_stack->addWidget(m_list);           // idx 0 — Thumbnails
     m_stack->addWidget(m_outline);        // idx 1 — Bookmarks
-    m_stack->addWidget(m_contentTree);    // idx 2 — Content
+    m_stack->addWidget(m_commentsPanel);  // idx 2 — Comments
     m_stack->addWidget(m_propertiesTree); // idx 3 — Properties
 
     connect(m_tabGroup, &QButtonGroup::idClicked, m_stack, &QStackedWidget::setCurrentIndex);
     connect(m_tabGroup, &QButtonGroup::idClicked, this, [this](int id) {
-        if (id == 2 && m_contentTree->topLevelItemCount() == 0
-                && m_doc && m_doc->isOpen())
-            buildContentTree();
         if (id == 3 && m_propertiesTree->topLevelItemCount() == 0
                 && m_doc && m_doc->isOpen())
             buildProperties();
@@ -689,4 +759,17 @@ void ThumbnailPanel::buildProperties() {
         m_propertiesTree->resizeColumnToContents(0);
     });
     watcher->setFuture(future);
+}
+
+void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
+    if (!m_commentsList) return;
+    m_commentsList->clear();
+    for (const AnnotInfo& a : comments) {
+        QString label = QString("p.%1  %2").arg(a.pageIndex + 1).arg(a.type);
+        if (!a.text.isEmpty()) label += "  — " + a.text.left(60);
+        auto* item = new QListWidgetItem(label, m_commentsList);
+        item->setData(Qt::UserRole, a.pageIndex);
+    }
+    if (m_commentsList->count() == 0)
+        m_commentsList->addItem(new QListWidgetItem(QStringLiteral("(no comments yet)")));
 }

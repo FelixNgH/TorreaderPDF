@@ -6,6 +6,7 @@
 #include <QDebug>
 #include <QDateTime>
 #include <QMutexLocker>
+#include <QRegularExpression>
 
 #include <fpdfview.h>
 #include <fpdf_signature.h>
@@ -264,12 +265,6 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
                               const SignParams& params, QString& errorMsg)
 {
     // ════════════════════════════════════════════════════════════════════════
-    // Step 0 — reject multi-sig
-    // ════════════════════════════════════════════════════════════════════════
-    if (checkExistingSignatures(inputPath, errorMsg))
-        return false;
-
-    // ════════════════════════════════════════════════════════════════════════
     // Step 1 — load PFX via OpenSSL
     // ════════════════════════════════════════════════════════════════════════
     QFile pfxFile(params.pfxPath);
@@ -342,6 +337,55 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
         return false;
     }
 
+    // Remove any pre-existing signature widgets and AcroForm signature fields so
+    // re-signing yields a single valid signature.
+    {
+        auto _pages = QPDFPageDocumentHelper(pdf).getAllPages();
+        for (auto& _ph : _pages) {
+            QPDFObjectHandle _pg = _ph.getObjectHandle();
+            if (_pg.hasKey("/Annots")) {
+                QPDFObjectHandle _annots = _pg.getKey("/Annots");
+                if (_annots.isArray()) {
+                    QPDFObjectHandle _keep = QPDFObjectHandle::newArray();
+                    int _n = _annots.getArrayNItems();
+                    for (int _i = 0; _i < _n; ++_i) {
+                        QPDFObjectHandle _a = _annots.getArrayItem(_i);
+                        bool _isSig = false;
+                        if (_a.isDictionary()) {
+                            if (_a.hasKey("/FT") && _a.getKey("/FT").isName() &&
+                                _a.getKey("/FT").getName() == "/Sig") _isSig = true;
+                            if (_a.hasKey("/V")) {
+                                QPDFObjectHandle _v = _a.getKey("/V");
+                                if (_v.isDictionary() && _v.hasKey("/Type") &&
+                                    _v.getKey("/Type").isName() &&
+                                    _v.getKey("/Type").getName() == "/Sig") _isSig = true;
+                            }
+                        }
+                        if (!_isSig) _keep.appendItem(_a);
+                    }
+                    _pg.replaceKey("/Annots", _keep);
+                }
+            }
+        }
+        QPDFObjectHandle _root = pdf.getRoot();
+        if (_root.hasKey("/AcroForm")) {
+            QPDFObjectHandle _af = _root.getKey("/AcroForm");
+            if (_af.hasKey("/Fields") && _af.getKey("/Fields").isArray()) {
+                QPDFObjectHandle _fields = _af.getKey("/Fields");
+                QPDFObjectHandle _keepF = QPDFObjectHandle::newArray();
+                int _n = _fields.getArrayNItems();
+                for (int _i = 0; _i < _n; ++_i) {
+                    QPDFObjectHandle _f = _fields.getArrayItem(_i);
+                    bool _isSig = _f.isDictionary() && _f.hasKey("/FT") &&
+                                  _f.getKey("/FT").isName() &&
+                                  _f.getKey("/FT").getName() == "/Sig";
+                    if (!_isSig) _keepF.appendItem(_f);
+                }
+                _af.replaceKey("/Fields", _keepF);
+            }
+        }
+    }
+
     // Signing time — Vietnam TZ +07:00 (D:YYYYMMDDHHmmSS+07'00')
     QString mStr = QString("D:%1+07'00'")
         .arg(QDateTime::currentDateTime().toString("yyyyMMddHHmmss"));
@@ -369,38 +413,144 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
     byteRange.appendItem(QPDFObjectHandle::newInteger(9999999999LL));
     sigDict.replaceKey("/ByteRange", byteRange);
 
-    // Widget annotation (invisible)
+    // Widget annotation
+    bool visible = params.pageIndex >= 0 && !params.rectPt.isNull()
+        && params.rectPt.width() > 0 && params.rectPt.height() > 0;
+
     QPDFObjectHandle widget = pdf.makeIndirectObject(QPDFObjectHandle::newDictionary());
     widget.replaceKey("/Type", QPDFObjectHandle::newName("/Annot"));
     widget.replaceKey("/Subtype", QPDFObjectHandle::newName("/Widget"));
     widget.replaceKey("/FT", QPDFObjectHandle::newName("/Sig"));
     widget.replaceKey("/T", QPDFObjectHandle::newUnicodeString("TorReaderSig1"));
-    {
+    if (visible) {
+        double x0 = params.rectPt.x();
+        double y0 = params.rectPt.y();
+        double x1 = x0 + params.rectPt.width();
+        double y1 = y0 + params.rectPt.height();
+        QPDFObjectHandle rect = QPDFObjectHandle::newArray();
+        rect.appendItem(QPDFObjectHandle::newReal(x0));
+        rect.appendItem(QPDFObjectHandle::newReal(y0));
+        rect.appendItem(QPDFObjectHandle::newReal(x1));
+        rect.appendItem(QPDFObjectHandle::newReal(y1));
+        widget.replaceKey("/Rect", rect);
+        widget.replaceKey("/F", QPDFObjectHandle::newInteger(4));
+    } else {
         QPDFObjectHandle rect = QPDFObjectHandle::newArray();
         rect.appendItem(QPDFObjectHandle::newInteger(0));
         rect.appendItem(QPDFObjectHandle::newInteger(0));
         rect.appendItem(QPDFObjectHandle::newInteger(0));
         rect.appendItem(QPDFObjectHandle::newInteger(0));
         widget.replaceKey("/Rect", rect);
+        widget.replaceKey("/F", QPDFObjectHandle::newInteger(132));
     }
-    widget.replaceKey("/F", QPDFObjectHandle::newInteger(132));
     widget.replaceKey("/V", sigDict);
 
-    // Attach widget to first page's /Annots
+    // Attach widget to chosen page's /Annots
     auto pages = QPDFPageDocumentHelper(pdf).getAllPages();
     if (pages.empty()) {
         errorMsg = QStringLiteral("PDF has no pages");
         return false;
     }
-    QPDFObjectHandle firstPage = pages[0].getObjectHandle();
-    widget.replaceKey("/P", firstPage);
-    if (firstPage.hasKey("/Annots")) {
-        QPDFObjectHandle annots = firstPage.getKey("/Annots");
+    QPDFObjectHandle targetPage = visible
+        ? pages[qBound(0, params.pageIndex, (int)pages.size() - 1)].getObjectHandle()
+        : pages[0].getObjectHandle();
+    widget.replaceKey("/P", targetPage);
+    if (targetPage.hasKey("/Annots")) {
+        QPDFObjectHandle annots = targetPage.getKey("/Annots");
         annots.appendItem(widget);
     } else {
         QPDFObjectHandle annots = pdf.makeIndirectObject(QPDFObjectHandle::newArray());
         annots.appendItem(widget);
-        firstPage.replaceKey("/Annots", annots);
+        targetPage.replaceKey("/Annots", annots);
+    }
+
+    // Visible signature appearance
+    if (visible) {
+        double W = params.rectPt.width();
+        double H = params.rectPt.height();
+        auto escapePdf = [](const QString& text) -> QByteArray {
+            QByteArray result;
+            for (const QChar& ch : text) {
+                if (ch == '\\') result.append("\\\\");
+                else if (ch == '(') result.append("\\(");
+                else if (ch == ')') result.append("\\)");
+                else if (ch.unicode() < 32 || ch.unicode() > 126) result.append('?');
+                else result.append(ch.toLatin1());
+            }
+            return result;
+        };
+
+        QString cn = certCommonName(cert);
+
+        QStringList lines;
+        lines << cn;
+        lines << QString("Date: ") + QDateTime::currentDateTime().toString("yyyy.MM.dd HH:mm:ss");
+        if (!params.reason.isEmpty())
+            lines << QString("Reason: ") + params.reason;
+        if (!params.location.isEmpty())
+            lines << QString("Location: ") + params.location;
+
+        int nLines = lines.size();
+        int maxChars = 1;
+        for (const auto& l : lines)
+            maxChars = qMax(maxChars, (int)l.length());
+
+        double vspace = (H - 4.0) / (nLines * 1.2);
+        double hspace = (W - 4.0) / (maxChars * 0.5);
+        double fontSize;
+        if (params.stampFont > 0)
+            fontSize = params.stampFont;
+        else
+            fontSize = qBound(4.0, qMin(vspace, hspace), 12.0);
+        double lineGap = fontSize * 1.2;
+        double x = 2.0;
+        double y = H - fontSize - 2.0;
+
+        QByteArray content;
+        content.append("q\n");
+        if (params.fillBg) {
+            content.append(QByteArray::number(params.fillR/255.0, 'f', 3) + " " + QByteArray::number(params.fillG/255.0, 'f', 3) + " " + QByteArray::number(params.fillB/255.0, 'f', 3) + " rg\n");
+            content.append("0 0 " + QByteArray::number(W, 'f', 2) + " " + QByteArray::number(H, 'f', 2) + " re f\n");
+        }
+        content.append(QByteArray::number(params.textR/255.0, 'f', 3) + " " + QByteArray::number(params.textG/255.0, 'f', 3) + " " + QByteArray::number(params.textB/255.0, 'f', 3) + " rg\n");
+        content.append("BT\n");
+        content.append("/Helv " + QByteArray::number(fontSize, 'f', 1) + " Tf\n");
+        content.append(QByteArray::number(x, 'f', 1) + " " + QByteArray::number(y, 'f', 1) + " Td\n");
+        content.append("(" + escapePdf(lines[0]) + ") Tj\n");
+        for (int i = 1; i < nLines; ++i) {
+            content.append("0 -" + QByteArray::number(lineGap, 'f', 1) + " Td\n");
+            content.append("(" + escapePdf(lines[i]) + ") Tj\n");
+        }
+        content.append("ET Q");
+
+        QPDFObjectHandle fontDict = pdf.makeIndirectObject(QPDFObjectHandle::newDictionary());
+        fontDict.replaceKey("/Type", QPDFObjectHandle::newName("/Font"));
+        fontDict.replaceKey("/Subtype", QPDFObjectHandle::newName("/Type1"));
+        fontDict.replaceKey("/BaseFont", QPDFObjectHandle::newName("/Helvetica"));
+
+        QPDFObjectHandle apStream = pdf.makeIndirectObject(QPDFObjectHandle::newStream(&pdf, content.toStdString()));
+        {
+            QPDFObjectHandle d = apStream.getDict();
+            d.replaceKey("/Type", QPDFObjectHandle::newName("/XObject"));
+            d.replaceKey("/Subtype", QPDFObjectHandle::newName("/Form"));
+            d.replaceKey("/FormType", QPDFObjectHandle::newInteger(1));
+            QPDFObjectHandle bbox = QPDFObjectHandle::newArray();
+            bbox.appendItem(QPDFObjectHandle::newReal(0));
+            bbox.appendItem(QPDFObjectHandle::newReal(0));
+            bbox.appendItem(QPDFObjectHandle::newReal(W));
+            bbox.appendItem(QPDFObjectHandle::newReal(H));
+            d.replaceKey("/BBox", bbox);
+            QPDFObjectHandle resources = QPDFObjectHandle::newDictionary();
+            QPDFObjectHandle fontRes = QPDFObjectHandle::newDictionary();
+            fontRes.replaceKey("/Helv", fontDict);
+            resources.replaceKey("/Font", fontRes);
+            d.replaceKey("/Resources", resources);
+        }
+
+        QPDFObjectHandle apDict = QPDFObjectHandle::newDictionary();
+        apDict.replaceKey("/N", apStream);
+        widget.replaceKey("/AP", apDict);
+        widget.replaceKey("/DA", QPDFObjectHandle::newString("/Helv 0 Tf 0 g"));
     }
 
     // AcroForm in Root
@@ -409,6 +559,10 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
     if (root.hasKey("/AcroForm")) {
         QPDFObjectHandle acroForm = root.getKey("/AcroForm");
         QPDFObjectHandle fields = acroForm.getKey("/Fields");
+        if (!fields.isArray()) {
+            fields = pdf.makeIndirectObject(QPDFObjectHandle::newArray());
+            acroForm.replaceKey("/Fields", fields);
+        }
         fields.appendItem(fieldRef);
         acroForm.replaceKey("/SigFlags", QPDFObjectHandle::newInteger(3));
     } else {
@@ -470,15 +624,17 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
     qint64 br4 = rawOut.size() - contentsEnd;
 
     // 3c — Locate and replace /ByteRange placeholder
-    const QByteArray brPlaceholder("[0 9999999999 9999999999 9999999999]");
-    qsizetype brPos = rawOut.indexOf(brPlaceholder);
-    if (brPos < 0) {
+    QRegularExpression reBR("\\[\\s*0\\s+9999999999\\s+9999999999\\s+9999999999\\s*\\]");
+    QRegularExpressionMatchIterator it = reBR.globalMatch(QString::fromLatin1(rawOut));
+    if (!it.hasNext()) {
         errorMsg = QStringLiteral("Cannot find /ByteRange placeholder in QPDF output");
         QFile::remove(tmpPath);
         return false;
     }
-    qsizetype brSecond = rawOut.indexOf(brPlaceholder, brPos + 1);
-    if (brSecond >= 0) {
+    QRegularExpressionMatch match = it.next();
+    qsizetype brPos = match.capturedStart();
+    qsizetype placeholderLen = match.capturedLength();
+    if (it.hasNext()) {
         errorMsg = QStringLiteral("Duplicate /ByteRange placeholder found");
         QFile::remove(tmpPath);
         return false;
@@ -488,12 +644,12 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
         .arg(br1).arg(br2).arg(br3).arg(br4);
     QByteArray brRealBytes = brReal.toLatin1();
     // Pad with spaces to match exact placeholder length
-    if (brRealBytes.size() > brPlaceholder.size()) {
+    if (brRealBytes.size() > placeholderLen) {
         errorMsg = QStringLiteral("/ByteRange value overflow (placeholder too small)");
         QFile::remove(tmpPath);
         return false;
     }
-    while (brRealBytes.size() < brPlaceholder.size())
+    while (brRealBytes.size() < placeholderLen)
         brRealBytes.append(' ');
     memcpy(rawOut.data() + brPos, brRealBytes.constData(), brRealBytes.size());
 
@@ -540,7 +696,7 @@ bool PdfSigner::signDocument(const QString& inputPath, const QString& outputPath
         }
     }
 
-    if (!CMS_final(cms, dataBio, nullptr, CMS_DETACHED | CMS_NOSMIMECAP)) {
+    if (!CMS_final(cms, dataBio, nullptr, CMS_DETACHED | CMS_BINARY | CMS_NOSMIMECAP)) {
         unsigned long err = ERR_get_error();
         char buf[256];
         ERR_error_string_n(err, buf, sizeof(buf));

@@ -19,6 +19,7 @@
 #include "core/Translator.h"
 #include "TranslationPopup.h"
 #include "NotificationBar.h"
+#include "NoteInputDialog.h"
 
 #include <fpdf_text.h>
 #include <fpdf_doc.h>
@@ -34,6 +35,7 @@ extern QMutex s_pdfiumMutex;
 #include <QToolBar>
 #include <QLabel>
 #include <QAction>
+
 #include <QStatusBar>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -44,6 +46,8 @@ extern QMutex s_pdfiumMutex;
 #include <QTimer>
 #include <QIcon>
 #include <QPixmap>
+#include <QColorDialog>
+#include <QInputDialog>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -59,6 +63,14 @@ extern QMutex s_pdfiumMutex;
 #include <QUrl>
 #include <QDesktopServices>
 #include <QRegularExpression>
+#include <QToolTip>
+#include <QCursor>
+#include <QDialog>
+#include <QFormLayout>
+#include <QSpinBox>
+#include <QCheckBox>
+#include <QDialogButtonBox>
+#include <QPushButton>
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -77,7 +89,7 @@ QMainWindow, QWidget                    { background:#1E1E1E; color:#D4D4D4; }
 QSplitter::handle                       { background:#333; width:1px; }
 QToolBar                                { background:#2D2D30; border-bottom:1px solid #111; spacing:2px; padding:2px 8px; }
 QToolButton                             { color:#D4D4D4; padding:2px 6px; border-radius:3px; border:none; background:transparent; }
-QToolButton:hover                       { background:#3E3E42; }
+QToolButton:hover                       { background:#1177BB; color:white; }
 QToolButton:checked                     { background:#1177BB; color:white; }
 QToolButton:pressed                     { background:#005f9e; }
 QTabWidget::pane                        { border:none; }
@@ -121,8 +133,8 @@ QMainWindow, QWidget                    { background:#F5F5F5; color:#1F2937; }
 QSplitter::handle                       { background:#B0B8C1; width:2px; height:2px; }
 QToolBar                                { background:#FFFFFF; border-bottom:2px solid #CBD5E1; spacing:2px; padding:2px 8px; }
 QToolBar::separator                     { background:#CBD5E1; width:1px; margin:4px 3px; }
-QToolButton                             { color:#374151; padding:2px 6px; border-radius:3px; border:none; background:transparent; }
-QToolButton:hover                       { background:#E5E7EB; }
+QToolButton                             { color:#000000; padding:2px 6px; border-radius:3px; border:none; background:transparent; }
+QToolButton:hover                       { background:#2563EB; color:white; }
 QToolButton:checked                     { background:#2563EB; color:white; }
 QToolButton:pressed                     { background:#1D4ED8; }
 QTabWidget::pane                        { border:none; background:transparent; }
@@ -170,6 +182,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     menuBar()->hide();
     setupActionBar();
+    new QShortcut(QKeySequence::Undo, this, [this]{ doUndo(); });
+    new QShortcut(QKeySequence::Redo, this, [this]{ doRedo(); });
+    new QShortcut(QKeySequence(Qt::Key_Escape), this, [this]{
+        if (auto* t = currentTab()) if (t->view) t->view->setTool(PdfGpuView::ViewTool::Pan);
+        m_selPage = -1; m_selIdx = -1;
+    });
+    new QShortcut(QKeySequence(Qt::Key_Delete), this, [this]{
+        if (m_selPage >= 0 && m_selIdx >= 0) deleteSelectedAnnot(m_selPage, m_selIdx);
+    });
 
     m_splitter = new QSplitter(Qt::Horizontal, this);
 
@@ -206,6 +227,17 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             this, &MainWindow::onPageChanged);
     connect(m_thumbPanel, &ThumbnailPanel::pageContextMenu,
             this, &MainWindow::showThumbnailContextMenu);
+    connect(m_thumbPanel, &ThumbnailPanel::annotToolSelected, this, [this](int id){
+        if (auto* t = currentTab()) if (t->view) t->view->setTool(static_cast<PdfGpuView::ViewTool>(id));
+    });
+    connect(m_thumbPanel, &ThumbnailPanel::commentActivated, this, &MainWindow::onPageChanged);
+    connect(m_thumbPanel, &ThumbnailPanel::annotStyleChanged, this,
+            [this](QColor color, double width, bool fill){
+        m_annotStyle.strokeColor = color;
+        m_annotStyle.strokeWidth = static_cast<float>(width);
+        m_annotStyle.opacity     = 1.0f;
+        m_annotStyle.fillColor   = fill ? color : QColor(Qt::transparent);
+    });
 
     // Text search
     connect(m_thumbPanel, &ThumbnailPanel::searchRequested,
@@ -370,6 +402,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             repositionNotifBar();
         });
     }
+
+    connect(qApp, &QApplication::applicationStateChanged, this,
+            [this](Qt::ApplicationState st) {
+        if (st != Qt::ApplicationActive) hideNotePopup();
+    });
 }
 
 MainWindow::~MainWindow() {
@@ -414,8 +451,12 @@ void MainWindow::setupActionBar() {
     // Sign
     auto* signAct = tb->addAction("Sign PDF…", this, &MainWindow::onSignPdf);
     signAct->setToolTip("Digitally sign this document with a certificate (.pfx/.p12)");
-    tb->addSeparator();
+    m_finalizeSigAct = tb->addAction("✔ Finalize Signature", this, &MainWindow::onFinalizeSignature);
+    m_cancelSigAct   = tb->addAction("✖ Cancel Signature",   this, &MainWindow::onCancelSignature);
+    m_finalizeSigAct->setVisible(false);
+    m_cancelSigAct->setVisible(false);
 #endif
+    tb->addSeparator();
 
     // Print
     tb->addAction("Print", this, &MainWindow::onPrintFile)->setShortcut(QKeySequence::Print);
@@ -597,6 +638,25 @@ void MainWindow::onOpenFile() {
     if (!path.isEmpty()) openFile(path);
 }
 
+void MainWindow::showNotePopup(const QString& text, const QString& author) {
+    if (text.isEmpty()) { hideNotePopup(); return; }
+    if (!m_notePopup) {
+        m_notePopup = new QLabel(nullptr, Qt::ToolTip | Qt::FramelessWindowHint);
+        m_notePopup->setWordWrap(true);
+        m_notePopup->setMargin(8);
+        m_notePopup->setMaximumWidth(360);
+        m_notePopup->setStyleSheet("QLabel{ background:#FFFDE7; border:1px solid #C9B458; color:#111827; }");
+    }
+    m_notePopup->setText(author.isEmpty() ? text : (author + ":\n" + text));
+    m_notePopup->adjustSize();
+    m_notePopup->move(QCursor::pos() + QPoint(14, 14));
+    m_notePopup->show();
+}
+
+void MainWindow::hideNotePopup() {
+    if (m_notePopup) m_notePopup->hide();
+}
+
 void MainWindow::onSaveFile() {
     auto* t = currentTab();
     if (!t) return;
@@ -604,25 +664,42 @@ void MainWindow::onSaveFile() {
         statusBar()->showMessage("No unsaved changes", 2000);
         return;
     }
-    const QString working  = t->doc->filePath();
     const QString original = t->originalPath;
+    const QString prevFile = t->doc->filePath();
+    const QString tmp      = makeTmpPath(original);
 
-    // Overwrite the original in place. If it's locked by another program or is
-    // read-only, the remove/copy fails → fall back to Save As.
+    // 1. Flush the in-memory document (page edits + annotations) to a temp file
+    //    (the document is still open, so FPDF_SaveAsCopy can read it).
+    if (t->annotMgr) {
+        t->annotMgr->setDocument(t->doc->raw(), tmp);
+        if (!t->annotMgr->saveDocument()) { onSaveAsFile(); return; }
+    }
+
+    // 2. Release our own handles on the original so it can be overwritten
+    //    (the open PDFium document + thumbnail pool lock the file on Windows).
+    t->doc->close();
+    if (t->thumbPool) t->thumbPool->close();
+    if (t->renderer) t->renderer->setTileCache(nullptr);
+
+    // 3. Overwrite the original with the temp.
     QFile::remove(original);
-    if (QFile::exists(original) || !QFile::copy(working, original)) {
-        QMessageBox::information(this, "Save",
-            "Couldn't overwrite the original file — it may be open in another "
-            "program or read-only.\nPlease choose a new location.");
-        onSaveAsFile();
+    if (!QFile::exists(original) && QFile::copy(tmp, original)) {
+        QFile::remove(tmp);
+        loadTabFile(t, original);                          // reopen from the saved original
+        if (prevFile != original) QFile::remove(prevFile); // discard any page-edit working copy
+        t->dirty = false;
+        updateTabDirty(t);
+        statusBar()->showMessage("Saved: " + QFileInfo(original).fileName(), 3000);
         return;
     }
 
-    loadTabFile(t, original);   // reopen from the freshly-saved original
-    QFile::remove(working);     // discard the working copy
-    t->dirty = false;
-    updateTabDirty(t);
-    statusBar()->showMessage("Saved: " + QFileInfo(original).fileName(), 3000);
+    // 4. Couldn't overwrite (locked by another program / read-only) — reopen from the
+    //    temp so the tab keeps its edits, then offer Save As.
+    loadTabFile(t, tmp);
+    QMessageBox::information(this, "Save",
+        "Couldn't overwrite the original file — it may be open in another "
+        "program or read-only.\nPlease choose a new location.");
+    onSaveAsFile();
 }
 
 void MainWindow::onSaveAsFile() {
@@ -635,21 +712,132 @@ void MainWindow::onSaveAsFile() {
     if (dest.isEmpty()) return;
     if (!dest.endsWith(".pdf", Qt::CaseInsensitive)) dest += ".pdf";
 
-    const QString working = t->doc->filePath();
-    QFile::remove(dest);
-    if (!QFile::copy(working, dest)) {
-        QMessageBox::warning(this, "Save As", "Could not write to:\n" + dest);
-        return;
+    const QString srcOriginal = t->originalPath;
+    const QString prevFile    = t->doc->filePath();
+    const QString tmp         = makeTmpPath(dest);
+
+    if (t->annotMgr) {
+        t->annotMgr->setDocument(t->doc->raw(), tmp);
+        if (!t->annotMgr->saveDocument()) {
+            QMessageBox::warning(this, "Save As", "Could not write to:\n" + dest);
+            QFile::remove(tmp);
+            return;
+        }
     }
 
-    const QString oldWorking = t->dirty ? working : QString();
+    QFile::remove(dest);
+    if (!QFile::copy(tmp, dest)) {
+        QMessageBox::warning(this, "Save As", "Could not write to:\n" + dest);
+        QFile::remove(tmp);
+        return;
+    }
+    QFile::remove(tmp);
+
     t->originalPath = dest;      // the tab now belongs to the new file
     loadTabFile(t, dest);
-    if (!oldWorking.isEmpty() && oldWorking != dest)
-        QFile::remove(oldWorking);
+    if (prevFile != srcOriginal && prevFile != dest)
+        QFile::remove(prevFile); // discard a page-edit working copy, never the source original
     t->dirty = false;
     updateTabDirty(t);
     statusBar()->showMessage("Saved as: " + QFileInfo(dest).fileName(), 4000);
+}
+
+void MainWindow::deleteSelectedAnnot(int page, int index) {
+    auto* t = currentTab();
+    if (!t || !t->annotMgr || index < 0) return;
+    AnnotSnapshot snap = t->annotMgr->snapshotAnnot(page, index);
+    if (!t->annotMgr->removeAnnot(page, index)) return;
+    DrawAction da; da.kind = DrawAction::Delete; da.page = page; da.snap = snap;
+    m_undoStack.append(da); m_redoStack.clear();
+    t->dirty = true; updateTabDirty(t);
+    if (t->view) t->view->clearSelectedAnnot();
+    m_selPage = -1; m_selIdx = -1;
+    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
+    if (t->doc && t->doc->isOpen()) m_thumbPanel->setComments(t->annotMgr->loadAll(t->doc->pageCount()));
+}
+
+void MainWindow::editSelectedAnnot(int page, int index) {
+    auto* t = currentTab();
+    if (!t || !t->annotMgr || index < 0) return;
+    auto list = t->annotMgr->loadPage(page);
+    if (index >= list.size()) return;
+    NoteInputDialog dlg(list[index].text, this, /*singleLine=*/(list[index].type == QLatin1String("FreeText")));
+    dlg.setWindowTitle("Edit text");
+    if (dlg.exec() != QDialog::Accepted) return;
+    QString newText = dlg.text();
+    AnnotSnapshot s = t->annotMgr->snapshotAnnot(page, index);
+    if (!s.valid) return;
+    s.contents = newText;
+    if (s.subtype == FPDF_ANNOT_FREETEXT) {
+        double w = qMax(24.0, static_cast<double>(newText.length()) * 5.5 + 6.0);
+        s.rr = s.rl + static_cast<float>(w);
+    }
+    if (!t->annotMgr->removeAnnot(page, index)) return;
+    t->annotMgr->addSnapshot(page, s);
+    t->dirty = true; updateTabDirty(t);
+    if (t->view) t->view->clearSelectedAnnot();
+    m_selPage = -1; m_selIdx = -1;
+    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
+    if (t->doc && t->doc->isOpen())
+        m_thumbPanel->setComments(t->annotMgr->loadAll(t->doc->pageCount()));
+}
+
+void MainWindow::doUndo() {
+    if (m_undoStack.isEmpty()) return;
+    auto* t = currentTab();
+    if (!t || !t->annotMgr) return;
+    DrawAction da = m_undoStack.takeLast();
+    bool ok = false;
+    if (da.kind == DrawAction::Add) {
+        int cnt = t->annotMgr->loadPage(da.page).size();
+        ok = (cnt > 0) && t->annotMgr->removeAnnot(da.page, cnt - 1);
+    } else if (da.kind == DrawAction::Move) {
+        int cnt = t->annotMgr->loadPage(da.page).size();
+        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
+        ok = t->annotMgr->addSnapshot(da.page, da.snap);
+    } else {
+        ok = t->annotMgr->addSnapshot(da.page, da.snap);
+    }
+    if (!ok) return;
+    m_redoStack.append(da);
+    t->dirty = true; updateTabDirty(t);
+    if (t->view) t->view->clearSelectedAnnot();
+    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); }
+    if (t->currentPage != da.page) { t->currentPage = da.page; m_thumbPanel->setCurrentPage(da.page); }
+    if (t->view) t->view->beginLoading();
+    if (t->renderer) t->renderer->requestPage(da.page, t->zoom);
+    if (t->doc && t->doc->isOpen()) m_thumbPanel->setComments(t->annotMgr->loadAll(t->doc->pageCount()));
+}
+
+void MainWindow::doRedo() {
+    if (m_redoStack.isEmpty()) return;
+    auto* t = currentTab();
+    if (!t || !t->annotMgr || !t->annotLayer) return;
+    DrawAction da = m_redoStack.takeLast();
+    if (da.kind == DrawAction::Add) {
+        if (da.isNote)
+            t->annotMgr->createPopupNote(da.page, da.a, da.text, da.author);
+        else if (da.isText)
+            t->annotMgr->createInlineNote(da.page,
+                (da.b.isNull() ? QRectF(da.a.x(), da.a.y(), 160, 20) : QRectF(da.a, da.b)),
+                da.text, da.author, da.textBg, da.style.strokeColor);
+        else
+            t->annotLayer->commitAnnotation(da.page, da.tool, da.style, da.a, da.b, {});
+    } else if (da.kind == DrawAction::Move) {
+        int cnt = t->annotMgr->loadPage(da.page).size();
+        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
+        t->annotMgr->addSnapshot(da.page, da.snapAfter);
+    } else {
+        int cnt = t->annotMgr->loadPage(da.page).size();
+        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
+    }
+    m_undoStack.append(da);
+    t->dirty = true; updateTabDirty(t);
+    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); }
+    if (t->currentPage != da.page) { t->currentPage = da.page; m_thumbPanel->setCurrentPage(da.page); }
+    if (t->view) t->view->beginLoading();
+    if (t->renderer) t->renderer->requestPage(da.page, t->zoom);
+    if (t->doc && t->doc->isOpen()) m_thumbPanel->setComments(t->annotMgr->loadAll(t->doc->pageCount()));
 }
 
 void MainWindow::onMergeFiles() {
@@ -667,7 +855,32 @@ void MainWindow::onSignPdf() {
 
     SignDialog dlg(this);
     if (dlg.exec() != QDialog::Accepted) return;
+    SignParams sp = dlg.params();
 
+    if (!dlg.visibleSignature()) { performSign(t, sp); return; }
+
+    if (m_continuousMode)
+        m_continuousAct->setChecked(false);
+
+    statusBar()->showMessage("Drag a rectangle where the signature should appear…");
+    QObject::disconnect(m_sigPickConn);
+    m_sigPickConn = connect(t->view, &PdfGpuView::signatureRectPicked, this,
+        [this, t, sp](int page, QRectF rectPt) {
+            QObject::disconnect(m_sigPickConn);
+            statusBar()->clearMessage();
+            t->annotMgr->createSignatureDraft(page, rectPt, QStringLiteral("[ Signature ]\nMove to position,\nthen Finalize"));
+            m_pendSp = sp;
+            m_pendPage = page;
+            m_pendActive = true;
+            if (m_finalizeSigAct) m_finalizeSigAct->setVisible(true);
+            if (m_cancelSigAct)   m_cancelSigAct->setVisible(true);
+            statusBar()->showMessage("Move the signature to position, then click 'Finalize Signature'");
+            if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
+        });
+    t->view->beginSignaturePick();
+}
+
+void MainWindow::performSign(DocTab* t, SignParams sp) {
     QString outPath = QFileDialog::getSaveFileName(
         this, "Save Signed PDF As",
         QFileInfo(t->doc->filePath()).completeBaseName() + "_signed.pdf",
@@ -675,7 +888,6 @@ void MainWindow::onSignPdf() {
     if (outPath.isEmpty()) return;
     if (!outPath.endsWith(".pdf", Qt::CaseInsensitive)) outPath += ".pdf";
 
-    SignParams sp = dlg.params();
     QString srcPath = t->doc->filePath();
 
     QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -705,7 +917,39 @@ void MainWindow::onSignPdf() {
         return {ok, errorMsg};
     }));
 }
-#endif // TORREADER_ENABLE_SIGNER
+
+void MainWindow::onFinalizeSignature() {
+    auto* t = currentTab();
+    if (!t || !m_pendActive) return;
+    int idx = -1;
+    QRectF rect = t->annotMgr->findSignatureDraftRect(m_pendPage, &idx);
+    if (idx < 0) { QMessageBox::warning(this, "Sign", "Signature draft not found."); return; }
+    t->annotMgr->removeAnnot(m_pendPage, idx);
+    SignParams sp = m_pendSp;
+    sp.pageIndex = m_pendPage;
+    sp.rectPt = rect;
+    m_pendActive = false; m_pendPage = -1;
+    if (m_finalizeSigAct) m_finalizeSigAct->setVisible(false);
+    if (m_cancelSigAct)   m_cancelSigAct->setVisible(false);
+    statusBar()->clearMessage();
+    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(t->currentPage, t->zoom); }
+    performSign(t, sp);
+}
+
+void MainWindow::onCancelSignature() {
+    auto* t = currentTab();
+    if (t && m_pendActive) {
+        int idx = -1;
+        t->annotMgr->findSignatureDraftRect(m_pendPage, &idx);
+        if (idx >= 0) t->annotMgr->removeAnnot(m_pendPage, idx);
+        if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(t->currentPage, t->zoom); }
+    }
+    m_pendActive = false; m_pendPage = -1;
+    if (m_finalizeSigAct) m_finalizeSigAct->setVisible(false);
+    if (m_cancelSigAct)   m_cancelSigAct->setVisible(false);
+    statusBar()->clearMessage();
+}
+#endif
 
 // Split the open PDF into single-page files named:
 //   "<base> - <bookmark title> - <NNN>.pdf"  (or "<base> - <NNN>.pdf" if no bookmark)
@@ -809,6 +1053,8 @@ void MainWindow::syncSidebarToTab(int docIdx, bool forceRebuild) {
     m_thumbPanel->setDocument(t->doc.get(), t->renderer.get(),
                               t->thumbPool.get(), forceRebuild);
     m_thumbPanel->setCurrentPage(t->currentPage);
+    if (t->annotMgr && t->doc && t->doc->isOpen())
+        m_thumbPanel->setComments(t->annotMgr->loadAll(t->doc->pageCount()));
 }
 
 // ── Tab helpers ───────────────────────────────────────────────────────────────
@@ -834,6 +1080,10 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path) {
     t->annotCacheValid = false;
     t->renderer->setDocument(t->doc.get());
     t->annotMgr->setDocument(t->doc->raw(), path);
+    if (t->annotLayer) {
+        t->annotLayer->setDocument(t->doc->raw());
+        t->annotLayer->setAnnotationManager(t->annotMgr.get());
+    }
 
     if (t->thumbPool && !t->thumbPool->open(path))
         t->thumbPool.reset(); // fallback: thumbnail panel uses PdfRenderer
@@ -935,6 +1185,157 @@ void MainWindow::openFile(const QString& path) {
         if (tab->doc->isOpen()) tab->renderer->requestPage(tab->currentPage, z);
     });
 
+    // ── Annotation signals ────────────────────────────────────────────────────
+    connect(tab->view, &PdfGpuView::shapeCommitRequested,
+            this, [this, tab](int pageIdx, AnnotTool tool, QPointF start, QPointF end) {
+        if (!tab->annotLayer) return;
+        AnnotStyle style = m_annotStyle;
+        tab->annotLayer->commitAnnotation(pageIdx, tool, style, start, end, {});
+        { DrawAction da; da.page = pageIdx; da.isText = false;
+          da.tool = tool; da.style = style; da.a = start; da.b = end;
+          m_undoStack.append(da); m_redoStack.clear(); }
+        if (tab->renderer) {
+            tab->renderer->setTileCache(nullptr);
+            tab->annotCacheValid = false;
+            tab->renderer->clearCache();
+            tab->renderer->requestPage(pageIdx, tab->zoom);
+        }
+        tab->dirty = true;
+        updateTabDirty(tab);
+    });
+
+    connect(tab->view, &PdfGpuView::noteRequested,
+            this, [this, tab](int pageIndex, QPointF pdfPoint) {
+        if (!tab) return;
+        NoteInputDialog dlg({}, this);
+        if (dlg.exec() != QDialog::Accepted) return;
+        tab->annotMgr->createPopupNote(pageIndex, pdfPoint, dlg.text(), dlg.author());
+        { DrawAction da; da.page = pageIndex; da.isNote = true; da.a = pdfPoint;
+          da.text = dlg.text(); da.author = dlg.author();
+          m_undoStack.append(da); m_redoStack.clear(); }
+        if (tab->renderer) {
+            tab->renderer->setTileCache(nullptr);
+            tab->annotCacheValid = false;
+            tab->renderer->clearCache();
+            tab->renderer->requestPage(pageIndex, tab->zoom);
+        }
+        tab->dirty = true;
+        updateTabDirty(tab);
+    });
+
+    connect(tab->view, &PdfGpuView::textBoxRequested, this,
+            [this, tab](int page, QRectF rectPdf) {
+        NoteInputDialog dlg({}, this, /*singleLine=*/true);
+        dlg.setWindowTitle("Add text");
+        if (dlg.exec() != QDialog::Accepted) return;
+        QString txt = dlg.text();
+        double w = qMax(24.0, static_cast<double>(txt.length()) * 5.5 + 6.0);
+        QRectF r(rectPdf.topLeft(), QSizeF(w, 18.0));
+        tab->annotMgr->createInlineNote(page, r, txt, dlg.author(), false, m_annotStyle.strokeColor);
+        { DrawAction da; da.page = page; da.isText = true;
+          da.a = r.topLeft(); da.b = r.bottomRight();
+          da.text = txt; da.author = dlg.author(); da.textBg = false; da.style = m_annotStyle;
+          m_undoStack.append(da); m_redoStack.clear(); }
+        if (tab->renderer) {
+            tab->renderer->setTileCache(nullptr);
+            tab->annotCacheValid = false;
+            tab->renderer->clearCache();
+            tab->renderer->requestPage(page, tab->zoom);
+        }
+    });
+
+    connect(tab->view, &PdfGpuView::annotationPickRequested, this,
+            [this, tab](int page, QPointF pt) {
+        if (!tab->annotMgr) return;
+        auto list = tab->annotMgr->loadPage(page);
+        m_selPage = -1; m_selIdx = -1;
+        for (int i = list.size() - 1; i >= 0; --i) {
+            if (list[i].type != QLatin1String("Widget") && list[i].rect.normalized().contains(pt)) {
+                m_selPage = page; m_selIdx = i;
+                tab->view->setSelectedAnnot(list[i].rect.normalized());
+                if (!list[i].text.isEmpty()) {
+                    showNotePopup(list[i].text, list[i].author);
+                }
+                return;
+            }
+        }
+        tab->view->clearSelectedAnnot();
+        hideNotePopup();
+    });
+
+    connect(tab->view, &PdfGpuView::annotationContextRequested, this,
+            [this, tab](int page, QPointF pt, QPoint gpos) {
+        if (!tab->annotMgr) return;
+        auto list = tab->annotMgr->loadPage(page);
+        int idx = -1;
+        for (int i = list.size() - 1; i >= 0; --i)
+            if (list[i].type != QLatin1String("Widget") && list[i].rect.normalized().contains(pt)) { idx = i; break; }
+        if (idx < 0) { tab->view->clearSelectedAnnot(); return; }
+        m_selPage = page; m_selIdx = idx;
+        tab->view->setSelectedAnnot(list[idx].rect.normalized());
+        QMenu menu(this);
+        const bool canEditText = (list[idx].type == QLatin1String("FreeText") || list[idx].type == QLatin1String("Note"));
+        QAction* editAct = canEditText ? menu.addAction("Edit text…") : nullptr;
+        QAction* propAct = menu.addAction("Properties…");
+        QAction* del     = menu.addAction("Delete");
+        QAction* chosen  = menu.exec(gpos);
+        if (chosen == del) {
+            deleteSelectedAnnot(page, idx);
+        } else if (editAct && chosen == editAct) {
+            editSelectedAnnot(page, idx);
+        } else if (chosen == propAct) {
+            QDialog dlg(this);
+            dlg.setWindowTitle("Markup properties");
+            auto* form = new QFormLayout(&dlg);
+            QColor curColor = m_annotStyle.strokeColor;
+            auto* colorBtn = new QPushButton("Choose…");
+            colorBtn->setStyleSheet(QString("background:%1;color:white;").arg(curColor.name()));
+            connect(colorBtn, &QPushButton::clicked, &dlg, [&]{
+                QColor c = QColorDialog::getColor(curColor, &dlg, "Markup color");
+                if (c.isValid()) { curColor = c; colorBtn->setStyleSheet(QString("background:%1;color:white;").arg(c.name())); }
+            });
+            auto* widthSpin = new QSpinBox; widthSpin->setRange(1, 24);
+            widthSpin->setValue(qMax(1, static_cast<int>(m_annotStyle.strokeWidth)));
+            auto* fillChk = new QCheckBox;
+            form->addRow("Color", colorBtn);
+            form->addRow("Width (px)", widthSpin);
+            form->addRow("Fill", fillChk);
+            auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+            form->addRow(bb);
+            connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+            connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+            if (dlg.exec() != QDialog::Accepted) return;
+            if (tab->annotMgr->setAnnotStyle(page, idx, curColor,
+                                             static_cast<float>(widthSpin->value()),
+                                             fillChk->isChecked())) {
+                tab->dirty = true; updateTabDirty(tab);
+                if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
+                if (tab->doc && tab->doc->isOpen())
+                    m_thumbPanel->setComments(tab->annotMgr->loadAll(tab->doc->pageCount()));
+            }
+        }
+    });
+
+    connect(tab->view, &PdfGpuView::annotationMoveRequested, this,
+            [this, tab](int page, double dx, double dy) {
+        if (m_selPage != page || m_selIdx < 0 || !tab->annotMgr) return;
+        AnnotSnapshot s = tab->annotMgr->snapshotAnnot(page, m_selIdx);
+        if (!s.valid) return;
+        AnnotSnapshot before = s;
+        s.rl += dx; s.rr += dx; s.rt += dy; s.rb += dy;
+        for (auto& stroke : s.ink)
+            for (auto& p : stroke) p = QPointF(p.x() + dx, p.y() + dy);
+        if (!tab->annotMgr->removeAnnot(page, m_selIdx)) return;
+        tab->annotMgr->addSnapshot(page, s);
+        { DrawAction da; da.kind = DrawAction::Move; da.page = page; da.snap = before; da.snapAfter = s; m_undoStack.append(da); m_redoStack.clear(); }
+        auto list = tab->annotMgr->loadPage(page);
+        m_selIdx = list.size() - 1;
+        if (m_selIdx >= 0 && m_selIdx < list.size())
+            tab->view->setSelectedAnnot(list[m_selIdx].rect.normalized());
+        tab->dirty = true; updateTabDirty(tab);
+        if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
+    });
+
     // ── Load PDF in background thread ─────────────────────────────────────────
     PdfDocument* docPtr = tab->doc.get();
     auto* watcher = new QFutureWatcher<bool>(this);
@@ -961,6 +1362,9 @@ void MainWindow::openFile(const QString& path) {
         // Success — finish setup on main thread
         tab->renderer->setDocument(tab->doc.get());
         tab->annotMgr->setDocument(tab->doc->raw(), path);
+        tab->annotLayer = std::make_unique<AnnotationLayer>(this);
+        tab->annotLayer->setDocument(tab->doc->raw());
+        tab->annotLayer->setAnnotationManager(tab->annotMgr.get());
 
         // Open FormibDoc in background — avoids blocking UI thread with f.readAll()
         // + formibpdf_open() parsing (can take several seconds for large files).
@@ -1045,6 +1449,11 @@ void MainWindow::openFile(const QString& path) {
 // ── Tab switching / closing ───────────────────────────────────────────────────
 
 void MainWindow::onTabChanged(int) {
+    hideNotePopup();
+    m_selPage = -1;
+    m_selIdx = -1;
+    auto* _t = currentTab();
+    if (_t && _t->view) _t->view->clearSelectedAnnot();
     auto* t = currentTab();
     if (t) {
         // Only sync sidebar if the document is already open.
@@ -1085,12 +1494,12 @@ void MainWindow::onTabClose(int idx) {
         if (t->dirty) {
             m_docTabs->setCurrentIndex(idx);
             auto r = QMessageBox::question(this, "Unsaved Changes",
-                QString("\"%1\" has unsaved changes.\nSave before closing?")
+                QString("Do you want to save changes to \"%1\"?")
                     .arg(QFileInfo(t->originalPath).fileName()),
-                QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
-                QMessageBox::Save);
+                QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel,
+                QMessageBox::Yes);
             if (r == QMessageBox::Cancel) return;
-            if (r == QMessageBox::Save) {
+            if (r == QMessageBox::Yes) {
                 onSaveFile();
                 if (t->dirty) return; // save failed / Save As cancelled → keep open
             }
@@ -1129,6 +1538,11 @@ void MainWindow::onTabClose(int idx) {
 // ── Page navigation ───────────────────────────────────────────────────────────
 
 void MainWindow::onPageChanged(int pageIndex) {
+    hideNotePopup();
+    m_selPage = -1;
+    m_selIdx = -1;
+    auto* _t = currentTab();
+    if (_t && _t->view) _t->view->clearSelectedAnnot();
     auto* t = currentTab();
     qDebug() << "[Main] onPageChanged req=" << pageIndex
              << "hasTab=" << (t != nullptr)
@@ -1192,15 +1606,22 @@ void MainWindow::dropEvent(QDropEvent* e) {
 }
 
 void MainWindow::closeEvent(QCloseEvent* e) {
-    // Warn if any tab has unsaved in-memory edits.
     int dirtyCount = 0;
     for (auto* t : m_openDocs) if (t->dirty) ++dirtyCount;
     if (dirtyCount > 0) {
         auto r = QMessageBox::question(this, "Unsaved Changes",
-            QString("%1 document(s) have unsaved changes.\nQuit without saving?")
+            QString("Do you want to save changes to %1 document(s)?")
                 .arg(dirtyCount),
-            QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel);
+            QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel,
+            QMessageBox::Yes);
         if (r == QMessageBox::Cancel) { e->ignore(); return; }
+        if (r == QMessageBox::Yes) {
+            for (auto* t : m_openDocs) {
+                if (!t->dirty) continue;
+                m_docTabs->setCurrentWidget(t->view);
+                onSaveFile();
+            }
+        }
     }
     e->accept();
 }

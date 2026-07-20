@@ -64,7 +64,7 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     }
     aLayout->addWidget(logoCard);
 
-    auto* versionLabel = new QLabel("TorReader PDF — Version 2.0.0");
+    auto* versionLabel = new QLabel("TorReader PDF — Version 2.2");
     versionLabel->setAlignment(Qt::AlignCenter);
     versionLabel->setStyleSheet("color: #6B7280; font-size: 11px;");
     aLayout->addWidget(versionLabel);

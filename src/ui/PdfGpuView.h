@@ -11,14 +11,18 @@
 #include <QSizeF>
 #include <QString>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QMatrix4x4>
+#include <QKeyEvent>
+
+#include "annotations/AnnotationTypes.h"
 
 // GPU-accelerated PDF page viewer (drop-in replacement for PdfView).
 // Renders page as an OpenGL texture — pan/zoom = matrix update only, no CPU re-render.
 class PdfGpuView : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
-    enum class ViewTool { Pan, PlaceNote };
+    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText };
     enum class ViewMode { Single, Double };  // Double is no-op (GPU view is single-mode)
 
     struct AnnotOverlay {
@@ -42,10 +46,13 @@ public:
     void setDarkMode(bool dark);
     void beginLoading();
     void setTool(ViewTool tool);
+    void beginSignaturePick();
     void setHighlights(const QList<QRectF>& rects);
     void clearHighlights();
     void setAnnotOverlays(const QList<AnnotOverlay>& overlays);
     void clearAnnotOverlays();
+    void setSelectedAnnot(const QRectF& rectPdf);
+    void clearSelectedAnnot();
 
     double   zoom()        const { return m_zoom; }
     int      currentPage() const { return m_pageIndex; }
@@ -63,6 +70,12 @@ signals:
     void noteRequested(int pageIndex, QPointF pdfPoint);
     void noteEditRequested(int pageIndex, int annotIndex);
     void textRegionSelected(int pageIndex, QRectF pageRectPts, QPoint globalPos);
+    void shapeCommitRequested(int pageIndex, AnnotTool tool, QPointF start, QPointF end);
+    void textBoxRequested(int pageIndex, QRectF rectPdf);
+    void annotationPickRequested(int pageIndex, QPointF pdfPoint);
+    void annotationContextRequested(int pageIndex, QPointF pdfPoint, QPoint globalPos);
+    void annotationMoveRequested(int pageIndex, double dx, double dy);
+    void signatureRectPicked(int pageIndex, QRectF rectPt);
 
 protected:
     void initializeGL() override;
@@ -72,6 +85,7 @@ protected:
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
+    void keyPressEvent(QKeyEvent*) override;
 
 private:
     void uploadTexture(const QImage& img);
@@ -97,6 +111,9 @@ private:
     QSizeF  m_pageSizePt;
     double  m_zoom        = 1.0;
     QPointF m_panOffset;
+    double  m_flipAccum = 0.0;
+    QElapsedTimer m_flipCooldown;
+    QImage  m_lastImage;
     bool    m_hasImage    = false;
     bool    m_loading     = false;
     bool    m_darkMode    = false;
@@ -107,10 +124,30 @@ private:
     bool    m_panning      = false;
     QPointF m_lastMousePos;
 
+    // Shape drawing
+    bool    m_drawingShape = false;
+    QPointF m_shapeStart;
+    QPointF m_shapeEnd;
+
     // Text selection (Ctrl+drag)
     bool    m_selecting  = false;
     QPointF m_selStart;
     QPointF m_selEnd;
+
+    // Selection
+    QRectF m_selRect;
+    bool   m_hasSel = false;
+
+    // Signature pick mode
+    bool    m_sigPickMode = false;
+    bool    m_sigActive   = false;
+    QPointF m_sigStart;
+    QPointF m_sigEnd;
+
+    // Drag-to-move annotation
+    bool    m_draggingAnnot = false;
+    QPointF m_dragStart;
+    QRectF  m_dragOrigRect;
 
     // Overlays (drawn via QPainter on top of GL)
     QList<QRectF>       m_highlights;

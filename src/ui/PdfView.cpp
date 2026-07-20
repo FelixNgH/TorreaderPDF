@@ -99,7 +99,7 @@ void PdfView::setDarkMode(bool dark) {
 
 void PdfView::setTool(ViewTool tool) {
     m_tool = tool;
-    setCursor(tool == ViewTool::PlaceNote ? Qt::CrossCursor : Qt::ArrowCursor);
+    setCursor(tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
 }
 
 // ── Coordinate helpers ────────────────────────────────────────────────────────
@@ -230,6 +230,21 @@ void PdfView::paintEvent(QPaintEvent*) {
         p.restore();
     }
 
+    if (m_drawingShape) {
+        p.save();
+        QPen dashPen(Qt::blue, 2, Qt::DashLine);
+        p.setPen(dashPen);
+        p.setBrush(Qt::NoBrush);
+        QRectF sr(m_shapeStart, m_shapeEnd);
+        if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow)
+            p.drawLine(m_shapeStart, m_shapeEnd);
+        else if (m_tool == ViewTool::Rectangle)
+            p.drawRect(sr.normalized());
+        else if (m_tool == ViewTool::Ellipse)
+            p.drawEllipse(sr.normalized());
+        p.restore();
+    }
+
     if (m_loading) {
         p.fillRect(rect(), QColor(0, 0, 0, 60));
         p.setPen(Qt::white);
@@ -276,21 +291,27 @@ void PdfView::wheelEvent(QWheelEvent* e) {
 }
 
 void PdfView::mousePressEvent(QMouseEvent* e) {
-    if (m_tool == ViewTool::PlaceNote && e->button() == Qt::LeftButton) {
-        if (!m_pixmap.isNull()) {
+    if (e->button() == Qt::LeftButton && !m_pixmap.isNull()) {
+        if (m_tool == ViewTool::PlaceNote || m_tool == ViewTool::FreeText) {
             // In double mode: determine which page was clicked
             if (m_viewMode == ViewMode::Double && !m_pixmap2.isNull()) {
                 QPointF po2 = page2Origin();
                 if (e->position().x() >= po2.x()) {
-                    // Clicked on right page
                     QPointF pdfPt = (e->position() - po2) / m_zoom;
                     emit noteRequested(m_pageIndex2, pdfPt);
                     return;
                 }
             }
             emit noteRequested(m_pageIndex, widgetToPdf(e->position()));
+            return;
         }
-        return;
+        if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow ||
+            m_tool == ViewTool::Rectangle || m_tool == ViewTool::Ellipse) {
+            m_drawingShape = true;
+            m_shapeStart = e->position();
+            m_shapeEnd = e->position();
+            return;
+        }
     }
     if (e->button() == Qt::LeftButton || e->button() == Qt::MiddleButton) {
         m_panning      = true;
@@ -300,6 +321,11 @@ void PdfView::mousePressEvent(QMouseEvent* e) {
 }
 
 void PdfView::mouseMoveEvent(QMouseEvent* e) {
+    if (m_drawingShape) {
+        m_shapeEnd = e->position();
+        update();
+        return;
+    }
     if (m_panning) {
         m_panOffset   += e->position() - m_lastMousePos;
         m_lastMousePos = e->position();
@@ -307,9 +333,31 @@ void PdfView::mouseMoveEvent(QMouseEvent* e) {
     }
 }
 
-void PdfView::mouseReleaseEvent(QMouseEvent*) {
+void PdfView::mouseReleaseEvent(QMouseEvent* e) {
+    if (m_drawingShape) {
+        if (e->button() == Qt::LeftButton) {
+            m_drawingShape = false;
+            QPointF startPdf = widgetToPdf(m_shapeStart);
+            QPointF endPdf   = widgetToPdf(m_shapeEnd);
+            if ((endPdf - startPdf).manhattanLength() > 5.0) {
+                AnnotTool at = AnnotTool::Line;
+                switch (m_tool) {
+                    case ViewTool::Arrow:     at = AnnotTool::Arrow; break;
+                    case ViewTool::Rectangle: at = AnnotTool::Rectangle; break;
+                    case ViewTool::Ellipse:   at = AnnotTool::Ellipse; break;
+                    default:                  at = AnnotTool::Line; break;
+                }
+                emit shapeCommitRequested(m_pageIndex, at, startPdf, endPdf);
+            }
+        } else {
+            m_drawingShape = false;
+        }
+        setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+        update();
+        return;
+    }
     m_panning = false;
-    setCursor(m_tool == ViewTool::PlaceNote ? Qt::CrossCursor : Qt::ArrowCursor);
+    setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
 }
 
 void PdfView::resizeEvent(QResizeEvent*) { update(); }

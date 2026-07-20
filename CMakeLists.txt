@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.1.3 LANGUAGES CXX)
+project(TorReader VERSION 2.0.0 LANGUAGES CXX)
 
-# ── FormibPDF — Rust helper engine (low-res preview rendering) ──────────────
+# ── FormibPDF — Rust engine (Phase 2) ────────────────────────────────────────
 include(FetchContent)
 FetchContent_Declare(
     Corrosion
@@ -10,12 +10,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Corrosion)
 
-set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/formibpdf-target" CACHE STRING
-    "Cargo target dir (short path avoids MSVC PDB path-length limit on Windows)")
+set(CARGO_TARGET_DIR "C:/tmp/formibpdf-target" CACHE STRING "Cargo target dir (short path to avoid MSVC PDB limit)")
 corrosion_import_crate(
     MANIFEST_PATH "${CMAKE_SOURCE_DIR}/src/formibpdf/Cargo.toml"
     PROFILE release
 )
+# Override cargo target dir to avoid long-path PDB bug on Windows
 set_target_properties(formibpdf-static PROPERTIES
     CARGO_ENV "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
 )
@@ -26,6 +26,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+# Output to build/bin
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ── Qt6 ──────────────────────────────────────────────────────────────────────
@@ -33,18 +34,20 @@ find_package(Qt6 REQUIRED COMPONENTS
     Core Widgets Gui Concurrent PrintSupport OpenGL OpenGLWidgets Network
 )
 
-# ── PDFium (bundled prebuilt, BSD 3-Clause — see third_party/pdfium/LICENSE) ─
-# Source: https://github.com/bblanchon/pdfium-binaries
+# ── PDFium (pdfium-binaries pre-built) ───────────────────────────────────────
+# Download từ https://github.com/bblanchon/pdfium-binaries/releases
+# Giải nén vào third_party/pdfium/
 set(PDFIUM_DIR "${CMAKE_SOURCE_DIR}/third_party/pdfium" CACHE PATH "PDFium directory")
 add_library(pdfium SHARED IMPORTED)
 if(WIN32)
     set(_pdfium_dll "${PDFIUM_DIR}/bin/pdfium.dll")
     set(_pdfium_lib "${PDFIUM_DIR}/lib/pdfium.dll.lib")
     if(NOT EXISTS "${_pdfium_lib}")
+        # fallback: plain pdfium.lib
         set(_pdfium_lib "${PDFIUM_DIR}/lib/pdfium.lib")
     endif()
     if(NOT EXISTS "${_pdfium_dll}" OR NOT EXISTS "${_pdfium_lib}")
-        message(FATAL_ERROR "PDFium not found at ${PDFIUM_DIR} — see README.md")
+        message(FATAL_ERROR "PDFium không tìm thấy tại ${PDFIUM_DIR}. Xem README để tải pdfium-binaries.")
     endif()
     set_target_properties(pdfium PROPERTIES
         IMPORTED_LOCATION "${_pdfium_dll}"
@@ -54,7 +57,7 @@ if(WIN32)
 else()
     find_library(PDFIUM_LIB NAMES pdfium PATHS "${PDFIUM_DIR}/lib" NO_DEFAULT_PATH)
     if(NOT PDFIUM_LIB)
-        message(FATAL_ERROR "PDFium not found — see README.md")
+        message(FATAL_ERROR "PDFium không tìm thấy. Xem README để tải pdfium-binaries.")
     endif()
     set_target_properties(pdfium PROPERTIES
         IMPORTED_LOCATION "${PDFIUM_LIB}"
@@ -62,7 +65,10 @@ else()
     )
 endif()
 
-# ── QPDF (Apache-2.0) — system package or vcpkg ──────────────────────────────
+# ── QPDF (Apache 2.0) ────────────────────────────────────────────────────────
+# NO_DEFAULT_PATH: only look in third_party/ — prevents CMake picking up the
+# vcpkg debug lib from the system search path when third_party/ is absent.
+find_package(PkgConfig QUIET)
 find_library(QPDF_LIB NAMES qpdf
     HINTS "${CMAKE_SOURCE_DIR}/third_party/qpdf/lib"
     NO_DEFAULT_PATH)
@@ -70,11 +76,12 @@ find_path(QPDF_INCLUDE NAMES qpdf/QPDF.hh
     HINTS "${CMAKE_SOURCE_DIR}/third_party/qpdf/include"
     NO_DEFAULT_PATH)
 if(NOT QPDF_LIB OR NOT QPDF_INCLUDE)
+    # Prefer vcpkg cmake config (handles Release/Debug DLLs correctly).
     find_package(qpdf CONFIG QUIET)
     if(NOT qpdf_FOUND)
-        message(FATAL_ERROR "QPDF not found. Install with: vcpkg install qpdf  (Windows) or  apt install libqpdf-dev  (Linux)")
+        message(FATAL_ERROR "QPDF không tìm thấy. Cài bằng: vcpkg install qpdf hoặc apt install libqpdf-dev")
     endif()
-    set(QPDF_TARGET qpdf::libqpdf)
+    set(QPDF_TARGET qpdf::libqpdf)  # target name from vcpkg cmake config
 else()
     add_library(qpdf::qpdf UNKNOWN IMPORTED)
     set_target_properties(qpdf::qpdf PROPERTIES
@@ -84,15 +91,24 @@ else()
     set(QPDF_TARGET qpdf::qpdf)
 endif()
 
-# ── OpenSSL (Apache-2.0) — OPTIONAL, enables "Sign PDF" (PKCS#7 detached) ────
-# Not required to build: if OpenSSL dev headers aren't installed, TorReader
-# still builds fully, just without the digital-signature feature.
-find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
-    set(TORREADER_ENABLE_SIGNER ON)
-    message(STATUS "OpenSSL found — Sign PDF feature ENABLED")
+# ── Tesseract OCR (Apache 2.0) ───────────────────────────────────────────────
+find_library(TESSERACT_LIB NAMES tesseract tesseract53
+    HINTS "${CMAKE_SOURCE_DIR}/third_party/tesseract/lib")
+find_path(TESSERACT_INCLUDE NAMES tesseract/baseapi.h
+    HINTS "${CMAKE_SOURCE_DIR}/third_party/tesseract/include")
+if(NOT TESSERACT_LIB)
+    find_package(Tesseract CONFIG QUIET)
+    if(NOT Tesseract_FOUND)
+        message(WARNING "Tesseract không tìm thấy — OCR search raster sẽ bị tắt.")
+        set(FELIXPDF_ENABLE_OCR OFF)
+    endif()
 else()
-    message(STATUS "OpenSSL not found — Sign PDF feature DISABLED (install libssl-dev / vcpkg openssl to enable)")
+    add_library(Tesseract::libtesseract UNKNOWN IMPORTED)
+    set_target_properties(Tesseract::libtesseract PROPERTIES
+        IMPORTED_LOCATION "${TESSERACT_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${TESSERACT_INCLUDE}"
+    )
+    set(FELIXPDF_ENABLE_OCR ON)
 endif()
 
 # ── Sources ───────────────────────────────────────────────────────────────────
@@ -109,12 +125,14 @@ set(SOURCES
     src/core/UpdateChecker.cpp
     src/core/GoogleAuth.cpp
     src/core/Translator.cpp
-    src/core/PdfPrinter.cpp
 
     # Annotations
     src/annotations/AnnotationLayer.cpp
     src/annotations/AnnotationTool.cpp
     src/annotations/AnnotationManager.cpp
+
+    # Print
+    src/core/PdfPrinter.cpp
 
     # UI
     src/ui/MainWindow.cpp
@@ -163,13 +181,14 @@ set(HEADERS
     src/ui/NotificationBar.h
 )
 
-if(TORREADER_ENABLE_SIGNER)
-    list(APPEND SOURCES src/core/PdfSigner.cpp src/ui/SignDialog.cpp)
-    list(APPEND HEADERS src/core/PdfSigner.h   src/ui/SignDialog.h)
+if(FELIXPDF_ENABLE_OCR)
+    list(APPEND SOURCES src/core/OcrEngine.cpp)
+    list(APPEND HEADERS src/core/OcrEngine.h)
 endif()
 
 # ── Executable ────────────────────────────────────────────────────────────────
 if(WIN32)
+    # Windows: ẩn console window, embed .ico into exe (Explorer + taskbar pinned icon)
     add_executable(TorReader WIN32
         ${SOURCES} ${HEADERS}
         resources/resources.qrc
@@ -181,7 +200,7 @@ endif()
 
 target_compile_definitions(TorReader PRIVATE
     FELIXPDF_VERSION="${PROJECT_VERSION}"
-    $<$<BOOL:${TORREADER_ENABLE_SIGNER}>:TORREADER_ENABLE_SIGNER>
+    $<$<BOOL:${FELIXPDF_ENABLE_OCR}>:FELIXPDF_ENABLE_OCR>
 )
 
 target_include_directories(TorReader PRIVATE src src/formibpdf)
@@ -198,19 +217,21 @@ target_link_libraries(TorReader PRIVATE
     Qt6::Network
     pdfium
     ${QPDF_TARGET}
-    $<$<BOOL:${TORREADER_ENABLE_SIGNER}>:OpenSSL::Crypto>
+    $<$<BOOL:${FELIXPDF_ENABLE_OCR}>:Tesseract::libtesseract>
     # Rust formibpdf image_decoder pulls in LittleCMS (ICC → sRGB) on Linux
     $<$<NOT:$<BOOL:${WIN32}>>:lcms2>
 )
 
 # ── Packaging (Windows portable) ──────────────────────────────────────────────
 if(WIN32)
+    # Copy PDFium DLL
     add_custom_command(TARGET TorReader POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${PDFIUM_DIR}/bin/pdfium.dll"
             $<TARGET_FILE_DIR:TorReader>
         COMMENT "Copying pdfium.dll"
     )
+    # windeployqt để bundle Qt DLLs
     find_program(WINDEPLOYQT windeployqt HINTS "${Qt6_DIR}/../../../bin")
     if(WINDEPLOYQT)
         add_custom_command(TARGET TorReader POST_BUILD
@@ -222,8 +243,10 @@ if(WIN32)
         )
     endif()
 
+    # Copy QPDF DLL (vcpkg x64-windows: DLL lives next to the .lib import lib)
     if(QPDF_LIB)
         get_filename_component(_qpdf_lib_dir "${QPDF_LIB}" DIRECTORY)
+        # vcpkg layout: lib/ → ../bin/
         file(GLOB _qpdf_dlls
             "${_qpdf_lib_dir}/../bin/qpdf*.dll"
             "${_qpdf_lib_dir}/qpdf*.dll"
@@ -236,6 +259,7 @@ if(WIN32)
             )
         endforeach()
     elseif(qpdf_FOUND)
+        # Installed via find_package(qpdf CONFIG) — target carries DLL path
         add_custom_command(TARGET TorReader POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:qpdf::libqpdf>

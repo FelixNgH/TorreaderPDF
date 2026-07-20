@@ -3,14 +3,6 @@
 #include <QDebug>
 #include <fpdf_text.h>
 
-#ifndef _WIN32
-#include <QFile>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#endif
-
 // Serializes FPDF_LoadCustomDocument / FPDF_LoadDocument / FPDF_CloseDocument
 // (PDFium document-level operations have internal global state).
 QMutex s_pdfiumMutex;

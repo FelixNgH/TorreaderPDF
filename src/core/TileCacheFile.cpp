@@ -1,5 +1,6 @@
 #include "TileCacheFile.h"
 #include <QBuffer>
+#include <QDir>
 #include <QFileInfo>
 #include <QMutexLocker>
 #include <cstring>
@@ -47,7 +48,8 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
     QMutexLocker lock(&m_mutex);
     if (m_open) { m_file.close(); m_open = false; }
     m_path = pdfPath;
-    QString cachePath = pdfPath + ".torcache";
+    QString cachePath = QDir::temp().filePath(
+        QFileInfo(pdfPath).fileName() + "_" + QString::number(pdfHash, 16) + ".torcache");
 
     if (QFile::exists(cachePath)) {
         m_file.setFileName(cachePath);
