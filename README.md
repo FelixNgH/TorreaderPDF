@@ -47,7 +47,8 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 - **Split PDF** — split a document into parts by page count or size
 - **Extract pages** — pull any page or range out into a new PDF
 - **Insert pages** — Adobe-style, right-click a thumbnail to insert pages from another PDF; bookmarks renumber to match
-- **Sign PDF** — digital signature, PKCS#7 detached, SHA-256, using your own `.pfx`/`.p12` certificate
+- **Sign PDF** — digital signature, PKCS#7 detached, SHA-256, using your own `.pfx`/`.p12` certificate; optional visible signature stamp, placed by dragging then confirmed with "Finalize Signature"
+- **Comments (markup)** — Line, Arrow, Rectangle, Ellipse, Cloud, Text box, and sticky Note tools with color/width/fill controls; select, move, and undo/redo any markup
 - **Translate PDF (free)** — Ctrl+drag over text to translate it in place, cached locally
 - **Delete / Reorder pages**, reorder bookmarks
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
