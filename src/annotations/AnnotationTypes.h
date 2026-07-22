@@ -25,5 +25,6 @@ struct AnnotStyle {
     QColor fillColor   = Qt::transparent;
     float  strokeWidth = 2.0f;
     float  opacity     = 1.0f;
+    float  fontSize    = 11.0f;
     QString stampText; // for Stamp tool
 };

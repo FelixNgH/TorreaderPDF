@@ -9,6 +9,19 @@
 
 extern QMutex s_pdfiumMutex;
 
+// ── Rotation-aware point transform ─────────────────────────────────────────────
+// (xd, yd) = display coordinates (Y down from top of DISPLAYED page)
+// (Wd, Hd) = display size = FPDF_GetPageWidth/Height
+// returns  (xu, yu) = unrotated PDF space (Y up from bottom)
+static QPointF dispToPdf(double xd, double yd, double Wd, double Hd, int rot) {
+    switch (rot) {
+        case 1:  return { yd,       xd };
+        case 2:  return { Wd - xd,  yd };
+        case 3:  return { Hd - yd,  Wd - xd };
+        default: return { xd,       Hd - yd };   // 0
+    }
+}
+
 AnnotationLayer::AnnotationLayer(QObject* parent) : QObject(parent) {}
 
 void AnnotationLayer::setDocument(FPDF_DOCUMENT doc) { m_doc = doc; }
@@ -22,14 +35,18 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
     if (!page) return;
 
-    double pageH = FPDF_GetPageHeight(page);
+    double pageH  = FPDF_GetPageHeight(page);
+    double pageW  = FPDF_GetPageWidth(page);
+    int    rot    = FPDFPage_GetRotation(page);
 
     // Line & Arrow → INK annotation. A bare FPDF_ANNOT_LINE (no /L, no AP) is dropped on save.
     if (tool == AnnotTool::Line || tool == AnnotTool::Arrow) {
         FPDF_ANNOTATION ink = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (!ink) { FPDF_ClosePage(page); return; }
-        FS_POINTF a{ static_cast<float>(start.x()), static_cast<float>(pageH - start.y()) };
-        FS_POINTF b{ static_cast<float>(end.x()),   static_cast<float>(pageH - end.y()) };
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        FS_POINTF a{ static_cast<float>(pa.x()), static_cast<float>(pa.y()) };
+        FS_POINTF b{ static_cast<float>(pb.x()), static_cast<float>(pb.y()) };
         FS_POINTF shaft[2] = { a, b };
         FPDFAnnot_AddInkStroke(ink, shaft, 2);
         if (tool == AnnotTool::Arrow) {
@@ -76,10 +93,12 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     if (tool == AnnotTool::Cloud) {
         FPDF_ANNOTATION ck = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (!ck) { FPDF_ClosePage(page); return; }
-        float x0 = static_cast<float>(qMin(start.x(), end.x()));
-        float x1 = static_cast<float>(qMax(start.x(), end.x()));
-        float yTop = static_cast<float>(pageH - qMin(start.y(), end.y()));
-        float yBot = static_cast<float>(pageH - qMax(start.y(), end.y()));
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        float x0 = static_cast<float>(qMin(pa.x(), pb.x()));
+        float x1 = static_cast<float>(qMax(pa.x(), pb.x()));
+        float yBot = static_cast<float>(qMin(pa.y(), pb.y()));
+        float yTop = static_cast<float>(qMax(pa.y(), pb.y()));
         const float r = 9.0f;
         std::vector<FS_POINTF> pts;
         auto addEdge = [&](float ax, float ay, float bx, float by, float nx, float ny) {
@@ -147,12 +166,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, subtype);
     if (!annot) { FPDF_ClosePage(page); return; }
 
-    // Y-flip: PDF Y increases upward, Qt Y increases downward
+    QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
+    QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
     FS_RECTF rect{
-        static_cast<float>(qMin(start.x(), end.x())),
-        static_cast<float>(pageH - qMax(start.y(), end.y())),
-        static_cast<float>(qMax(start.x(), end.x())),
-        static_cast<float>(pageH - qMin(start.y(), end.y()))
+        static_cast<float>(qMin(pa.x(), pb.x())),
+        static_cast<float>(qMin(pa.y(), pb.y())),
+        static_cast<float>(qMax(pa.x(), pb.x())),
+        static_cast<float>(qMax(pa.y(), pb.y()))
     };
     FPDFAnnot_SetRect(annot, &rect);
 

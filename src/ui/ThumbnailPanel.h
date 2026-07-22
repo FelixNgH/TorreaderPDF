@@ -7,6 +7,7 @@
 #include <QAtomicInt>
 #include <QList>
 #include <QSet>
+#include <QHash>
 #include <QRectF>
 #include <QString>
 #include "annotations/AnnotationManager.h"
@@ -29,7 +30,9 @@ public:
                      ThumbnailRenderPool* pool = nullptr,
                      bool forceRebuild = false);
     void setComments(const QList<AnnotInfo>& comments);
+    void setAnnotMgr(AnnotationManager* mgr, int pageCount);
     void setCurrentPage(int pageIndex);
+    QImage thumbnailForPage(int pageIndex) const;
     void clearThumbnails();
     void setDarkMode(bool dark);
 
@@ -49,15 +52,19 @@ signals:
     void annotToolSelected(int toolId);
     void commentActivated(int pageIndex);
     void annotStyleChanged(QColor color, double width, bool fill);
+    void requestComments();
 
 private slots:
     void onPageReady(int pageIndex, const QImage& image);
 
 private:
+    void requestVisibleThumbnails();
+    void resizeEvent(QResizeEvent* event) override;
     void buildBookmarks();
     void buildContentTree();
     void buildProperties();
     void syncBookmarkToPage(int pageIndex);
+    void flushPendingThumbs();
 
     // Tab navigation: 2×2 button grid + stacked content widget
     QStackedWidget* m_stack          = nullptr;
@@ -73,15 +80,17 @@ private:
     PdfDocument*         m_doc       = nullptr;
     PdfRenderer*         m_renderer  = nullptr;
     ThumbnailRenderPool* m_thumbPool = nullptr;
-    QMetaObject::Connection m_rendererConn;
     QMetaObject::Connection m_thumbPoolConn;
     QMetaObject::Connection m_scrollConn;
     int           m_currentPage = -1;
     QAtomicInt    m_contentGen{0};
     QAtomicInt    m_bookmarkGen{0};
     QAtomicInt    m_propsGen{0};
+    AnnotationManager* m_annotMgr   = nullptr;
+    int                m_annotPages = 0;
     QColor       m_annColor = Qt::red;
     double       m_annWidth = 2.0;
     bool         m_annFill  = false;
     QPushButton* m_colorBtn = nullptr;
+    QHash<int, QImage> m_pendingThumbs;
 };

@@ -9,6 +9,7 @@
 #include <QResizeEvent>
 #include <QPaintEvent>
 #include <QApplication>
+#include <QDebug>
 #include <QFont>
 #include <QFontMetrics>
 #include <algorithm>
@@ -46,42 +47,32 @@ ContinuousView::ContinuousView(QWidget* parent)
         }
     });
 
-    // Sharp-region debounce: request sharp overlay 180 ms after last zoom/scroll
-    m_sharpTimer = new QTimer(this);
-    m_sharpTimer->setSingleShot(true);
-    m_sharpTimer->setInterval(180);
-    connect(m_sharpTimer, &QTimer::timeout, this, [this] {
-        if (!m_renderer) return;
-        int page = pageAtCenter();
-        if (page < 0 || page >= m_pageCount) return;
+    // Sharp-region overlay is no longer needed (full-page renders at zoom resolution)
 
-        auto it = m_pageImages.find(page);
-        if (it == m_pageImages.end()) return;
-        if (it->width() >= pageW(page) - 2) return;
-
-        int scrollX = horizontalScrollBar()->value();
-        int scrollY = verticalScrollBar()->value();
-        int vpW = viewport()->width();
-        int vpH = viewport()->height();
-
-        int cx = pageLeftX(page);
-        int cy = pageTopY(page);
-        int cw = pageW(page);
-        int ch = pageH(page);
-
-        int interLeft = qMax(cx, scrollX);
-        int interTop = qMax(cy, scrollY);
-        int interRight = qMin(cx + cw, scrollX + vpW);
-        int interBottom = qMin(cy + ch, scrollY + vpH);
-        if (interRight <= interLeft || interBottom <= interTop) return;
-
-        const int margin = 256;
-        int rx = qMax(0, (interLeft - cx) - margin);
-        int ry = qMax(0, (interTop - cy) - margin);
-        int rw = qMin(cw, (interRight - interLeft) + 2 * margin);
-        int rh = qMin(ch, (interBottom - interTop) + 2 * margin);
-
-        m_renderer->requestRegion(page, m_zoom, QRect(rx, ry, rw, rh));
+    // Settle timer for primary page (same pattern as single-mode: 400ms delay
+    // before starting a new render, so fast scrolling doesn't trigger renders).
+    m_contSettleTimer = new QTimer(this);
+    m_contSettleTimer->setSingleShot(true);
+    m_contSettleTimer->setInterval(400);
+    connect(m_contSettleTimer, &QTimer::timeout, this, [this]() {
+        if (m_primaryPage < 0 || !m_renderer) {
+            qDebug() << "[perf] cont settle SKIP reason=noPrimaryPage";
+            return;
+        }
+        // Skip re-render if we already have a full-quality (kFullRenderMaxPx) image.
+        auto zit = m_pageImageZoom.constFind(m_primaryPage);
+        if (zit != m_pageImageZoom.constEnd()) {
+            double maxDim = qMax(m_pageSizePt[m_primaryPage].width(), m_pageSizePt[m_primaryPage].height());
+            double maxResZoom = PdfRenderer::kFullRenderMaxPx / qMax(maxDim, 1.0);
+            if (maxDim > 0 && qAbs(zit.value() - maxResZoom) < 1e-9) {
+                qDebug() << "[perf] cont settle SKIP reason=alreadyFullQuality page=" << m_primaryPage;
+                requestNeighborPages();
+                return;
+            }
+        }
+        qDebug() << "[perf] cont settle timeout — rendering primary page=" << m_primaryPage;
+        m_renderer->requestPageForContinuous(m_primaryPage, m_zoom);
+        m_primaryRequested = true;
     });
 }
 
@@ -97,7 +88,7 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
 
     // Disconnect old renderer
     if (m_renderer) {
-        disconnect(m_pageReadyConn);
+        disconnect(m_continuousPageReadyConn);
         disconnect(m_regionReadyConn);
     }
 
@@ -107,33 +98,56 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
     {
         m_doc      = doc;
         m_renderer = renderer;
-        m_pageReadyConn = connect(
-            m_renderer, &PdfRenderer::pageReady,
-            this, [this](int idx, QImage img) {
-                if (img.isNull()) return;
-                if (idx < 0 || idx >= m_pageCount) return;
-                auto it = m_pageImages.find(idx);
-                if (it != m_pageImages.end()) {
-                    int expectedW = qMax(1, static_cast<int>(
-                        m_pageSizePt[idx].width() * m_zoom));
-                    bool existingIsCurrentZoom =
-                        qAbs(it->width() - expectedW) < expectedW * 0.15;
-                    if (existingIsCurrentZoom
-                        && img.width() < it->width()
-                        && img.height() < it->height())
-                        return;
+        m_continuousRequested.clear();
+        m_continuousPageReadyConn = connect(
+            m_renderer, &PdfRenderer::continuousPageReady,
+            this, [this](int idx, QImage img, double renderedScale) {
+                m_cacheProbed.remove(idx);
+                if (img.isNull()) {
+                    qDebug() << "[perf] cont SKIP continuousPageReady idx=" << idx << "reason=nullImage";
+                    return;
                 }
+                if (idx < 0 || idx >= m_pageCount) {
+                    qDebug() << "[perf] cont SKIP continuousPageReady idx=" << idx << "reason=outOfRange count=" << m_pageCount;
+                    return;
+                }
+                // Accept any image — even zoom-mismatched — as a temporary placeholder.
+                // The settle timer will request a zoom-matched render if needed.
                 m_pageImages[idx] = QPixmap::fromImage(img);
+                m_pageImageZoom[idx] = renderedScale;
+                qDebug() << "[perf] cont ACCEPT continuousPageReady idx=" << idx
+                         << "imgW=" << img.width() << "renderedScale=" << renderedScale;
+                { static const bool dump = qEnvironmentVariableIsSet("TORREADER_DUMP");
+                  if (dump && !img.isNull()) {
+                      QString fn = QString("contview_dump_p%1.png").arg(idx);
+                      img.save(fn);
+                      qDebug() << "[dump] saved" << fn << "w=" << img.width() << "h=" << img.height();
+                  }
+                }
+                m_continuousRequested.remove(idx);
+                if (idx == m_primaryPage) {
+                    m_contSettleTimer->stop();
+                    requestNeighborPages();
+                }
                 if (pageVisible(idx))
                     viewport()->update();
             });
         m_regionReadyConn = connect(
             m_renderer, &PdfRenderer::regionReady,
             this, [this](int pageIndex, double scale, QRect regionPx, QImage img) {
-                if (img.isNull()) return;
+                if (img.isNull()) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=nullImage";
+                    return;
+                }
                 int curPage = pageAtCenter();
-                if (pageIndex != curPage) return;
-                if (qAbs(scale - m_zoom) > 1e-9) return;
+                if (pageIndex != curPage) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=notCenterPage center=" << curPage;
+                    return;
+                }
+                if (qAbs(scale - m_zoom) > 1e-9) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=zoomMismatch scale=" << scale << "zoom=" << m_zoom;
+                    return;
+                }
                 m_sharpPage = pageIndex;
                 m_sharpScale = scale;
                 m_sharpRegion = regionPx;
@@ -142,7 +156,6 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
             });
         requestVisiblePages();
         viewport()->update();
-        m_sharpTimer->start();
         return;
     }
 
@@ -150,6 +163,8 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
     m_doc      = doc;
     m_renderer = renderer;
     m_pageImages.clear();
+    m_pageImageZoom.clear();
+    m_continuousRequested.clear();
     m_lastEmittedPage = -1;
 
     if (!m_doc || !m_doc->isOpen()) {
@@ -166,26 +181,36 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
         m_pageSizePt[i] = m_doc->pageSize(i);
 
     if (m_renderer) {
-        m_pageReadyConn = connect(
-            m_renderer, &PdfRenderer::pageReady,
-            this, [this](int idx, QImage img) {
-                if (img.isNull()) return;
-                if (idx < 0 || idx >= m_pageCount) return;
-                // Zoom-aware replacement: only refuse a smaller image if the existing
-                // one is already at the current zoom level (progressive loading).
-                // If zoom changed, the existing image is stale — always replace it.
-                auto it = m_pageImages.find(idx);
-                if (it != m_pageImages.end()) {
-                    int expectedW = qMax(1, static_cast<int>(
-                        m_pageSizePt[idx].width() * m_zoom));
-                    bool existingIsCurrentZoom =
-                        qAbs(it->width() - expectedW) < expectedW * 0.15;
-                    if (existingIsCurrentZoom
-                        && img.width() < it->width()
-                        && img.height() < it->height())
-                        return;
+        m_continuousPageReadyConn = connect(
+            m_renderer, &PdfRenderer::continuousPageReady,
+            this, [this](int idx, QImage img, double renderedScale) {
+                m_cacheProbed.remove(idx);
+                if (img.isNull()) {
+                    qDebug() << "[perf] cont SKIP continuousPageReady idx=" << idx << "reason=nullImage";
+                    return;
                 }
+                if (idx < 0 || idx >= m_pageCount) {
+                    qDebug() << "[perf] cont SKIP continuousPageReady idx=" << idx << "reason=outOfRange count=" << m_pageCount;
+                    return;
+                }
+                // Accept any image — even zoom-mismatched — as a temporary placeholder.
+                // The settle timer will request a zoom-matched render if needed.
                 m_pageImages[idx] = QPixmap::fromImage(img);
+                m_pageImageZoom[idx] = renderedScale;
+                qDebug() << "[perf] cont ACCEPT continuousPageReady idx=" << idx
+                         << "imgW=" << img.width() << "renderedScale=" << renderedScale;
+                { static const bool dump = qEnvironmentVariableIsSet("TORREADER_DUMP");
+                  if (dump && !img.isNull()) {
+                      QString fn = QString("contview_dump_p%1.png").arg(idx);
+                      img.save(fn);
+                      qDebug() << "[dump] saved" << fn << "w=" << img.width() << "h=" << img.height();
+                  }
+                }
+                m_continuousRequested.remove(idx);
+                if (idx == m_primaryPage) {
+                    m_contSettleTimer->stop();
+                    requestNeighborPages();
+                }
                 if (pageVisible(idx))
                     viewport()->update();
             });
@@ -193,10 +218,19 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
         m_regionReadyConn = connect(
             m_renderer, &PdfRenderer::regionReady,
             this, [this](int pageIndex, double scale, QRect regionPx, QImage img) {
-                if (img.isNull()) return;
+                if (img.isNull()) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=nullImage";
+                    return;
+                }
                 int curPage = pageAtCenter();
-                if (pageIndex != curPage) return;
-                if (qAbs(scale - m_zoom) > 1e-9) return;
+                if (pageIndex != curPage) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=notCenterPage center=" << curPage;
+                    return;
+                }
+                if (qAbs(scale - m_zoom) > 1e-9) {
+                    qDebug() << "[perf] cont SKIP regionReady page=" << pageIndex << "reason=zoomMismatch scale=" << scale << "zoom=" << m_zoom;
+                    return;
+                }
                 m_sharpPage = pageIndex;
                 m_sharpScale = scale;
                 m_sharpRegion = regionPx;
@@ -243,6 +277,13 @@ void ContinuousView::setZoom(double scale)
     verticalScrollBar()->setValue(newScrollY);
 
     m_sharpPage = -1;
+    m_primaryPage = -1;
+    m_lastRequestZoom = -1.0;
+    m_primaryRequested = false;
+    m_contSettleTimer->stop();
+    m_continuousRequested.clear();
+    m_pageImageZoom.clear();
+    m_cacheProbed.clear();
     viewport()->update();
     m_zoomTimer->start();
 }
@@ -381,41 +422,133 @@ int ContinuousView::pageAtCenter() const
 
 void ContinuousView::requestVisiblePages()
 {
-    if (!m_renderer || m_pageCount == 0) return;
+    if (!m_renderer || m_pageCount == 0) {
+        qDebug() << "[perf] cont SKIP requestVisiblePages reason=noDoc";
+        return;
+    }
 
-    // Find first and last visible page
+    int primary = pageAtCenter();
+    bool primaryChanged = (primary != m_primaryPage
+                           || qAbs(m_zoom - m_lastRequestZoom) >= 1e-9);
+
+    if (primaryChanged) {
+        qDebug() << "[perf] cont primary=" << primary << "zoom=" << m_zoom;
+        m_primaryPage = primary;
+        m_lastRequestZoom = m_zoom;
+        m_primaryRequested = false;
+        m_contSettleTimer->stop();
+        m_cacheProbed.clear();
+
+        // Step a: primary page already determined (primary).
+        //
+        // Step b: try cache first — same pattern as single-mode:
+        // requestFromCacheOnly → if hit, image served immediately (synchronous
+        // signal), no settle.
+        // Accept image at exact zoom match OR at full quality (kFullRenderMaxPx).
+        auto it = m_pageImages.find(primary);
+        if (it != m_pageImages.end()) {
+            auto zit = m_pageImageZoom.constFind(primary);
+            if (zit != m_pageImageZoom.constEnd()) {
+                double storedZoom = zit.value();
+                double maxDim = qMax(m_pageSizePt[primary].width(), m_pageSizePt[primary].height());
+                double maxResZoom = PdfRenderer::kFullRenderMaxPx / qMax(maxDim, 1.0);
+                if (qAbs(storedZoom - m_zoom) < 1e-9
+                    || (maxDim > 0 && qAbs(storedZoom - maxResZoom) < 1e-9)) {
+                    // Already have a good-enough pixmap: exact zoom match or
+                    // full-quality render usable at any zoom.
+                    m_continuousRequested.remove(primary);
+                    requestNeighborPages();
+                    goto evict;
+                }
+            }
+        }
+        if (m_renderer->requestFromCacheOnlyForContinuous(primary, m_zoom)) {
+            // Cache hit → image arrives synchronously via continuousPageReady
+            // handler, which calls requestNeighborPages for us.
+            m_continuousRequested.remove(primary);
+            // After cache, check if the returned image matches zoom exactly.
+            // If not (e.g. full-quality at different scale), we still accept it
+            // but the settle timer below handles re-render if needed.
+            auto zit = m_pageImageZoom.constFind(primary);
+            if (zit != m_pageImageZoom.constEnd()
+                && qAbs(zit.value() - m_zoom) >= 1e-9) {
+                // Image is at full quality but zoom doesn't match user's zoom.
+                // No re-render needed — full quality is always good enough.
+                // Just proceed to neighbors.
+                requestNeighborPages();
+            }
+            goto evict;
+        }
+
+        // Step c: cache miss → record probe (skip re-probe) and start settle timer
+        m_cacheProbed[primary] = m_zoom;
+        qDebug() << "[perf] cont primary cache miss page=" << primary
+                 << "— starting 400ms settle";
+        m_contSettleTimer->start();
+    }
+
+evict:
+    // Always bound RAM: drop pages outside a small window around visible range.
     int first = -1, last = -1;
     for (int i = 0; i < m_pageCount; ++i) {
         if (pageVisible(i)) {
             if (first == -1) first = i;
             last = i;
         } else if (first != -1) {
-            break;  // past the visible range
+            break;
         }
     }
-    if (first == -1) return;
-
-    // Include one-page preload buffer on each side
-    int preloadFirst = qMax(0, first - 1);
-    int preloadLast  = qMin(m_pageCount - 1, last + 1);
-
-    for (int i = preloadFirst; i <= preloadLast; ++i)
-        m_renderer->requestPage(i, m_zoom);
-
-    // Bound RAM: drop cached page pixmaps outside a small window around the
-    // visible range. Without this, scrolling through a large document keeps one
-    // full-resolution QPixmap per visited page resident forever (GBs on big
-    // merged files with large drawing pages). The renderer keeps its own bounded
-    // cache, so re-scrolling re-renders cheaply from there.
     const int kKeepMargin = 4;
     int keepFirst = qMax(0, first - kKeepMargin);
     int keepLast  = qMin(m_pageCount - 1, last + kKeepMargin);
     for (auto it = m_pageImages.begin(); it != m_pageImages.end(); ) {
-        if (it.key() < keepFirst || it.key() > keepLast)
+        if (it.key() < keepFirst || it.key() > keepLast) {
+            m_continuousRequested.remove(it.key());
+            m_pageImageZoom.remove(it.key());
             it = m_pageImages.erase(it);
-        else
+        } else {
             ++it;
+        }
     }
+}
+
+void ContinuousView::requestNeighborPages()
+{
+    // Neighbors (primary ±1) are requested AFTER primary is done, using the
+    // non-cancellable requestPageForContinuous path. Never before primary.
+    if (m_primaryPage < 0) return;
+    int pages[] = {m_primaryPage - 1, m_primaryPage + 1};
+    for (int i : pages) {
+        if (i < 0 || i >= m_pageCount) continue;
+        // Accept any existing image (all are full-quality = good enough for any zoom)
+        if (m_pageImages.contains(i))
+            continue;
+        if (m_renderer->requestFromCacheOnlyForContinuous(i, m_zoom))
+            continue;
+        if (!m_continuousRequested.contains(i)) {
+            qDebug() << "[perf] cont neighbor request page=" << i << "zoom=" << m_zoom;
+            m_renderer->requestPageForContinuous(i, m_zoom);
+            m_continuousRequested.insert(i);
+        }
+    }
+}
+
+void ContinuousView::setSelectedAnnotRect(const QRectF& rectPdf) {
+    m_selRect = rectPdf;
+    m_hasSel = true;
+    viewport()->update();
+}
+
+void ContinuousView::clearSelectedAnnotRect() {
+    m_hasSel = false;
+    viewport()->update();
+}
+
+void ContinuousView::invalidatePage(int pageIndex) {
+    m_pageImages.remove(pageIndex);
+    m_pageImageZoom.remove(pageIndex);
+    m_continuousRequested.remove(pageIndex);
+    qDebug() << "[markup] invalidatePage page=" << pageIndex;
 }
 
 // ── QAbstractScrollArea overrides ─────────────────────────────────────────────
@@ -425,7 +558,6 @@ void ContinuousView::scrollContentsBy(int /*dx*/, int /*dy*/)
     viewport()->update();
     requestVisiblePages();
     m_scrollTimer->start();
-    m_sharpTimer->start();
 }
 
 void ContinuousView::resizeEvent(QResizeEvent* event)
@@ -439,6 +571,9 @@ void ContinuousView::resizeEvent(QResizeEvent* event)
 
 void ContinuousView::paintEvent(QPaintEvent* /*event*/)
 {
+    QElapsedTimer paintTimer;
+    paintTimer.start();
+
     QPainter p(viewport());
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
@@ -500,6 +635,10 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
     // Draw Alt+drag selection rect on top of all pages
     if (m_selecting || m_selStart != m_selEnd)
         drawSelection(p);
+
+    qint64 paintMs = paintTimer.elapsed();
+    if (paintMs > 16)
+        qDebug() << "[perf] cont paint ms=" << paintMs;
 }
 
 // ── Input events ──────────────────────────────────────────────────────────────
@@ -533,6 +672,12 @@ void ContinuousView::wheelEvent(QWheelEvent* event)
         verticalScrollBar()->setValue(newScrollY);
 
         m_sharpPage = -1;
+        m_primaryPage = -1;
+        m_lastRequestZoom = -1.0;
+        m_primaryRequested = false;
+        m_contSettleTimer->stop();
+        m_pageImageZoom.clear();
+        m_cacheProbed.clear();
         viewport()->update();
         m_zoomTimer->start();
         event->accept();
@@ -556,6 +701,8 @@ void ContinuousView::mousePressEvent(QMouseEvent* event)
         event->accept();
         return;
     }
+
+    // ── Pan ──────────────────────────────────────────────────────────────
     if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton) {
         m_panning      = true;
         m_lastMousePos = event->pos();
@@ -574,6 +721,7 @@ void ContinuousView::mouseMoveEvent(QMouseEvent* event)
         event->accept();
         return;
     }
+
     if (m_panning) {
         QPoint delta   = event->pos() - m_lastMousePos;
         m_lastMousePos = event->pos();
@@ -645,6 +793,11 @@ void ContinuousView::mouseReleaseEvent(QMouseEvent* event)
     } else {
         QAbstractScrollArea::mouseReleaseEvent(event);
     }
+}
+
+void ContinuousView::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    QAbstractScrollArea::mouseDoubleClickEvent(event);
 }
 
 void ContinuousView::drawSelection(QPainter& p)

@@ -10,9 +10,7 @@
 #include "core/TileCacheFile.h"
 #include "core/ThumbnailRenderPool.h"
 #include "core/TextSearch.h"
-#ifdef TORREADER_ENABLE_SIGNER
 #include "core/PdfSigner.h"
-#endif
 #include "PdfView.h"
 #include "PdfGpuView.h"
 #include "annotations/AnnotationManager.h"
@@ -28,14 +26,15 @@ class QSplitter;
 class Translator;
 class TranslationPopup;
 class GoogleAuth;
-class NotificationBar;
+class UpdateChecker;
+class QTimer;
 
 struct DocTab {
     std::unique_ptr<PdfDocument>       doc;
     std::unique_ptr<PdfRenderer>       renderer;
     std::unique_ptr<AnnotationManager> annotMgr;
     std::unique_ptr<AnnotationLayer>   annotLayer;
-    std::unique_ptr<TileCacheFile>        tileCache;
+    std::shared_ptr<TileCacheFile>        tileCache;
     std::unique_ptr<ThumbnailRenderPool>  thumbPool;
     PdfGpuView* view        = nullptr;
     int      currentPage    = 0;
@@ -61,16 +60,13 @@ protected:
     void dropEvent(QDropEvent* e) override;
     void closeEvent(QCloseEvent* e) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
-    void resizeEvent(QResizeEvent* e) override;
 
 private slots:
     void onOpenFile();
     void onSaveFile();
     void onSaveAsFile();
     void onMergeFiles();
-#ifdef TORREADER_ENABLE_SIGNER
     void onSignPdf();
-#endif
     void onExtractAll();
     void onPrintFile();
     void onTabChanged(int idx);
@@ -88,17 +84,16 @@ private:
     void reloadTab(DocTab* t, const QString& filePath, const QString& tmpPath);
     void loadTabFile(DocTab* t, const QString& path);
     void updateTabDirty(DocTab* t);
-#ifdef TORREADER_ENABLE_SIGNER
     void performSign(DocTab* t, SignParams sp);
     void onFinalizeSignature();
     void onCancelSignature();
+    void onCommentsRequested();
 
     SignParams m_pendSp;
     int  m_pendPage = -1;
     bool m_pendActive = false;
     QAction* m_finalizeSigAct = nullptr;
     QAction* m_cancelSigAct   = nullptr;
-#endif
 
     QTabWidget*      m_docTabs       = nullptr;
     QList<DocTab*>   m_openDocs;
@@ -119,17 +114,15 @@ private:
     Translator*        m_translator  = nullptr;
     TranslationPopup*  m_transPopup  = nullptr;
     GoogleAuth*        m_googleAuth  = nullptr;
-    NotificationBar*   m_notifBar    = nullptr;
+    UpdateChecker*     m_updateChecker = nullptr;
     QPoint             m_lastTransPos;
-
-    void repositionNotifBar();
 
     int m_selPage = -1;
     int m_selIdx  = -1;
     AnnotStyle m_annotStyle;
 
     struct DrawAction {
-        enum Kind { Add, Delete, Move };
+        enum Kind { Add, Delete, Move, NoteMove };
         Kind kind = Add;
         int        page = 0;
         bool       isText = false;
@@ -151,7 +144,18 @@ private:
     void showNotePopup(const QString& text, const QString& author);
     void hideNotePopup();
     QLabel* m_notePopup = nullptr;
-#ifdef TORREADER_ENABLE_SIGNER
     QMetaObject::Connection m_sigPickConn;
-#endif
+
+    // Settle timer: defers full-quality render until page stops changing for 400ms.
+    // Prevents mutex contention during fast scrolling through many pages.
+    QTimer* m_settleTimer = nullptr;
+    qint64  m_settleStartMs = 0;  // timestamp of first onPageChanged in scroll sequence
+
+    // ── Markup helpers ───────────────────────────────────────────────────────
+    void showAnnotOverlayImmediate(DocTab* tab, int pageIdx);
+    void scheduleReRender(DocTab* tab, int pageIdx);
+    QTimer* m_markupTimer = nullptr;
+    DocTab* m_markupTab   = nullptr;
+    int     m_markupPage  = -1;
+    bool    m_commentsVisible = false;
 };

@@ -59,17 +59,25 @@ public:
     bool createInlineNote(int pageIndex, QRectF rectPdf,
                           const QString& text, const QString& author,
                           bool withBackground = true,
-                          QColor textColor = Qt::black);
+                          QColor textColor = Qt::black,
+                          float fontSize = 11.0f);
 
     // Update the Contents string of an existing annotation in place.
     // Saves the document to disk.
     bool updateNote(int pageIndex, int annotIndex, const QString& newText);
 
     bool removeAnnot(int pageIndex, int index);
+    int removeNotePageObjects(int pageIndex, unsigned int noteId);
     bool setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill);
+    bool rebuildTextNote(int pageIndex, int index, QColor newColor, float newFontSize);
+    bool moveNote(int pageIndex, int index, double dxDisp, double dyDisp);
 
     AnnotSnapshot snapshotAnnot(int pageIndex, int index);
     bool addSnapshot(int pageIndex, const AnnotSnapshot& s);
+
+    // Read-back for Properties dialog. Returns false if annot does not exist.
+    bool getAnnotEditState(int pageIndex, int index, QString& outType,
+                           QColor& outColor, float& outWidth, float& outFontSize);
 
     bool createSignatureDraft(int pageIndex, QRectF rectPt, const QString& text);
     QRectF findSignatureDraftRect(int pageIndex, int* outIndex);
@@ -85,4 +93,5 @@ private:
     FPDF_DOCUMENT m_doc     = nullptr;
     QString       m_path;
     QString       m_lastError;
+    unsigned int  m_nextNoteId = 1;
 };

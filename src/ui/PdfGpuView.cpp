@@ -4,6 +4,10 @@
 #include <QPainter>
 #include <QDebug>
 
+// ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
+// accumulation during pan; farthest-from-viewport tiles evicted when exceeded.
+static constexpr int kMaxLiveTiles = 120;
+
 // Unit quad: position (x,y) in [-1,1] + texcoord (u,v) in [0,1].
 // Row 0 of QImage = top of image → UV(0,0) = top-left of texture.
 static const float kQuad[] = {
@@ -53,6 +57,12 @@ PdfGpuView::PdfGpuView(QWidget* parent)
     connect(m_zoomTimer, &QTimer::timeout, this, [this]{
         emit zoomChanged(m_zoom);
     });
+
+    m_tileTimer = new QTimer(this);
+    m_tileTimer->setSingleShot(true);
+    m_tileTimer->setInterval(120);
+    connect(m_tileTimer, &QTimer::timeout, this, &PdfGpuView::requestTiles);
+
     setFocusPolicy(Qt::StrongFocus);
 }
 
@@ -113,17 +123,32 @@ void PdfGpuView::resizeGL(int, int) {
 // ── Texture upload ────────────────────────────────────────────────────────────
 
 void PdfGpuView::uploadTexture(const QImage& img) {
-    QImage rgba = img.convertToFormat(QImage::Format_RGBA8888);
+    QElapsedTimer _tt; _tt.start();
     if (!m_texture) glGenTextures(1, &m_texture);
     glBindTexture(GL_TEXTURE_2D, m_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rgba.width(), rgba.height(),
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.constBits());
-    m_texW = rgba.width();
-    m_texH = rgba.height();
+
+    int w = img.width(), h = img.height();
+    GLint rowLen = img.bytesPerLine() / 4;
+    if (rowLen != w)
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLen);
+
+    if (w == m_texW && h == m_texH) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
+        m_texW = w;
+        m_texH = h;
+    }
+
+    if (rowLen != w)
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    qDebug().noquote() << QString("[perf] texUpload ms=%1 w=%2 h=%3")
+                              .arg(_tt.elapsed(), 3).arg(w).arg(h);
 }
 
 // ── Transform ─────────────────────────────────────────────────────────────────
@@ -153,6 +178,7 @@ QMatrix4x4 PdfGpuView::computeTransform() const {
 // ── Paint ─────────────────────────────────────────────────────────────────────
 
 void PdfGpuView::paintGL() {
+    QElapsedTimer _pf; _pf.start();
     // Upload pending texture (must happen inside GL context)
     if (m_textureDirty && !m_pendingImage.isNull()) {
         uploadTexture(m_pendingImage);
@@ -169,7 +195,7 @@ void PdfGpuView::paintGL() {
     if (m_hasImage && !m_texture)
         qDebug() << "[GpuView] WARN: hasImage=true but texture=0, page" << m_pageIndex;
     if (m_hasImage && m_pageSizePt.isEmpty())
-        qDebug() << "[GpuView] WARN: hasImage=true but pageSizePt is EMPTY, page" << m_pageIndex;
+        qDebug() << "[GpuView] WARN: hasImage=true but pageSizePt is EMPTY (page index" << m_pageIndex << ") — chính path không set kích thước trang";
     if (m_hasImage && m_texture && !m_pageSizePt.isEmpty()) {
         // Drop shadow via filled quad slightly offset (draw under page)
         // (Drawn via QPainter below to keep GL code minimal)
@@ -188,6 +214,23 @@ void PdfGpuView::paintGL() {
     }
 
     // Overlays via QPainter (drawn on top of GL — valid inside paintGL for QOpenGLWidget)
+    {
+        bool _needQP = (!m_hasImage && !m_loading) ||
+            m_selecting || m_drawingShape ||
+            (m_sigPickMode && m_sigActive) ||
+            (m_loading && !m_hasImage) ||
+            (m_hasImage && !m_pageSizePt.isEmpty());
+        if (!_needQP) {
+            qint64 _pms = _pf.elapsed();
+            if (_pms >= 16)
+                qDebug() << "[perf] paint ms=" << _pms << "zoom=" << m_zoom
+                         << "tiles=" << m_tiles.size()
+                         << "annots=" << m_annotOverlays.size()
+                         << "panning=" << m_panning;
+            return;
+        }
+    }
+
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
@@ -201,15 +244,30 @@ void PdfGpuView::paintGL() {
     }
 
     if (m_hasImage && !m_pageSizePt.isEmpty()) {
-        // Drop shadow — only the strips that extend BEYOND the page's right and
-        // bottom edges. A full-page rect here would cover the entire page (QPainter
-        // draws on top of the GL texture) and dim every page with a grey veil.
         double pw = m_pageSizePt.width()  * m_zoom;
         double ph = m_pageSizePt.height() * m_zoom;
         QPointF orig = pageOrigin();
-        const double sh = 4.0; // shadow thickness
-        p.fillRect(QRectF(orig.x() + pw, orig.y() + sh, sh, ph), QColor(0, 0, 0, 80)); // right
-        p.fillRect(QRectF(orig.x() + sh, orig.y() + ph, pw, sh), QColor(0, 0, 0, 80)); // bottom
+        const double sh = 4.0;
+        p.fillRect(QRectF(orig.x() + pw, orig.y() + sh, sh, ph), QColor(0, 0, 0, 80));
+        p.fillRect(QRectF(orig.x() + sh, orig.y() + ph, pw, sh), QColor(0, 0, 0, 80));
+
+        // ── Draw tile overlays (sharp textures on top of lo-res background) ──
+        if (m_tilePage == m_pageIndex && qAbs(m_tileScale - m_zoom) < 1e-6) {
+            const QRectF viewRect = rect();
+            p.save();
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+            for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it) {
+                int col = it.key().first;
+                int row = it.key().second;
+                const qreal tx = orig.x() + col * 512.0;
+                const qreal ty = orig.y() + row * 512.0;
+                if (!viewRect.intersects(QRectF(tx, ty, 512.0, 512.0)))
+                    continue;
+                p.drawImage(QPoint(qRound(tx), qRound(ty)), it.value());
+            }
+            p.restore();
+        }
 
         // Highlights (PDF coords, Y up → convert)
         if (!m_highlights.isEmpty()) {
@@ -238,7 +296,7 @@ void PdfGpuView::paintGL() {
             p.drawRect(wr);
         }
 
-        // Annotation overlays
+        // Annotation overlays (sticky note badges only)
         if (!m_annotOverlays.isEmpty()) {
             double pageH = m_pageSizePt.height();
             p.save();
@@ -262,6 +320,7 @@ void PdfGpuView::paintGL() {
             }
             p.restore();
         }
+
     }
 
     // Text selection overlay (Ctrl+drag)
@@ -298,35 +357,99 @@ void PdfGpuView::paintGL() {
         p.setBrush(Qt::NoBrush);
     }
 
-    // Show loading overlay only when no existing image — keeps old page visible
-    // while new page is rendering (no grey flash on navigation).
-    if (m_loading && !m_hasImage) {
-        p.fillRect(rect(), QColor(0, 0, 0, 60));
-        p.setPen(Qt::white);
-        QFont f = p.font(); f.setPointSize(12); p.setFont(f);
+    // Show loading indicator on ANY state: even when a partial image exists,
+    // keep the "Loading…" overlay so the user knows rendering is in progress.
+    if (m_loading) {
+        if (!m_hasImage) {
+            if (!m_placeholder.isNull() && !m_pageSizePt.isEmpty()) {
+                // Draw thumbnail placeholder scaled to page rect
+                double pw = m_pageSizePt.width() * m_zoom;
+                double ph = m_pageSizePt.height() * m_zoom;
+                QPointF orig = pageOrigin();
+                QRectF pageRect(orig.x(), orig.y(), pw, ph);
+                p.fillRect(pageRect, Qt::white);
+                p.drawImage(pageRect, m_placeholder);
+                qDebug() << "[perf] placeholder shown page=" << m_pageIndex << "source=thumb";
+            } else if (!m_pageSizePt.isEmpty()) {
+                // No thumbnail — draw blank page rect
+                double pw = m_pageSizePt.width() * m_zoom;
+                double ph = m_pageSizePt.height() * m_zoom;
+                QPointF orig = pageOrigin();
+                p.fillRect(QRectF(orig.x(), orig.y(), pw, ph), Qt::white);
+                qDebug() << "[perf] placeholder shown page=" << m_pageIndex << "source=blank";
+            } else if (m_pageSizePt.isEmpty()) {
+                p.fillRect(rect(), QColor(0, 0, 0, 80));
+            }
+        }
+        QFont f = p.font(); f.setPointSize(26); f.setBold(true); p.setFont(f);
+        p.setPen(QPen(QColor(255, 255, 255), 2));
         p.drawText(rect(), Qt::AlignCenter, "Loading…");
     }
+
+    qint64 _pms = _pf.elapsed();
+    if (_pms >= 16)
+        qDebug() << "[perf] paint ms=" << _pms << "zoom=" << m_zoom
+                 << "tiles=" << m_tiles.size()
+                 << "annots=" << m_annotOverlays.size()
+                 << "panning=" << m_panning;
 }
 
 // ── Page management ───────────────────────────────────────────────────────────
 
 void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt) {
-    // Treat first load (!m_hasImage) same as new page so pan resets properly.
     bool newPage = (pageIndex != m_pageIndex) || !m_hasImage;
-    if (!newPage && m_hasImage && !pageImage.isNull() &&
-        !m_lastImage.isNull() && pageImage.width() < m_lastImage.width())
-        return;   // don't downgrade a sharper render with a blurrier one
+    // Low-res guard: only skip when the incoming image is from the SAME page
+    // as the last cached image, AND is significantly smaller (= blurry).
+    // The tolerance (0.9) prevents 1px rounding differences (e.g. 3999 vs 4000)
+    // from triggering the guard — that was the original bug: setPendingPage
+    // had already set m_pageIndex to the new page, making newPage=false even
+    // for a cross-page jump, and 3999 < 4000 caused a silent discard.
+    bool samePage = (pageIndex == m_lastImagePage);
+    if (samePage && m_hasImage && !pageImage.isNull() &&
+        !m_lastImage.isNull() && pageImage.width() < m_lastImage.width() * 0.9) {
+        qDebug() << "[GpuView] setPage SKIP lowres page=" << pageIndex
+                 << "newW=" << pageImage.width() << "lastW=" << m_lastImage.width()
+                 << "lastPage=" << m_lastImagePage;
+        return;
+    }
+    // Skip if image content is identical (same cacheKey/serial) — avoids
+    // redundant texUpload from cache-hit pageReady after setPage already ran.
+    if (samePage && !pageImage.isNull() && !m_lastImage.isNull() &&
+        pageImage.cacheKey() == m_lastImage.cacheKey() &&
+        pageImage.size() == m_lastImage.size()) {
+        qDebug().noquote() << "[GpuView] setPage skip duplicate cacheKey page=" << pageIndex
+                 << "key=" << pageImage.cacheKey()
+                 << "lastKey=" << m_lastImage.cacheKey()
+                 << "size=" << pageImage.size();
+        return;
+    }
+    // Auto-fix empty pageSizePt from image dimensions (progressive partial
+    // may arrive before PdfDocument has the size).
+    if (pageSizePt.isEmpty() && !pageImage.isNull()) {
+        pageSizePt = QSizeF(pageImage.width(), pageImage.height());
+        qDebug() << "[GpuView] auto-fix pageSizePt from image page=" << pageIndex;
+    }
     qDebug() << "[GpuView] setPage idx=" << pageIndex
              << "newPage=" << newPage
              << "imgSize=" << pageImage.size()
              << "pageSizePt=" << pageSizePt
              << "loading=" << m_loading;
+    { static const bool dump = qEnvironmentVariableIsSet("TORREADER_DUMP");
+      if (dump && !pageImage.isNull()) {
+          QString fn = QString("gpuview_dump_p%1.png").arg(pageIndex);
+          pageImage.save(fn);
+          qDebug() << "[dump] saved" << fn << "w=" << pageImage.width() << "h=" << pageImage.height();
+      }
+    }
     m_pageIndex  = pageIndex;
     m_pageSizePt = pageSizePt;
     m_loading    = false;
     m_hasImage   = !pageImage.isNull();
-    if (!pageImage.isNull()) m_lastImage = pageImage;
+    m_placeholder = {};  // clear placeholder now that we have the real image
     if (!pageImage.isNull()) {
+        m_lastImage = pageImage;
+        m_lastImagePage = pageIndex;
+        // Full-resolution render — no cap, no tile dependency
         m_pendingImage = pageImage;
         m_textureDirty = true;
     }
@@ -334,6 +457,10 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
         m_panOffset = {};
         m_highlights.clear();
         m_hasSel = false;
+        m_tiles.clear();
+        m_tilePage = -1;
+        m_tileScale = 0.0;
+        m_tileTimer->start();
     }
     update();
 }
@@ -352,6 +479,78 @@ void PdfGpuView::updatePageImage(const QImage& pageImage) {
     update();
 }
 
+void PdfGpuView::setPlaceholder(const QImage& img) {
+    m_placeholder = img;
+    update();
+}
+
+void PdfGpuView::showPartial(int page, double scale, QImage img) {
+    if (page != m_pageIndex) {
+        qDebug() << "[GpuView] showPartial SKIP wrong page=" << page << "current=" << m_pageIndex;
+        return;
+    }
+    if (img.isNull()) {
+        qDebug() << "[GpuView] showPartial SKIP null image page=" << page;
+        return;
+    }
+    // Only replace if resolution is higher or we have no image yet
+    if (m_hasImage && !m_lastImage.isNull() && img.width() <= m_lastImage.width()) {
+        qDebug() << "[GpuView] showPartial SKIP lowres page=" << page
+                 << "newW=" << img.width() << "lastW=" << m_lastImage.width();
+        return;
+    }
+    if (m_panning) {
+        qDebug() << "[perf] skip partial during pan page=" << page;
+        m_pendingPartImg = img;
+        m_pendingPartScale = scale;
+        m_pendingPartPage = page;
+        return;
+    }
+    // ponytail: keep m_loading=true so the "Loading…" overlay persists until
+    // setPage()/updatePageImage() is called with the final full-resolution image.
+    // If pageSizePt is empty, infer from image dimensions / scale so paintGL
+    // can render the partial image immediately instead of staying gray.
+    if (m_pageSizePt.isEmpty() && scale > 0.0) {
+        m_pageSizePt = QSizeF(img.width() / scale, img.height() / scale);
+        qDebug() << "[GpuView] WARN fallback pageSizePt from PIXEL size (wrong unit!) page=" << page
+                 << "from img" << img.size() << "scale=" << scale;
+    }
+    m_hasImage = true;
+    m_lastImage = img;
+    m_lastImagePage = page;
+    m_pendingImage = img;
+    m_textureDirty = true;
+    update();
+}
+
+void PdfGpuView::setPendingPage(int pageIndex, QSizeF pageSizePt) {
+    bool samePageAndSize = (pageIndex == m_pageIndex && m_pageSizePt == pageSizePt);
+    if (samePageAndSize && m_hasImage) {
+        qDebug() << "[GpuView] setPendingPage SKIP same page=" << pageIndex << "size=" << pageSizePt;
+        return;
+    }
+    bool pageChanged = (pageIndex != m_pageIndex);
+    qDebug() << "[GpuView] setPendingPage idx=" << pageIndex
+             << "size=" << pageSizePt << "pageChanged=" << pageChanged;
+    m_pageIndex  = pageIndex;
+    m_pageSizePt = pageSizePt;
+    if (pageChanged) {
+        m_panOffset  = {};
+        m_highlights.clear();
+        m_hasSel     = false;
+        m_tiles.clear();
+        m_tilePage = -1;
+        m_tileScale = 0.0;
+        m_hasImage   = false;
+        m_lastImage  = {};
+        m_lastImagePage = -1;
+        m_placeholder = {};
+        m_loading    = true;
+        qDebug() << "[GpuView] setPendingPage cleared old image — showing placeholder/loading";
+    }
+    update();
+}
+
 void PdfGpuView::beginLoading() {
     qDebug() << "[GpuView] beginLoading page=" << m_pageIndex
              << "hasImage=" << m_hasImage
@@ -362,6 +561,62 @@ void PdfGpuView::beginLoading() {
 
 void PdfGpuView::setZoom(double scale) {
     m_zoom = qBound(0.1, scale, 10.0);
+    m_tiles.clear();
+    m_tilePage = -1;
+    m_tileScale = 0.0;
+    m_tileTimer->start();
+    update();
+}
+
+void PdfGpuView::requestTiles() {
+    if (!m_hasImage || m_pageSizePt.isEmpty()) return;
+    double pw = m_pageSizePt.width()  * m_zoom;
+    double ph = m_pageSizePt.height() * m_zoom;
+    QPointF orig = pageOrigin();
+
+    double visLeft   = qMax(0.0, orig.x());
+    double visTop    = qMax(0.0, orig.y());
+    double visRight  = qMin((double)width(),  orig.x() + pw);
+    double visBottom = qMin((double)height(), orig.y() + ph);
+    if (visRight <= visLeft || visBottom <= visTop) return;
+
+    int rx = qMax(0, (int)(visLeft  - orig.x()));
+    int ry = qMax(0, (int)(visTop   - orig.y()));
+    int rw = qMin((int)pw, (int)(visRight - visLeft));
+    int rh = qMin((int)ph, (int)(visBottom - visTop));
+
+    QRect viewportPx(rx, ry, rw, rh);
+    m_tilePage  = m_pageIndex;
+    m_tileScale = m_zoom;
+    emit tilesNeeded(m_pageIndex, m_zoom, viewportPx);
+}
+
+void PdfGpuView::setTile(int page, double scale, int col, int row, const QImage& img) {
+    if (page != m_pageIndex || qAbs(scale - m_zoom) > 1e-6) return;
+    // Reject stale tiles from a different zoom/request cycle
+    if (page != m_tilePage || qAbs(m_tileScale - scale) > 1e-6) return;
+    if (img.isNull()) return;
+    m_tiles[{col, row}] = img;
+
+    // Evict tiles farthest from viewport center when over cap
+    if (m_tiles.size() > kMaxLiveTiles) {
+        QPointF viewCenter(width() / 2.0, height() / 2.0);
+        QPointF orig = pageOrigin();
+        using DistKey = QPair<double, QPair<int,int>>;
+        QList<DistKey> dists;
+        dists.reserve(m_tiles.size());
+        for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it) {
+            int c = it.key().first, r = it.key().second;
+            QPointF tc(orig.x() + c * 512.0 + 256.0, orig.y() + r * 512.0 + 256.0);
+            dists.append({QPointF(tc - viewCenter).manhattanLength(), {c, r}});
+        }
+        std::sort(dists.begin(), dists.end(), [](const DistKey& a, const DistKey& b) {
+            return a.first > b.first;
+        });
+        while (m_tiles.size() > kMaxLiveTiles && !dists.isEmpty())
+            m_tiles.remove(dists.takeFirst().second);
+    }
+
     update();
 }
 
@@ -456,6 +711,10 @@ void PdfGpuView::wheelEvent(QWheelEvent* e) {
         QPointF newWidget = pdfToWidget(cursorPdf);
         m_panOffset += e->position() - newWidget;
 
+        m_tiles.clear();
+        m_tilePage = -1;
+        m_tileScale = 0.0;
+        m_tileTimer->start();
         update();
         m_zoomTimer->start();
     } else {
@@ -676,5 +935,13 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         return;
     }
     m_panning = false;
+    if (!m_pendingPartImg.isNull() && m_pendingPartPage == m_pageIndex) {
+        qDebug() << "[perf] flush pending partial after pan page=" << m_pageIndex;
+        showPartial(m_pendingPartPage, m_pendingPartScale, m_pendingPartImg);
+        m_pendingPartImg = {};
+        m_pendingPartPage = -1;
+        m_pendingPartScale = 0.0;
+    }
     setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+    update();
 }

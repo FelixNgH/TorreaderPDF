@@ -41,8 +41,11 @@ void UpdateChecker::checkForUpdates() {
         if (!doc.isObject()) { emit checkFailed("invalid response"); return; }
         auto obj = doc.object();
         QString remote = obj["version"].toString().trimmed();
-        QString dlUrl  = obj["download_url"].toString().trimmed();
-        if (!remote.isEmpty() && isNewer(remote, FELIXPDF_VERSION))
-            emit updateAvailable(remote, dlUrl);
+        if (remote.isEmpty()) { emit checkFailed("empty version"); return; }
+        if (!isNewer(remote, FELIXPDF_VERSION)) { emit upToDate(); return; }
+        QString title   = obj["title"].toString().trimmed();
+        QString body    = obj["body"].toString().trimmed();
+        bool blocking   = obj["blocking"].toBool(false);
+        emit updateAvailable(remote, title, body, blocking);
     });
 }

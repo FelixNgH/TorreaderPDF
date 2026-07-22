@@ -21,7 +21,7 @@ void PdfPrinter::printPage(FPDF_DOCUMENT doc, QPrinter* printer, int pageIdx) {
     FPDF_BITMAP bitmap = FPDFBitmap_CreateEx(
         pixW, pixH, FPDFBitmap_BGR, img.bits(), img.bytesPerLine());
     if (!bitmap) { FPDF_ClosePage(page); return; } // guard: alloc failure
-    FPDF_RenderPageBitmap(bitmap, page, 0, 0, pixW, pixH, 0, 0);
+    FPDF_RenderPageBitmap(bitmap, page, 0, 0, pixW, pixH, 0, FPDF_RENDER_LIMITEDIMAGECACHE);
     FPDFBitmap_Destroy(bitmap);
     FPDF_ClosePage(page);
 

@@ -10,6 +10,7 @@
 #include <QtConcurrent>
 #include <QMenu>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QColorDialog>
@@ -336,6 +337,9 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         if (id == 3 && m_propertiesTree->topLevelItemCount() == 0
                 && m_doc && m_doc->isOpen())
             buildProperties();
+        // ponytail: lazy comment loading — load only when user opens the tab
+        if (id == 2)
+            emit requestComments();
     });
 
     auto* layout = new QVBoxLayout(this);
@@ -374,8 +378,38 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     };
 }
 
-ThumbnailPanel::~ThumbnailPanel() {
-    if (m_renderer) disconnect(m_rendererConn);
+ThumbnailPanel::~ThumbnailPanel() {}
+
+// ── resizeEvent ───────────────────────────────────────────────────────────────
+void ThumbnailPanel::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    QTimer::singleShot(0, this, [this]() { requestVisibleThumbnails(); });
+}
+
+// ── requestVisibleThumbnails ───────────────────────────────────────────────────
+void ThumbnailPanel::requestVisibleThumbnails() {
+    int n = m_list->count();
+    if (n == 0) return;
+
+    QListWidgetItem* topItem = m_list->itemAt(QPoint(0, 1));
+    int topRow = topItem ? m_list->row(topItem) : 0;
+
+    int iconH = m_list->iconSize().height() + m_list->spacing() * 2 + 22;
+    int colW  = m_list->iconSize().width()  + m_list->spacing() * 2 + 4;
+    int cols  = qMax(1, m_list->viewport()->width()  / qMax(1, colW));
+    int rows  = qMax(1, m_list->viewport()->height() / qMax(1, iconH));
+    int ahead = (rows + 2) * cols;
+    int visibleCount = rows * cols;
+
+    if (m_thumbPool && !m_thumbPool->isOpen())
+        qDebug() << "[perf] thumb requestVisibleThumbnails but pool is NOT open";
+    for (int i = topRow; i < qMin(topRow + ahead, n); ++i) {
+        auto* item = m_list->item(i);
+        if (!item || !item->icon().isNull()) continue;
+        int priority = (i < topRow + visibleCount) ? 0 : 1;
+        if (m_thumbPool && m_thumbPool->isOpen())
+            m_thumbPool->requestThumbnail(i, priority);
+    }
 }
 
 // ── setDocument ───────────────────────────────────────────────────────────────
@@ -383,17 +417,31 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
                                   ThumbnailRenderPool* pool, bool forceRebuild) {
     // forceRebuild: sau khi sửa file (insert/delete/reorder…) doc được mở lại
     // TRÊN CÙNG con trỏ — phải dựng lại thumbnail + bookmark, không được early-return.
-    if (!forceRebuild && doc == m_doc && renderer == m_renderer && m_list->count() > 0)
+    // pool so sánh riêng — cho phép initWatcher cập nhật pool mà không clear thumbnail.
+    if (!forceRebuild && doc == m_doc && renderer == m_renderer
+        && pool == m_thumbPool && m_list->count() > 0)
         return;
 
     m_doc = doc;
-    if (m_renderer) disconnect(m_rendererConn);
     if (m_thumbPool) disconnect(m_thumbPoolConn);
     m_renderer  = renderer;
     m_thumbPool = pool;
-    if (m_thumbPool)
+    if (m_thumbPool) {
         m_thumbPoolConn = connect(m_thumbPool, &ThumbnailRenderPool::thumbnailReady,
                                   this, &ThumbnailPanel::onPageReady);
+        if (!m_thumbPoolConn)
+            qDebug() << "[perf] thumb pool CONNECT FAILED";
+        else
+            qDebug() << "[perf] thumb pool connected ok isOpen=" << m_thumbPool->isOpen()
+                     << "pool=" << (void*)m_thumbPool << "panel=" << (void*)this;
+    }
+    // Direct worker→panel connections as fallback (UniqueConnection avoids duplicates)
+    if (m_thumbPool) {
+        const auto& ww = m_thumbPool->workers();
+        for (auto* w : ww)
+            connect(w, &ThumbnailWorker::thumbnailReady, this, &ThumbnailPanel::onPageReady, Qt::UniqueConnection);
+        qDebug() << "[perf] thumb direct worker conn n=" << ww.size();
+    }
     m_list->clear();
     m_currentPage = -1;
     m_contentGen.fetchAndAddOrdered(1);
@@ -410,48 +458,66 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
         item->setSizeHint({125, 170});
         item->setData(Qt::UserRole, i);
     }
+    flushPendingThumbs();
 
-    // Connect BEFORE issuing requests so tile-cache hits (synchronous emit) are not lost
-    m_rendererConn = connect(m_renderer, &PdfRenderer::pageReady,
-                             this, &ThumbnailPanel::onPageReady);
-
-    // Use ThumbnailRenderPool (parallel) if available, else fallback to PdfRenderer
+    // ThumbnailRenderPool only — never fall back to PdfRenderer.
+    // If pool is unavailable, thumbnails stay empty (blank placeholder).
     if (m_thumbPool && m_thumbPool->isOpen()) {
-        // Request first 12 visible pages at high priority
-        int initial = qMin(n, 12);
-        for (int i = 0; i < initial; ++i)
+        qDebug() << "[perf] thumb prefetch called n=" << n << "poolOpen=1";
+        static const int kBatch = 20;
+        int firstBatch = qMin(n, kBatch);
+        for (int i = 0; i < qMin(n, 4); ++i)
             m_thumbPool->requestThumbnail(i, 0);
-        // Prefetch rest [12..99] in background after 200ms
-        if (n > initial)
-            QTimer::singleShot(200, this, [this, initial, n]() {
-                if (m_thumbPool) m_thumbPool->prefetchRange(initial, qMin(n - 1, 99));
+        m_thumbPool->prefetchRange(0, firstBatch - 1);
+        qDebug() << "[perf] thumb prefetch batch 0-" << (firstBatch - 1)
+                 << "(deferred rest=" << (n - firstBatch) << ")";
+        for (int start = firstBatch; start < n; start += kBatch) {
+            int end = qMin(start + kBatch, n);
+            int s = start, e = end;
+            QTimer::singleShot(100 * (s / kBatch), this, [this, s, e]() {
+                if (m_thumbPool && m_thumbPool->isOpen()) {
+                    m_thumbPool->prefetchRange(s, e - 1);
+                    qDebug() << "[perf] thumb prefetch batch" << s << "-" << (e - 1);
+                }
             });
-    } else if (m_renderer) {
-        static constexpr double kThumbScale = 0.15;
-        int limit = qMin(n, 8);
-        for (int i = 0; i < limit; ++i)
-            m_renderer->requestPage(i, kThumbScale);
+        }
+    } else if (m_thumbPool) {
+        qDebug() << "[perf] thumb pool not yet open, will retry in 200ms";
+        QTimer::singleShot(200, this, [this, n]() {
+            if (!m_thumbPool || !m_doc) return;
+            if (m_thumbPool->isOpen()) {
+                qDebug() << "[perf] thumb prefetch (delayed) n=" << n << "poolOpen=1";
+                static const int kBatch = 20;
+                int firstBatch = qMin(n, kBatch);
+                for (int i = 0; i < qMin(n, 4); ++i)
+                    m_thumbPool->requestThumbnail(i, 0);
+                m_thumbPool->prefetchRange(0, firstBatch - 1);
+                qDebug() << "[perf] thumb prefetch batch 0-" << (firstBatch - 1)
+                         << "(deferred rest=" << (n - firstBatch) << ")";
+                for (int start = firstBatch; start < n; start += kBatch) {
+                    int end = qMin(start + kBatch, n);
+                    int s = start, e = end;
+                    QTimer::singleShot(100 * (s / kBatch), this, [this, s, e]() {
+                        if (m_thumbPool && m_thumbPool->isOpen()) {
+                            m_thumbPool->prefetchRange(s, e - 1);
+                            qDebug() << "[perf] thumb prefetch batch" << s << "-" << (e - 1);
+                        }
+                    });
+                }
+            } else {
+                qDebug() << "[perf] thumb pool FAILED to open after retry — thumbnails will be empty";
+            }
+        });
+    } else {
+        qDebug() << "[perf] thumb pool not available — thumbnails will be empty";
     }
 
     if (m_scrollConn) disconnect(m_scrollConn);
     m_scrollConn = connect(m_list->verticalScrollBar(), &QScrollBar::valueChanged,
-            this, [this, n]() {
-        int topRow = m_list->row(m_list->itemAt(QPoint(0, 1)));
-        if (topRow < 0) topRow = 0;
-        int iconH = m_list->iconSize().height() + m_list->spacing() * 2 + 22;
-        int colW  = m_list->iconSize().width()  + m_list->spacing() * 2 + 4;
-        int cols  = qMax(1, m_list->viewport()->width()  / qMax(1, colW));
-        int rows  = qMax(1, m_list->viewport()->height() / qMax(1, iconH));
-        int ahead = (rows + 2) * cols;
-        for (int i = topRow; i < qMin(topRow + ahead, n); ++i) {
-            auto* item = m_list->item(i);
-            if (!item || !item->icon().isNull()) continue;
-            if (m_thumbPool && m_thumbPool->isOpen())
-                m_thumbPool->requestThumbnail(i, 1); // adjacent priority
-            else if (m_renderer)
-                m_renderer->requestPage(i, 0.15);
-        }
-    });
+            this, [this]() { requestVisibleThumbnails(); });
+
+    // Request thumbnails for the current visible region
+    QTimer::singleShot(0, this, [this]() { requestVisibleThumbnails(); });
 
     buildBookmarks();
     // Properties built lazily on tab click; pre-populate now only if already visible
@@ -468,23 +534,41 @@ void ThumbnailPanel::setCurrentPage(int pageIndex) {
         auto* item = m_list->item(pageIndex);
         item->setBackground(QColor(37, 99, 235, 90));
         m_list->scrollToItem(item, QAbstractItemView::PositionAtCenter);
+        QTimer::singleShot(0, this, [this]() { requestVisibleThumbnails(); });
     }
     syncBookmarkToPage(pageIndex);
+}
+
+// ── thumbnailForPage ──────────────────────────────────────────────────────────
+QImage ThumbnailPanel::thumbnailForPage(int pageIndex) const {
+    if (!m_list || pageIndex < 0 || pageIndex >= m_list->count())
+        return {};
+    auto* item = m_list->item(pageIndex);
+    if (!item) return {};
+    QIcon icon = item->icon();
+    if (icon.isNull()) return {};
+    QList<QSize> sizes = icon.availableSizes();
+    if (sizes.isEmpty()) return {};
+    QPixmap pix = icon.pixmap(sizes.first());
+    if (pix.isNull()) return {};
+    return pix.toImage();
 }
 
 // ── clearThumbnails ───────────────────────────────────────────────────────────
 void ThumbnailPanel::clearThumbnails() {
     m_doc = nullptr;
-    if (m_renderer) disconnect(m_rendererConn);
     if (m_scrollConn) disconnect(m_scrollConn);
     m_renderer = nullptr;
     m_list->clear();
+    m_pendingThumbs.clear();
     m_outline->clear();
     m_contentGen.fetchAndAddOrdered(1);
     m_bookmarkGen.fetchAndAddOrdered(1);
     m_contentTree->clear();
     m_propertiesTree->clear();
     m_currentPage = -1;
+    m_annotMgr   = nullptr;
+    m_annotPages = 0;
 }
 
 // ── Search helpers (kept as no-ops; panel hidden) ─────────────────────────────
@@ -499,11 +583,46 @@ void ThumbnailPanel::setDarkMode(bool dark) { Q_UNUSED(dark) }
 
 // ── onPageReady ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image) {
-    if (!m_doc || pageIndex < 0 || pageIndex >= m_list->count()) return;
-    double expectedW = m_doc->pageSize(pageIndex).width() * 0.15;
-    if (image.width() > expectedW * 3.0) return;
+    qDebug() << "[perf] thumb recv page=" << pageIndex
+             << "imgW=" << image.width()
+             << "listCount=" << (m_list ? m_list->count() : -1)
+             << "hasDoc=" << (m_doc != nullptr)
+             << "sender=" << (sender() ? sender()->metaObject()->className() : "null")
+             << "panel=" << (void*)this;
+    if (!m_doc || pageIndex < 0 || !m_list || pageIndex >= m_list->count()) {
+        qDebug() << "[perf] thumb DROPPED-EARLY page=" << pageIndex
+                 << "reason=listNotReady listCount=" << (m_list ? m_list->count() : -1)
+                 << "hasDoc=" << (m_doc != nullptr);
+        if (pageIndex >= 0)
+            m_pendingThumbs[pageIndex] = image;
+        return;
+    }
+    double pw = m_doc->pageSize(pageIndex).width();
+    if (pw > 0.0 && image.width() > pw * 0.5) {
+        qDebug() << "[perf] thumb REJECTED page=" << pageIndex
+                 << "imgW=" << image.width() << "pageW=" << pw;
+        return;
+    }
     if (auto* item = m_list->item(pageIndex))
         item->setIcon(QIcon(QPixmap::fromImage(image)));
+}
+
+void ThumbnailPanel::flushPendingThumbs() {
+    if (m_pendingThumbs.isEmpty()) return;
+    int n = m_list ? m_list->count() : 0;
+    for (auto it = m_pendingThumbs.begin(); it != m_pendingThumbs.end();) {
+        int pg = it.key();
+        if (pg >= 0 && pg < n) {
+            if (auto* item = m_list->item(pg))
+                item->setIcon(QIcon(QPixmap::fromImage(it.value())));
+            it = m_pendingThumbs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!m_pendingThumbs.isEmpty())
+        qDebug() << "[perf] thumb" << m_pendingThumbs.size()
+                 << "pending thumb(s) still waiting for list to grow";
 }
 
 // ── buildBookmarks (async) ────────────────────────────────────────────────────
@@ -772,4 +891,9 @@ void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
     }
     if (m_commentsList->count() == 0)
         m_commentsList->addItem(new QListWidgetItem(QStringLiteral("(no comments yet)")));
+}
+
+void ThumbnailPanel::setAnnotMgr(AnnotationManager* mgr, int pageCount) {
+    m_annotMgr   = mgr;
+    m_annotPages = pageCount;
 }

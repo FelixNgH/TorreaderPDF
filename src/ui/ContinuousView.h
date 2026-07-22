@@ -1,12 +1,14 @@
 #pragma once
 #include <QAbstractScrollArea>
 #include <QHash>
+#include <QSet>
 #include <QPixmap>
 #include <QImage>
 #include <QPointF>
 #include <QRect>
 #include <QTimer>
 #include <QVector>
+    #include <QElapsedTimer>
 
 class PdfDocument;
 class PdfRenderer;
@@ -33,6 +35,10 @@ public:
     // Page index whose vertical midpoint is closest to the viewport center.
     int currentPage() const;
 
+    void setSelectedAnnotRect(const QRectF& rectPdf);
+    void clearSelectedAnnotRect();
+    void invalidatePage(int pageIndex);
+
 
 signals:
     // Emitted when the most-visible page changes while scrolling.
@@ -49,6 +55,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void scrollContentsBy(int dx, int dy) override;
 
@@ -97,6 +104,8 @@ private:
 
     // ── Render cache ──────────────────────────────────────────────────────────
     QHash<int, QPixmap> m_pageImages; // keyed by page index
+    QHash<int, double>  m_pageImageZoom; // zoom level when each image was rendered
+    QSet<int>           m_continuousRequested; // pages currently being rendered
 
     // ── View state ────────────────────────────────────────────────────────────
     double  m_zoom     = 1.0;
@@ -119,8 +128,13 @@ private:
     QTimer* m_scrollTimer = nullptr;   // debounce for pageChanged on scroll
 
     // Renderer signal connection (kept so we can disconnect on document change).
-    QMetaObject::Connection m_pageReadyConn;
+    QMetaObject::Connection m_continuousPageReadyConn;
     QMetaObject::Connection m_regionReadyConn;
+
+    // Tracks which (page → zoom) pairs have already been probed from cache.
+    // Prevents repeated synchronous disk reads when cached images don't match
+    // current continuous zoom. Cleared on zoom change.
+    QHash<int, double> m_cacheProbed;
 
     // ── Sharp-region overlay ─────────────────────────────────────────────────
     // Renders only the visible region at full zoom when the base page image is
@@ -129,5 +143,19 @@ private:
     double  m_sharpScale   = 0.0;
     QRect   m_sharpRegion;
     QPixmap m_sharpPixmap;
-    QTimer* m_sharpTimer   = nullptr;
+
+    // ── Primary-page settle (single-mode pattern, Việc 1 2026-07-21) ─────────
+    // Continuous tracks one "primary page" (the page with most visible area in
+    // viewport) and treats it like single-mode: cache-first, then 400ms settle
+    // timer, then render. Neighbors only after primary is done.
+    QTimer* m_contSettleTimer = nullptr;
+    int     m_primaryPage = -1;
+    double  m_lastRequestZoom = -1.0;
+    bool    m_primaryRequested = false;
+    void requestNeighborPages();
+
+    // ── Selection state ──────────────────────────────────────────────────────
+    QRectF      m_selRect;
+    bool        m_hasSel = false;
+
 };

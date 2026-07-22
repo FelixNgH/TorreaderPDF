@@ -13,38 +13,43 @@
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QMatrix4x4>
+#include <QHash>
+#include <QSet>
+#include <QPair>
 #include <QKeyEvent>
 
 #include "annotations/AnnotationTypes.h"
 
-// GPU-accelerated PDF page viewer (drop-in replacement for PdfView).
-// Renders page as an OpenGL texture — pan/zoom = matrix update only, no CPU re-render.
+// GPU-accelerated PDF page viewer with viewport tiling.
+// Renders the page as a low-res full-page background texture plus a grid of
+// sharp 512×512 tile textures for the visible viewport region.
 class PdfGpuView : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
     enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText };
-    enum class ViewMode { Single, Double };  // Double is no-op (GPU view is single-mode)
+    enum class ViewMode { Single, Double };
 
     struct AnnotOverlay {
         int     pageIndex;
-        QRectF  pdfRect;   // PDF coords (Y up)
+        QRectF  pdfRect;
         QString snippet;
     };
 
     explicit PdfGpuView(QWidget* parent = nullptr);
     ~PdfGpuView() override;
 
-    // Called when navigating to a NEW page (resets pan).
     void setPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt);
-    // Second page (no-op in GPU single-mode view).
     void setSecondPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt);
-    // Called when a fresh render of the SAME page arrives (keeps pan).
     void updatePageImage(const QImage& pageImage);
+
+    // Accept a partial (in-progress) render from ProgressiveRenderTask
+    void showPartial(int page, double scale, QImage img);
 
     void setZoom(double scale);
     void setViewMode(ViewMode mode);
     void setDarkMode(bool dark);
     void beginLoading();
+    void setPendingPage(int pageIndex, QSizeF pageSizePt);
     void setTool(ViewTool tool);
     void beginSignaturePick();
     void setHighlights(const QList<QRectF>& rects);
@@ -53,6 +58,12 @@ public:
     void clearAnnotOverlays();
     void setSelectedAnnot(const QRectF& rectPdf);
     void clearSelectedAnnot();
+
+    // Insert or update a tile in the current view.
+    void setTile(int page, double scale, int col, int row, const QImage& img);
+
+    // Show a blurred placeholder (thumbnail) while the full render loads.
+    void setPlaceholder(const QImage& img);
 
     double   zoom()        const { return m_zoom; }
     int      currentPage() const { return m_pageIndex; }
@@ -76,6 +87,8 @@ signals:
     void annotationContextRequested(int pageIndex, QPointF pdfPoint, QPoint globalPos);
     void annotationMoveRequested(int pageIndex, double dx, double dy);
     void signatureRectPicked(int pageIndex, QRectF rectPt);
+    // Emitted after debounce (~120ms) when pan/zoom changes the visible region.
+    void tilesNeeded(int page, double scale, QRect viewportPx);
 
 protected:
     void initializeGL() override;
@@ -104,7 +117,7 @@ private:
     // Pending upload
     QImage  m_pendingImage;
     bool    m_textureDirty = false;
-    int     m_texW = 0, m_texH = 0;
+    int     m_texW = -1, m_texH = -1;
 
     // View state
     int     m_pageIndex   = 0;
@@ -114,6 +127,8 @@ private:
     double  m_flipAccum = 0.0;
     QElapsedTimer m_flipCooldown;
     QImage  m_lastImage;
+    int     m_lastImagePage = -1;
+    QImage  m_placeholder;  // thumbnail shown while full render loads
     bool    m_hasImage    = false;
     bool    m_loading     = false;
     bool    m_darkMode    = false;
@@ -149,9 +164,22 @@ private:
     QPointF m_dragStart;
     QRectF  m_dragOrigRect;
 
-    // Overlays (drawn via QPainter on top of GL)
-    QList<QRectF>       m_highlights;
-    QList<AnnotOverlay> m_annotOverlays;
+    // ponytail: most recent partial skipped during pan — flushed on pan-end
+    QImage  m_pendingPartImg;
+    double  m_pendingPartScale = 0.0;
+    int     m_pendingPartPage  = -1;
 
-    QTimer* m_zoomTimer = nullptr;
+    // Overlays (drawn via QPainter on top of GL)
+    QList<QRectF>           m_highlights;
+    QList<AnnotOverlay>     m_annotOverlays;
+
+    QTimer* m_zoomTimer     = nullptr;
+
+    // ── Tiling ────────────────────────────────────────────────────────────────
+    QTimer* m_tileTimer    = nullptr;
+    // Tiles for the current page/view: key = (col,row), value = rendered image.
+    QHash<QPair<int,int>, QImage> m_tiles;
+    int     m_tilePage     = -1;
+    double  m_tileScale    = 0.0;
+    void requestTiles();
 };

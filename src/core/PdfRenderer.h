@@ -14,31 +14,24 @@
 #include <functional>
 #include <atomic>
 #include <vector>
+#include <QElapsedTimer>
+#include <fpdf_progressive.h>
 #include "PdfDocument.h"
 #include "TileCacheFile.h"
 #include "formibpdf.h"
 
-// Thread-safe shared ownership of FormibDoc (auto-closes via custom deleter)
 using FormibDocPtr = std::shared_ptr<FormibDoc>;
 inline FormibDocPtr makeFormibDoc(FormibDoc* raw) {
     return FormibDocPtr(raw, [](FormibDoc* p){ if (p) formibpdf_close(p); });
 }
 
-// Adaptive verdict cache for FormibPDF. Shared (shared_ptr) between PdfRenderer
-// and all PageRenderTasks. FormibPDF is a young renderer: it's fast for simple
-// text/vector PDFs but fails (blank/garbled) on complex content. Without this,
-// every failing page wastes a full parallel render before falling back to PDFium
-// — making the app SLOWER and heavier than pure PDFium. This gate makes the app
-// learn per-page and, if FormibPDF fails too often early, disables it for the
-// whole document so the app degrades gracefully to plain PDFium speed.
 struct FormibGate {
     std::atomic<int>  attempts{0};
     std::atomic<int>  rejects{0};
     std::atomic<bool> disabled{false};
     QMutex            mtx;
-    QSet<int>         rejectedPages;   // pages where FormibPDF was already rejected
+    QSet<int>         rejectedPages;
 
-    // True if FormibPDF is worth trying for this page.
     bool shouldTry(int page) {
         if (disabled.load()) return false;
         QMutexLocker lk(&mtx);
@@ -49,14 +42,9 @@ struct FormibGate {
         int a = attempts.fetch_add(1) + 1;
         int r = rejects.fetch_add(1) + 1;
         { QMutexLocker lk(&mtx); rejectedPages.insert(page); }
-        // Learning window: after 8 attempts, if >70% failed, give up on FormibPDF
-        // for this document entirely (avoids endless double-work on a file it
-        // simply can't render).
         if (a >= 8 && static_cast<double>(r) / a > 0.70)
             disabled.store(true);
     }
-    // Deliberate skip (e.g. oversized page) — don't retry, but don't count it
-    // against the disable ratio (it isn't a FormibPDF quality failure).
     void skipPage(int page) {
         QMutexLocker lk(&mtx);
         rejectedPages.insert(page);
@@ -67,38 +55,77 @@ struct RenderRequest {
     int    pageIndex;
     double scaleFactor;
     bool   renderAnnotations;
+    bool   fullQuality = false;
     int    generation;
 };
 
-// PDFium is NOT thread-safe — all FPDF_* calls must be serialized through
-// s_pdfiumMutex (defined in PdfDocument.cpp). Single-doc path only.
-// Decision 2026-07-04: no DocPool, no per-page mutex.
+class PdfRenderer;
 
 class PageRenderTask : public QObject, public QRunnable {
     Q_OBJECT
 public:
-    PageRenderTask(FPDF_DOCUMENT doc, PdfDocument* pdfDoc, RenderRequest req,
+    PageRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc, RenderRequest req,
                    QObject* receiver, std::shared_ptr<QAtomicInt> genRef,
                    FormibDocPtr formibDoc = nullptr,
                    std::shared_ptr<FormibGate> gate = nullptr);
     void run() override;
 signals:
     void finished(int pageIndex, QImage image);
+    void pageObjectCount(int pageIndex, int count);
 private:
-    FPDF_DOCUMENT                m_doc;
+    PdfRenderer*                 m_renderer = nullptr;
     PdfDocument*                 m_pdfDoc = nullptr;
     RenderRequest                m_req;
     std::shared_ptr<QAtomicInt>  m_genRef;
-
     FormibDocPtr                 m_formibDoc;
     std::shared_ptr<FormibGate>  m_gate;
 };
 
-// ── RegionRenderTask ───────────────────────────────────────────────────────────
+struct ProgressivePauseCtx {
+    QElapsedTimer timer;
+    int sliceMs = 50;
+};
+
+inline FPDF_BOOL ProgressiveNeedToPauseNow(IFSDK_PAUSE* pThis) {
+    auto* ctx = static_cast<ProgressivePauseCtx*>(pThis->user);
+    return ctx->timer.elapsed() >= ctx->sliceMs;
+}
+
+class ProgressiveRenderTask : public QObject, public QRunnable {
+    Q_OBJECT
+public:
+    ProgressiveRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc, RenderRequest req,
+                          QObject* receiver, std::shared_ptr<QAtomicInt> genRef,
+                          FormibDocPtr formibDoc = nullptr,
+                          std::shared_ptr<FormibGate> gate = nullptr);
+    ~ProgressiveRenderTask() override;
+    void run() override;
+signals:
+    void pagePartial(int pageIndex, double scale, QImage image);
+    void finished(int pageIndex, QImage image);
+    void pageObjectCount(int pageIndex, int count);
+private:
+    PdfRenderer*                 m_renderer;
+    PdfDocument*                 m_pdfDoc;
+    RenderRequest                m_req;
+    std::shared_ptr<QAtomicInt>  m_genRef;
+    FormibDocPtr                 m_formibDoc;
+    std::shared_ptr<FormibGate>  m_gate;
+    FPDF_BITMAP                  m_bmp = nullptr;
+    FPDF_PAGE                    m_fpdfPage = nullptr;
+    int                          m_bmpW = 0;
+    int                          m_bmpH = 0;
+    int                          m_renderStatus = FPDF_RENDER_READY;
+    double                       m_renderScale = 0.0;
+    QImage                       m_image;
+    QElapsedTimer                m_lastEmitTimer;
+    double scaleFactor() const { return m_renderScale; }
+};
+
 class RegionRenderTask : public QObject, public QRunnable {
     Q_OBJECT
 public:
-    RegionRenderTask(FPDF_DOCUMENT doc, PdfDocument* pdfDoc,
+    RegionRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc,
                      int pageIndex, double scale, QRect regionPx,
                      QObject* receiver,
                      std::shared_ptr<QAtomicInt> genRef);
@@ -106,7 +133,7 @@ public:
 signals:
     void finished(int pageIndex, double scale, QRect regionPx, QImage img);
 private:
-    FPDF_DOCUMENT               m_doc;
+    PdfRenderer*                m_renderer = nullptr;
     PdfDocument*                m_pdfDoc = nullptr;
     int                         m_pageIndex;
     double                      m_scale;
@@ -115,6 +142,41 @@ private:
     int                         m_reqGen = 0;
 };
 
+class TileBatchRenderTask : public QObject, public QRunnable {
+    Q_OBJECT
+public:
+    TileBatchRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc,
+                        int pageIndex, double scale,
+                        QVector<QPoint> tiles,
+                        QObject* receiver,
+                        std::shared_ptr<QAtomicInt> genRef);
+    void run() override;
+signals:
+    void tileDone(int page, double scale, int col, int row, QImage img);
+private:
+    static constexpr int kTileSize = 512;
+    PdfRenderer*                m_renderer = nullptr;
+    PdfDocument*                m_pdfDoc = nullptr;
+    int                         m_pageIndex;
+    double                      m_scale;
+    QVector<QPoint>             m_tiles;
+    std::shared_ptr<QAtomicInt> m_genRef;
+    int                         m_reqGen = 0;
+};
+
+struct TileKey {
+    int    page;
+    double qscale;
+    int    col;
+    int    row;
+    bool operator==(const TileKey& o) const {
+        return page == o.page && qAbs(qscale - o.qscale) < 1e-9 && col == o.col && row == o.row;
+    }
+};
+inline size_t qHash(const TileKey& k, size_t seed = 0) {
+    return qHash(k.page, qHash(k.col, qHash(k.row, qHash(size_t(k.qscale * 1000), seed))));
+}
+
 class PdfRenderer : public QObject {
     Q_OBJECT
 public:
@@ -122,56 +184,97 @@ public:
     ~PdfRenderer() override;
 
     void setDocument(PdfDocument* doc);
-    /// Called from background thread after formibpdf_open() completes.
-    /// Thread-safe: sets m_formibDoc and is only called before any render tasks start.
     void setFormibDoc(FormibDocPtr doc);
     void requestPage(int pageIndex, double scale);
+    void requestTiles(int page, double scale, QRect viewportPx);
     void preloadAdjacent(int pageIndex, double scale);
     void cancelPending();
-    // Clear the pending-request tracking set without cancelling running tasks.
-    // Stale tasks (generation mismatch) return early without emitting finished,
-    // leaving their key stuck in m_pendingRequests forever. Call this on each
-    // scroll tick so those stuck keys are released and pages can be re-requested.
     void clearStalePending();
     void clearCache();
+    void invalidatePage(int pageIndex);
     void setCurrentPage(int page);
-    void setTileCache(TileCacheFile* cache);
+    void setTileCache(std::shared_ptr<TileCacheFile> cache);
     void requestRegion(int pageIndex, double scale, QRect regionPx);
+    // Like requestPage but only checks memory/disk cache — emits pageReady if hit,
+    // returns true on hit, false if no cache found (no render started).
+    bool requestFromCacheOnly(int pageIndex, double scale);
+    // Like requestFromCacheOnly but for continuous mode: memory cache ONLY (no disk I/O),
+    // validates image dimensions match requested scale, emits continuousPageReady.
+    bool requestFromCacheOnlyForContinuous(int pageIndex, double scale);
+    // Continuous-mode render: no newest-wins, multiple pages can render concurrently.
+    // Passes through to ProgressiveRenderTask without bumping the full-quality gate.
+    void requestPageForContinuous(int pageIndex, double scale);
+
+    static std::atomic<int> s_renderCount;
+    FPDF_PAGE acquirePage(int pageIndex);
+    void setPageObjectCount(int pageIndex, int count) { m_pageObjectCount[pageIndex] = count; }
+
+    // ponytail: only 1 full-quality render at a time; newest-wins
+
+    // Full-quality renders: 4000px long edge. Resolution is free for PDFium
+    // (content-bound, not pixel-bound). Benchmark on page 4 (4.5M drawing
+    // commands): 200px=3105ms, 800px=3049ms, 4000px=3265ms.
+    // DO NOT lower — it would NOT save render time, only degrade quality.
+    static constexpr double kFullRenderMaxPx = 4000.0;
+    // Thumbnail renders cap at this long-edge pixel count to avoid 43MB
+    // thumbnail images for the page-navigation panel.
+    static constexpr double kThumbMaxPx = 400.0;
+
+    // Exposed for MainWindow to show placeholder immediately on page navigation
+    QImage bestCachedForPage(int pageIndex) const;
 
 signals:
     void pageReady(int pageIndex, QImage image);
+    void continuousPageReady(int pageIndex, QImage image, double renderedScale);
+    void pagePartial(int pageIndex, double scale, QImage image);
     void regionReady(int pageIndex, double scale, QRect regionPx, QImage img);
+    void tileReady(int page, double scale, int col, int row, QImage img);
 
 private:
     static double quantize(double scale) {
         return std::round(scale * 20.0) / 20.0;
     }
-    static qint64 cacheKey(int pageIndex, double qscale) {
-        return static_cast<qint64>(pageIndex) * 10000LL
-               + static_cast<int>(qscale * 100.0);
-    }
-
-    QImage bestCachedForPage(int pageIndex) const;
     void evictCache();
-    /// Insert into m_cache with single-zoom eviction: when page P is cached at
-    /// zoom Z, remove all other zoom levels for page P. Keeps only the most
-    /// recently requested zoom per page. Cap: kMaxCacheBytes ~ 80 MB.
-    void insertCache(int pageIndex, double qscale, const QImage& img);
+    bool isHeavyPage(int pageIndex);
 
     PdfDocument*                m_doc = nullptr;
-    QHash<qint64, QImage>       m_cache;
-    QSet<qint64>                m_pendingRequests;
-    std::shared_ptr<QAtomicInt>             m_regionGeneration;
-    std::shared_ptr<QAtomicInt>             m_generation;
+    QHash<int, QImage>          m_cache;             // key = pageIndex
+    QHash<qint64, qint64>       m_pendingRequests;  // compositeKey(pageIndex,fullQuality) → timestamp (ms)
+    std::shared_ptr<QAtomicInt> m_regionGeneration;
+    std::shared_ptr<QAtomicInt> m_generation;
+    std::shared_ptr<QAtomicInt> m_tileGeneration;
     QThreadPool                 m_thumbPool;
     QThreadPool                 m_mainPool;
-    static constexpr int        kMaxCachePages      = 40;
-    static constexpr int        kMaxOpenPageHandles = 32;
-    static constexpr qint64     kMaxCacheBytes      = 80LL * 1024 * 1024; // 80 MB single-zoom cap
+    // ~6-8 pages × 43MB/page at 4000px; raised from 40MB because each
+    // page cache entry is now a full 4000px-long-edge render (~43MB for A1).
+    static constexpr qint64     kMaxCacheBytes      = 300LL * 1024 * 1024;
 
     qint64         m_cacheBytes  = 0;
     int            m_currentPage = 0;
-    TileCacheFile* m_tileCache   = nullptr;
-    FormibDocPtr   m_formibDoc;   // shared with active PageRenderTasks
-    std::shared_ptr<FormibGate> m_formibGate; // adaptive FormibPDF verdict cache
+    int            m_lastTilePage  = -1;
+    double         m_lastTileScale = 0.0;
+    std::shared_ptr<TileCacheFile> m_tileCache;
+    FormibDocPtr   m_formibDoc;
+    std::shared_ptr<FormibGate> m_formibGate;
+    QSet<int>                   m_writingCache;      // pages currently being written to disk cache
+
+    // Tile cache for light pages (heavy pages skip tiles entirely)
+    static constexpr int        kTileSize       = 512;
+    static constexpr qint64     kMaxTileBytes   = 150LL * 1024 * 1024;
+    QHash<TileKey, QImage>      m_tileCacheInMem;
+    qint64                      m_tileCacheBytes = 0;
+    QSet<TileKey>               m_pendingTiles;
+
+    // Heavy page detection: caches FPDFPage_CountObjects result per page
+    QHash<int, int> m_pageObjectCount;
+    static constexpr int kHeavyObjectThreshold = 100000;
+
+    std::shared_ptr<QAtomicInt> m_fullRenderGen;
+    std::shared_ptr<QAtomicInt> m_progressiveGen;
+    std::atomic<bool>           m_fullRenderRunning{false};
+    std::atomic<int>            m_fullRenderPage{-1};
+    double                      m_fullRenderScale = 1.0;
+    std::shared_ptr<QAtomicInt> m_continuousGen;
+    std::atomic<int>            m_continuousRunning{0};
+    static constexpr int        kMaxContinuousRenders = 2;
 };

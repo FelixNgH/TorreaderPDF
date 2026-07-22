@@ -9,6 +9,7 @@
 #include <queue>
 #include <vector>
 #include <fpdfview.h>
+#include "TileCacheFile.h"
 
 struct ThumbRequest {
     int pageIndex;
@@ -19,9 +20,10 @@ struct ThumbRequest {
 class ThumbnailWorker : public QThread {
     Q_OBJECT
 public:
-    ThumbnailWorker(FPDF_DOCUMENT doc, int slot, QObject* parent = nullptr);
+    ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cache, QObject* parent = nullptr);
     void stop();
     void enqueue(int pageIndex, int priority = 2);
+
 signals:
     void thumbnailReady(int pageIndex, QImage image);
 protected:
@@ -29,6 +31,7 @@ protected:
 private:
     FPDF_DOCUMENT m_doc;
     int  m_slot;
+    TileCacheFile* m_cache;
     std::priority_queue<ThumbRequest, std::vector<ThumbRequest>, std::greater<ThumbRequest>> m_queue;
     QSet<int>      m_queued;   // pages currently in queue — prevents duplicate entries
     QMutex         m_mutex;
@@ -39,7 +42,7 @@ private:
 class ThumbnailRenderPool : public QObject {
     Q_OBJECT
 public:
-    static constexpr int    kDocs       = 1;  // was 4; now serialized via s_pdfiumMutex so extra docs just waste RAM
+    static constexpr int    kDocs       = 1;  // was 4→2; single-doc because all renders serialize through s_pdfiumMutex anyway
     static constexpr double kThumbScale = 0.15;
 
     explicit ThumbnailRenderPool(QObject* parent = nullptr);
@@ -53,12 +56,14 @@ public:
     // priority: 0=visible, 1=adjacent, 2=background
     void requestThumbnail(int pageIndex, int priority = 2);
     void prefetchRange(int first, int last);
+    const std::vector<ThumbnailWorker*>& workers() const { return m_workers; }
 
 signals:
     void thumbnailReady(int pageIndex, QImage image);
 
 private:
     std::vector<ThumbnailWorker*> m_workers;
+    TileCacheFile m_cache;
     bool    m_open      = false;
     int     m_pageCount = 0;
     QString m_path;

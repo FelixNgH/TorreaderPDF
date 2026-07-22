@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.0.0 LANGUAGES CXX)
+project(TorReader VERSION 2.2.3 LANGUAGES CXX)
 
 # ── FormibPDF — Rust engine (Phase 2) ────────────────────────────────────────
 include(FetchContent)
@@ -136,6 +136,7 @@ set(SOURCES
 
     # UI
     src/ui/MainWindow.cpp
+    src/ui/GateDialog.cpp
     src/ui/PdfView.cpp
     src/ui/PdfGpuView.cpp
     src/ui/ThumbnailPanel.cpp

@@ -1,5 +1,6 @@
 #include "TileCacheFile.h"
 #include <QBuffer>
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QMutexLocker>
@@ -58,18 +59,17 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
                 m_file.seek(0);
                 m_file.read(reinterpret_cast<char*>(&m_header), sizeof(TorCacheHeader));
 
-                bool valid = std::strncmp(m_header.magic, "TORCACH2", 8) == 0
+                bool valid = std::strncmp(m_header.magic, "TORCACH4", 8) == 0
                           && m_header.pdfHash   == pdfHash
                           && m_header.pdfSize   == pdfSize
                           && m_header.pageCount == (uint32_t)pageCount;
                 if (valid) {
                     m_pageCount = pageCount;
                     m_index.resize(pageCount * 4);
-                    qint64 need = (qint64)m_index.size() * sizeof(TileEntry);
+                    qint64 need = (qint64)m_index.size() * sizeof(TorEntry);
                     qint64 got  = m_file.read(reinterpret_cast<char*>(m_index.data()), need);
                     if (got == need) {
                         m_open = true;
-                        m_jpegQuality = m_header.jpegQuality;
                         return true;
                     }
                 }
@@ -84,21 +84,19 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
     if (!m_file.open(QIODevice::ReadWrite | QIODevice::Truncate)) return false;
 
     std::memset(&m_header, 0, sizeof(m_header));
-    std::memcpy(m_header.magic, "TORCACH2", 8);
+    std::memcpy(m_header.magic, "TORCACH4", 8);
     m_header.pdfHash    = pdfHash;
     m_header.pdfSize    = pdfSize;
     m_header.pageCount  = static_cast<uint32_t>(pageCount);
     m_header.zoomLevels = 4;
-    m_header.jpegQuality = 85;
 
     m_file.write(reinterpret_cast<char*>(&m_header), sizeof(m_header));
 
     m_pageCount = pageCount;
-    m_index.assign(pageCount * 4, TileEntry{});
-    m_file.write(reinterpret_cast<char*>(m_index.data()), (qint64)m_index.size() * sizeof(TileEntry));
+    m_index.assign(pageCount * 4, TorEntry{});
+    m_file.write(reinterpret_cast<char*>(m_index.data()), (qint64)m_index.size() * sizeof(TorEntry));
     m_file.flush();
     m_open = true;
-    m_jpegQuality = 85;
     return true;
 }
 
@@ -112,10 +110,10 @@ QImage TileCacheFile::readPage(int pageIndex, CacheZoom zoom) {
     if (!m_open || pageIndex < 0 || pageIndex >= m_pageCount) return {};
     int idx = entryIndex(pageIndex, zoom);
     if (idx >= m_index.size() || m_index[idx].status != 1) return {};
-    const TileEntry& e = m_index[idx];
+    const TorEntry& e = m_index[idx];
     m_file.seek((qint64)e.offset);
     QByteArray blob = m_file.read((qint64)e.size);
-    return QImage::fromData(blob, "JPG");
+    return QImage::fromData(blob, "PNG");
 }
 
 bool TileCacheFile::writePage(int pageIndex, CacheZoom zoom, const QImage& image) {
@@ -123,7 +121,7 @@ bool TileCacheFile::writePage(int pageIndex, CacheZoom zoom, const QImage& image
     {
         QBuffer buf(&blob);
         buf.open(QIODevice::WriteOnly);
-        image.save(&buf, "JPG", m_jpegQuality);
+        image.save(&buf, "PNG", 1);
     }
     if (blob.isEmpty()) return false;
 
@@ -138,7 +136,7 @@ bool TileCacheFile::writePage(int pageIndex, CacheZoom zoom, const QImage& image
     m_index[idx] = { static_cast<uint64_t>(off), static_cast<uint32_t>(blob.size()), 1, {0,0,0} };
 
     m_file.seek(entryFileOffset(pageIndex, zoom));
-    m_file.write(reinterpret_cast<char*>(&m_index[idx]), sizeof(TileEntry));
+    m_file.write(reinterpret_cast<char*>(&m_index[idx]), sizeof(TorEntry));
     m_file.flush();
     return true;
 }
@@ -148,4 +146,24 @@ bool TileCacheFile::hasPage(int pageIndex, CacheZoom zoom) const {
     if (!m_open || pageIndex < 0 || pageIndex >= m_pageCount) return false;
     int idx = entryIndex(pageIndex, zoom);
     return idx < m_index.size() && m_index[idx].status == 1;
+}
+
+void TileCacheFile::invalidatePage(int pageIndex) {
+    QMutexLocker lock(&m_mutex);
+    if (!m_open || pageIndex < 0 || pageIndex >= m_pageCount) return;
+    int cleared = 0;
+    for (int z = 0; z < 4; ++z) {
+        CacheZoom zoom = static_cast<CacheZoom>(z);
+        int idx = entryIndex(pageIndex, zoom);
+        if (idx < m_index.size() && m_index[idx].status != 0) {
+            m_index[idx] = TorEntry{};
+            m_file.seek(entryFileOffset(pageIndex, zoom));
+            m_file.write(reinterpret_cast<char*>(&m_index[idx]), sizeof(TorEntry));
+            ++cleared;
+        }
+    }
+    if (cleared > 0) {
+        m_file.flush();
+        qDebug().noquote() << "[cache] disk invalidate page=" << pageIndex << "entries=" << cleared;
+    }
 }

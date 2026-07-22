@@ -15,14 +15,42 @@ Open a 200MB PDF in a second or two, combine files **without losing bookmarks**,
 pull out or split pages, insert pages from another PDF, add a digital signature,
 and translate text in place — free and open-source (MIT).
 
+### 🚀 Built for large, multi-hundred-page drawing sets
+
+TorReader stays smooth on the files that make other viewers crawl — a **300-page
+A1 CAD drawing set** opens fast, scrolls and pages **without freezing**, and keeps
+memory low. The renderer draws each page in short, interruptible slices so the UI
+never blocks, backs it with a two-layer (memory + disk) cache, and evicts
+off-screen pages so RAM stays flat no matter how many pages you flip through.
+
 ### ⬇ Download
 
 | Platform | Download |
 |----------|----------|
-| **Windows** (x64) | [`TorReaderPDF-2.2-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
-| **Linux** (x86_64) | [`TorReaderPDF-2.2-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run |
+| **Windows** (x64) | [`TorReaderPDF-2.2.3-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Linux** (x86_64) | [`TorReaderPDF-2.2.3-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (Ubuntu 22.04+, glibc 2.35+) |
 
 See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
+
+### ✨ What's new in 2.2.3
+
+- **Large-file rendering overhaul** — the 2.2 release had rendering regressions on
+  big multi-page drawings (missed pages in single view, severe lag in continuous
+  scroll). 2.2.3 rebuilds the render pipeline around progressive, interruptible
+  rendering + a two-layer cache: 200–300 page large-format drawing sets now open
+  and scroll smoothly.
+- **Markup on rotated pages fixed** — annotations now land in the right place on
+  `/Rotate 90/180/270` pages; the arrow tool keeps its arrowhead; sticky notes are
+  selectable and upright.
+- **Text markup** — inline text reads horizontally, the box fits the text, and you
+  can change **font size and colour** via right-click → Properties (it now shows the
+  markup's real current values).
+- **Move + Undo/Redo** for text/note markup; the Linux build is rebuilt for broad
+  compatibility (runs on Ubuntu 22.04, 24.04 and newer).
+
+> Heavy CAD pages (millions of vector operations) still take ~2–3s for the *first*
+> full-resolution render — a physical ceiling shared by every PDF engine — but
+> navigation across the whole document stays responsive.
 
 ![TorReader PDF demo](docs/screenshots/demo.gif)
 
@@ -42,13 +70,13 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 
 ## Features
 
-- **Fast PDF viewer** — memory-mapped loading opens 200MB files in 1–2s; continuous scroll (RAM-efficient), sharp at every zoom even with mixed page sizes (A4 + A0–A3 in one file)
+- **Fast PDF viewer, built for large drawing sets** — memory-mapped loading opens 200MB files in 1–2s; **300-page A1 CAD sets** scroll and page without freezing thanks to progressive interruptible rendering + a two-layer cache; continuous scroll is RAM-efficient (off-screen pages evicted), sharp at every zoom even with mixed page sizes (A4 + A0–A3 in one file)
 - **Merge PDF** — combine files while **keeping every bookmark**, remapped to the new page numbers (most tools drop them); unbookmarked pages get an auto "Page N" entry
 - **Split PDF** — split a document into parts by page count or size
 - **Extract pages** — pull any page or range out into a new PDF
 - **Insert pages** — Adobe-style, right-click a thumbnail to insert pages from another PDF; bookmarks renumber to match
 - **Sign PDF** — digital signature, PKCS#7 detached, SHA-256, using your own `.pfx`/`.p12` certificate; optional visible signature stamp, placed by dragging then confirmed with "Finalize Signature"
-- **Comments (markup)** — Line, Arrow, Rectangle, Ellipse, Cloud, Text box, and sticky Note tools with color/width/fill controls; select, move, and undo/redo any markup
+- **Comments (markup)** — Line, Arrow, Rectangle, Ellipse, Cloud, Text box, and sticky Note tools with colour/width/fill controls; select, move, and undo/redo any markup. Text boxes support adjustable **font size and colour** (right-click → Properties), and all markup lands correctly on **rotated pages**
 - **Translate PDF (free)** — Ctrl+drag over text to translate it in place, cached locally
 - **Delete / Reorder pages**, reorder bookmarks
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
