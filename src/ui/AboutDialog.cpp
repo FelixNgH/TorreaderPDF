@@ -11,29 +11,50 @@
 static const char* kLicenseText = R"(
 <h3>Third-party open-source components</h3>
 
+<b>Qt 6</b> — GNU LGPL v3<br>
+Copyright &copy; The Qt Company Ltd.<br>
+Dynamically linked; source code and relinking information at <a href='https://code.qt.io'>code.qt.io</a>.<br><br>
+
 <b>PDFium</b> — BSD 3-Clause License<br>
 Copyright &copy; Google LLC and contributors.<br>
-Used for PDF rendering, annotation, and text extraction.<br><br>
+PDF rendering, annotation, and text extraction.<br><br>
 
 <b>QPDF</b> — Apache License 2.0<br>
 Copyright &copy; Jay Berkenbilt.<br>
-Used for PDF split, merge, reorder, and structural editing.<br><br>
+PDF split, merge, reorder, and structural editing.<br><br>
 
-<b>Qt 6</b> — LGPL v3<br>
-Copyright &copy; The Qt Company Ltd.<br>
-Source code available at <a href='https://code.qt.io'>code.qt.io</a><br><br>
+<b>OpenSSL</b> — Apache License 2.0<br>
+Copyright &copy; The OpenSSL Project Authors.<br>
+Digital signatures (PKCS#7) — Windows builds.<br><br>
 
-<b>Tesseract OCR</b> — Apache License 2.0<br>
+<b>zlib</b> — zlib License<br>
+Copyright &copy; Jean-loup Gailly and Mark Adler.<br>
+Lossless compression used by PDFium and QPDF.<br><br>
+
+<b>libjpeg-turbo</b> — BSD 3-Clause / IJG License<br>
+Copyright &copy; The libjpeg-turbo Project and contributors.<br>
+JPEG image decoding.<br><br>
+
+<b>Little CMS (lcms2)</b> — MIT License<br>
+Copyright &copy; Marti Maria Saguer.<br>
+ICC colour management for colour-accurate rendering.<br><br>
+
+<b>Rust preview engine (formibpdf)</b> — MIT / Apache-2.0<br>
+Built on the crates rayon, flate2, fontdue, and image, each under the MIT or Apache-2.0 license.<br>
+Low-resolution thumbnail / preview rendering.<br><br>
+
+<b>Tesseract OCR</b> — Apache License 2.0 (optional)<br>
 Copyright &copy; Google LLC and contributors.<br>
-Used for optical character recognition on scanned pages.<br><br>
+Optical character recognition — OCR-enabled builds only.<br><br>
 
 <b>Noto Sans</b> — SIL Open Font License 1.1<br>
 Copyright &copy; Google LLC.<br>
-Default UI font — free for commercial use.<br><br>
+UI font — free for commercial use.<br><br>
 
 <p style='color:#6B7280; font-size:11px;'>
 All third-party libraries are used in compliance with their respective licenses.
-TorReader PDF does not bundle proprietary fonts or non-open-source code.
+Qt is used under the LGPL v3 via dynamic linking, so the Qt libraries can be replaced
+or relinked. TorReader PDF bundles no proprietary or non-open-source code.
 </p>
 )";
 
