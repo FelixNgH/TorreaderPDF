@@ -82,6 +82,16 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 - **Dark mode**, full keyboard shortcuts (press **F1** in-app for the full list)
 - **Safe save model** — edits (insert/delete/reorder/merge) apply to an in-memory working copy first; your original file is only overwritten when you press **Ctrl+S**
 
+## How it compares
+
+An objective look at **24 PDF apps** — paid suites, open-source desktop viewers, self-hosted
+toolkits and web tools — across 11 everyday jobs. Tools are sorted A–Z within each group;
+TorReader is listed in its category, not on a pedestal.
+
+![Comparison of 24 PDF tools across 11 everyday jobs](docs/screenshots/comparison.png)
+
+<sub>● full support · ◐ partial, limited or paid-tier only · ○ not available. General positioning as of 2026 — feature sets vary by version and licence tier; verify the current release before deciding.</sub>
+
 ## FAQ
 
 **Is TorReader free?** Yes — free and open-source (MIT). No ads, no account, no watermark.
