@@ -167,7 +167,7 @@ dependencies keep their own licenses — see `THIRD_PARTY_NOTICES.md`.
 
 ## Author
 
-Built by **Loc Nguyen Huy ([@FelixNgH](https://github.com/FelixNgH))**.
+Built by **Felix Nguyen Huy ([@FelixNgH](https://github.com/FelixNgH))**.
 
 - Web: [torreader.cloud](https://torreader.cloud)
 - Also building: [BIMServer.cloud](https://bimserver.cloud) — BIM infrastructure for architecture firms
