@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/FelixNgH/TorreaderPDF)](https://github.com/FelixNgH/TorreaderPDF/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/FelixNgH/TorreaderPDF/total)](https://github.com/FelixNgH/TorreaderPDF/releases)
-[![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF?v=2)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 
 **TorReader is a lightweight, portable PDF app for Windows and Linux** — a fast
