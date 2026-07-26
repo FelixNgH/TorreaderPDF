@@ -4,34 +4,43 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QCheckBox>
+#include <QStyle>
 #include <QTimer>
 
 FindBar::FindBar(QWidget* parent)
     : QWidget(parent)
 {
     setObjectName("findBar");
-    setFixedHeight(36);
     setAutoFillBackground(true);
 
     m_input     = new QLineEdit(this);
     m_matchLabel = new QLabel("0 / 0", this);
-    m_prevBtn   = new QPushButton(QStringLiteral("\u25B2"), this); // ▲
-    m_nextBtn   = new QPushButton(QStringLiteral("\u25BC"), this); // ▼
+    m_prevBtn   = new QPushButton(this);
+    m_nextBtn   = new QPushButton(this);
     m_matchCase = new QCheckBox("Aa", this);
-    m_closeBtn  = new QPushButton(QStringLiteral("\u2715"), this); // ✕
+    m_closeBtn  = new QPushButton(this);
+
+    m_prevBtn->setIcon(style()->standardIcon(QStyle::SP_ArrowUp));
+    m_nextBtn->setIcon(style()->standardIcon(QStyle::SP_ArrowDown));
+    m_closeBtn->setIcon(style()->standardIcon(QStyle::SP_DialogCloseButton));
+    m_prevBtn->setToolTip("Previous match (Shift+Enter)");
+    m_nextBtn->setToolTip("Next match (Enter)");
+    m_closeBtn->setToolTip("Close (Esc)");
 
     m_input->setPlaceholderText("Find in document\u2026");
     m_input->setClearButtonEnabled(true);
     m_input->setFixedWidth(200);
+    m_input->setFixedHeight(24);
     m_matchLabel->setFixedWidth(60);
+    m_matchLabel->setFixedHeight(24);
     m_matchLabel->setAlignment(Qt::AlignCenter);
-    m_prevBtn->setFixedWidth(28);
-    m_nextBtn->setFixedWidth(28);
+    m_prevBtn->setFixedSize(28, 24);
+    m_nextBtn->setFixedSize(28, 24);
     m_matchCase->setToolTip("Match case");
-    m_closeBtn->setFixedWidth(28);
+    m_closeBtn->setFixedSize(28, 24);
 
     auto* lay = new QHBoxLayout(this);
-    lay->setContentsMargins(6, 2, 6, 2);
+    lay->setContentsMargins(6, 0, 6, 0);
     lay->setSpacing(4);
     lay->addWidget(m_input);
     lay->addWidget(m_matchLabel);

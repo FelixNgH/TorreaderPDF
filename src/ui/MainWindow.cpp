@@ -210,7 +210,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
           if (auto* p = qobject_cast<QWidget*>(m_findBar->parent())) {
               int bw = m_findBar->sizeHint().width();
               int x = qMax(0, p->width() - bw - 8);
-              m_findBar->move(x, 4);
+              const int tabH = m_docTabs->tabBar()->height();
+              const int bh   = m_findBar->sizeHint().height();
+              const int y    = qMax(0, (tabH - bh) / 2);
+              m_findBar->move(x, y);
               m_findBar->resize(bw, m_findBar->sizeHint().height());
           }
           m_findBar->showAndFocus();
@@ -2412,7 +2415,10 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         auto* p = qobject_cast<QWidget*>(m_findBar->parent());
         if (p) {
             int bw = m_findBar->sizeHint().width();
-            m_findBar->move(qMax(0, p->width() - bw - 8), 4);
+            const int tabH = m_docTabs->tabBar()->height();
+            const int bh   = m_findBar->sizeHint().height();
+            const int y    = qMax(0, (tabH - bh) / 2);
+            m_findBar->move(qMax(0, p->width() - bw - 8), y);
         }
     }
     return QMainWindow::eventFilter(watched, event);
