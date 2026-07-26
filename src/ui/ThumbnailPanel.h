@@ -30,16 +30,22 @@ public:
                      ThumbnailRenderPool* pool = nullptr,
                      bool forceRebuild = false);
     void setComments(const QList<AnnotInfo>& comments);
+    void setCommentsLoading(bool loading);
+    void setCommentsProgress(int scanned, int total);
     void setAnnotMgr(AnnotationManager* mgr, int pageCount);
     void setCurrentPage(int pageIndex);
+    void setActiveToolButton(int id);
+    bool isCommentsTabVisible() const { return m_stack && m_stack->currentIndex() == 2; }
     QImage thumbnailForPage(int pageIndex) const;
     void clearThumbnails();
     void setDarkMode(bool dark);
+    void selectCommentFor(int pageIndex, int annotIndex);
 
-    // Search (panel is hidden; kept for future version)
+    // Search
     void addSearchResult(const SearchResult& result);
     void clearSearchResults();
     void activateSearch();
+    void setSearchProgress(int pagesScanned, int totalPages);
 
 signals:
     void pageClicked(int pageIndex);
@@ -47,11 +53,12 @@ signals:
     void extractPagesRequested(QList<int> pageIndices);
     void searchRequested(const QString& query);
     void searchResultSelected(int pageIndex, QRectF boundingBox);
+    void searchCleared();
     void pagesReordered(QList<int> newOrder);
     void bookmarksReordered(QList<int> newOrder);
     void annotToolSelected(int toolId);
-    void commentActivated(int pageIndex);
-    void annotStyleChanged(QColor color, double width, bool fill);
+    void commentActivated(int pageIndex, int annotIndex);
+    void annotStyleChanged(QColor color, double width, bool fill, int fillOpacityPct);
     void requestComments();
 
 private slots:
@@ -91,6 +98,8 @@ private:
     QColor       m_annColor = Qt::red;
     double       m_annWidth = 2.0;
     bool         m_annFill  = false;
+    int          m_annFillOpacity = 50;
     QPushButton* m_colorBtn = nullptr;
+    QHash<int, QPushButton*> m_toolButtons;
     QHash<int, QImage> m_pendingThumbs;
 };

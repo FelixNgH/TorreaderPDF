@@ -128,7 +128,8 @@ public:
     RegionRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc,
                      int pageIndex, double scale, QRect regionPx,
                      QObject* receiver,
-                     std::shared_ptr<QAtomicInt> genRef);
+                     std::shared_ptr<QAtomicInt> genRef,
+                     bool renderAnnotations = true);
     void run() override;
 signals:
     void finished(int pageIndex, double scale, QRect regionPx, QImage img);
@@ -140,6 +141,7 @@ private:
     QRect                       m_regionPx;
     std::shared_ptr<QAtomicInt> m_genRef;
     int                         m_reqGen = 0;
+    bool                        m_renderAnnotations = true;
 };
 
 class TileBatchRenderTask : public QObject, public QRunnable {
@@ -149,7 +151,8 @@ public:
                         int pageIndex, double scale,
                         QVector<QPoint> tiles,
                         QObject* receiver,
-                        std::shared_ptr<QAtomicInt> genRef);
+                        std::shared_ptr<QAtomicInt> genRef,
+                        bool renderAnnotations = true);
     void run() override;
 signals:
     void tileDone(int page, double scale, int col, int row, QImage img);
@@ -162,6 +165,7 @@ private:
     QVector<QPoint>             m_tiles;
     std::shared_ptr<QAtomicInt> m_genRef;
     int                         m_reqGen = 0;
+    bool                        m_renderAnnotations = true;
 };
 
 struct TileKey {
@@ -208,6 +212,7 @@ public:
     static std::atomic<int> s_renderCount;
     FPDF_PAGE acquirePage(int pageIndex);
     void setPageObjectCount(int pageIndex, int count) { m_pageObjectCount[pageIndex] = count; }
+    void setPageAnnotRender(int page, bool on) { m_pageAnnotRender[page] = on; }
 
     // ponytail: only 1 full-quality render at a time; newest-wins
 
@@ -277,4 +282,5 @@ private:
     std::shared_ptr<QAtomicInt> m_continuousGen;
     std::atomic<int>            m_continuousRunning{0};
     static constexpr int        kMaxContinuousRenders = 2;
+    QHash<int, bool>            m_pageAnnotRender;
 };

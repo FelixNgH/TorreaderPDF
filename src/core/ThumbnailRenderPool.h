@@ -42,8 +42,8 @@ private:
 class ThumbnailRenderPool : public QObject {
     Q_OBJECT
 public:
-    static constexpr int    kDocs       = 1;  // was 4→2; single-doc because all renders serialize through s_pdfiumMutex anyway
     static constexpr double kThumbScale = 0.15;
+    static constexpr int kDocs = 1;
 
     explicit ThumbnailRenderPool(QObject* parent = nullptr);
     ~ThumbnailRenderPool() override;
@@ -53,7 +53,6 @@ public:
     bool isOpen()    const { return m_open; }
     int  pageCount() const { return m_pageCount; }
 
-    // priority: 0=visible, 1=adjacent, 2=background
     void requestThumbnail(int pageIndex, int priority = 2);
     void prefetchRange(int first, int last);
     const std::vector<ThumbnailWorker*>& workers() const { return m_workers; }

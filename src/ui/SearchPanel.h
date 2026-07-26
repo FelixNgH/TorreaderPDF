@@ -18,10 +18,13 @@ public:
 public slots:
     void addResult(const SearchResult& result);
     void clearResults();
+    void setSearchProgress(int pagesScanned, int totalPages);
 
 signals:
     void searchRequested(const QString& query);
     void resultSelected(int pageIndex, QRectF boundingBox);
+    void searchCleared();
+
 
 private:
     QLineEdit*   m_input      = nullptr;

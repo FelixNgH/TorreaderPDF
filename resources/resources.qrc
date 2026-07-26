@@ -1,6 +1,6 @@
-<RCC>
-    <qresource prefix="/icons">
-        <file>Logo_rectangle.png</file>
-        <file>TorReader.ico</file>
-    </qresource>
+<!DOCTYPE RCC>
+<RCC version="1.0">
+<qresource prefix="/">
+    <file>icons/TorReader.ico</file>
+</qresource>
 </RCC>

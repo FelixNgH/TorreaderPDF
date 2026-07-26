@@ -4,6 +4,7 @@
 #include "PdfGpuView.h"
 #include "ThumbnailPanel.h"
 #include "ContinuousView.h"
+#include "FindBar.h"
 #include "MergeDialog.h"
 #include "SignDialog.h"
 #include "AboutDialog.h"
@@ -47,6 +48,7 @@ extern QMutex s_pdfiumMutex;
 #include <QCloseEvent>
 #include <QTimer>
 #include <QIcon>
+#include <QElapsedTimer>
 #include <QPixmap>
 #include <QColorDialog>
 #include <QInputDialog>
@@ -196,14 +198,73 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     menuBar()->hide();
     setupActionBar();
-    new QShortcut(QKeySequence::Undo, this, [this]{ doUndo(); });
-    new QShortcut(QKeySequence::Redo, this, [this]{ doRedo(); });
-    new QShortcut(QKeySequence(Qt::Key_Escape), this, [this]{
-        if (auto* t = currentTab()) if (t->view) t->view->setTool(PdfGpuView::ViewTool::Pan);
-        m_selPage = -1; m_selIdx = -1;
-    });
     new QShortcut(QKeySequence(Qt::Key_Delete), this, [this]{
         if (m_selPage >= 0 && m_selIdx >= 0) deleteSelectedAnnot(m_selPage, m_selIdx);
+    });
+    // ── Find bar shortcuts (application-level, don't let widgets eat them) ──
+    { auto* a = new QAction(this); a->setShortcutContext(Qt::ApplicationShortcut);
+      a->setShortcut(QKeySequence("Ctrl+F"));
+      connect(a, &QAction::triggered, this, [this]{
+          if (!m_findBar) return;
+          // Position bar at top-right of the right panel
+          if (auto* p = qobject_cast<QWidget*>(m_findBar->parent())) {
+              int bw = m_findBar->sizeHint().width();
+              int x = qMax(0, p->width() - bw - 8);
+              m_findBar->move(x, 4);
+              m_findBar->resize(bw, m_findBar->sizeHint().height());
+          }
+          m_findBar->showAndFocus();
+      }); addAction(a); }
+    { auto* escAction = new QAction(this); escAction->setShortcutContext(Qt::ApplicationShortcut);
+      escAction->setShortcut(QKeySequence(Qt::Key_Escape));
+      connect(escAction, &QAction::triggered, this, [this]{
+          if (m_findBar && m_findBar->isVisible()) {
+              m_findBar->closeBar();
+              return;
+          }
+          if (auto* t = currentTab()) if (t->view) t->view->setTool(PdfGpuView::ViewTool::Pan);
+          if (m_thumbPanel) m_thumbPanel->setActiveToolButton(0);
+          m_selPage = -1; m_selIdx = -1;
+      }); addAction(escAction); }
+    { auto* a = new QAction(this); a->setShortcutContext(Qt::ApplicationShortcut);
+      a->setShortcut(QKeySequence(Qt::Key_F3));
+      connect(a, &QAction::triggered, this, [this]{
+          if (m_findBar && m_findBar->isVisible()) {
+              // Simulate Enter for next match
+              QMetaObject::invokeMethod(m_findBar, "onNext", Qt::QueuedConnection);
+          } else if (m_findBar) {
+              // Reopen and search with last query
+              m_findBar->showAndFocus();
+              QMetaObject::invokeMethod(m_findBar, "onReturnPressed", Qt::QueuedConnection);
+          }
+      }); addAction(a); }
+    { auto* a = new QAction(this); a->setShortcutContext(Qt::ApplicationShortcut);
+      a->setShortcuts({QKeySequence("Shift+F3"), QKeySequence("Ctrl+Shift+F3")});
+      connect(a, &QAction::triggered, this, [this]{
+          if (m_findBar && m_findBar->isVisible())
+              QMetaObject::invokeMethod(m_findBar, "onPrev", Qt::QueuedConnection);
+      }); addAction(a); }
+
+    new QShortcut(QKeySequence(Qt::Key_PageDown), this, [this]{
+        if (auto* t = currentTab()) {
+            int n = qMin(t->currentPage + 1, t->doc->pageCount() - 1);
+            if (n != t->currentPage) onPageChanged(n);
+        }
+    });
+    new QShortcut(QKeySequence(Qt::Key_PageUp), this, [this]{
+        if (auto* t = currentTab()) {
+            int n = qMax(t->currentPage - 1, 0);
+            if (n != t->currentPage) onPageChanged(n);
+        }
+    });
+    new QShortcut(QKeySequence(Qt::Key_Home), this, [this]{
+        if (auto* t = currentTab()) if (t->currentPage != 0) onPageChanged(0);
+    });
+    new QShortcut(QKeySequence(Qt::Key_End), this, [this]{
+        if (auto* t = currentTab()) {
+            int last = t->doc->pageCount() - 1;
+            if (t->currentPage != last) onPageChanged(last);
+        }
     });
 
     m_splitter = new QSplitter(Qt::Horizontal, this);
@@ -235,6 +296,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_splitter->setStretchFactor(1, 1);
     setCentralWidget(m_splitter);
 
+    // ── Find bar (floating over right panel) ─────────────────────────
+    m_findBar = new FindBar(rightPanel);
+    m_findBar->hide();
+    // Reposition FindBar on parent resize
+    rightPanel->installEventFilter(this);
+
     connect(m_docTabs, &QTabWidget::currentChanged,    this, &MainWindow::onTabChanged);
     connect(m_docTabs, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabClose);
     connect(m_thumbPanel, &ThumbnailPanel::requestComments, this, &MainWindow::onCommentsRequested);
@@ -245,33 +312,109 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_thumbPanel, &ThumbnailPanel::annotToolSelected, this, [this](int id){
         if (auto* t = currentTab()) if (t->view) t->view->setTool(static_cast<PdfGpuView::ViewTool>(id));
     });
-    connect(m_thumbPanel, &ThumbnailPanel::commentActivated, this, &MainWindow::onPageChanged);
+    connect(m_thumbPanel, &ThumbnailPanel::commentActivated, this, &MainWindow::onCommentActivated);
     connect(m_thumbPanel, &ThumbnailPanel::annotStyleChanged, this,
-            [this](QColor color, double width, bool fill){
+            [this](QColor color, double width, bool fill, int fillOpacityPct){
         m_annotStyle.strokeColor = color;
         m_annotStyle.strokeWidth = static_cast<float>(width);
         m_annotStyle.opacity     = 1.0f;
-        m_annotStyle.fillColor   = fill ? color : QColor(Qt::transparent);
+        QColor fc = color;
+        fc.setAlpha(qBound(0, qRound(255.0 * fillOpacityPct / 100.0), 255));
+        m_annotStyle.fillColor = fill ? fc : QColor(Qt::transparent);
     });
 
-    // Text search
+    // Text search — shared state between FindBar and SearchPanel
     connect(m_thumbPanel, &ThumbnailPanel::searchRequested,
             this, [this](const QString& query) {
         auto* t = currentTab();
         if (!t || !t->doc->isOpen() || query.trimmed().isEmpty()) return;
+        m_searchResults.clear();
+        m_searchCurrentIdx = -1;
         m_thumbPanel->clearSearchResults();
         m_textSearch->cancel();
         m_textSearch->search(t->doc.get(), query, Qt::CaseInsensitive);
     });
+    // Found results go to both SearchPanel and FindBar's result tracking
     connect(m_textSearch, &TextSearch::found,
             m_thumbPanel, &ThumbnailPanel::addSearchResult);
+    connect(m_textSearch, &TextSearch::progress,
+            m_thumbPanel, &ThumbnailPanel::setSearchProgress);
     connect(m_thumbPanel, &ThumbnailPanel::searchResultSelected,
             this, [this](int page, QRectF rect) {
+        m_textSearch->cancel();
+        m_searchCurrentIdx = -1;
         onPageChanged(page);
         if (m_continuousMode && m_continuousView)
             m_continuousView->scrollToPage(page);
-        if (auto* t = currentTab())
-            if (t->view) t->view->setHighlights({rect});
+        applySearchHighlights(m_searchResults, -1);
+        if (m_findBar) m_findBar->setCurrentMatch(-1);
+    });
+
+    // FindBar connections
+    connect(m_findBar, &FindBar::searchRequested,
+            this, [this](const QString& query, Qt::CaseSensitivity cs) {
+        auto* t = currentTab();
+        if (!t || !t->doc->isOpen() || query.trimmed().isEmpty()) return;
+        m_searchResults.clear();
+        m_searchCurrentIdx = -1;
+        if (m_thumbPanel) m_thumbPanel->clearSearchResults();
+        m_textSearch->cancel();
+        m_textSearch->search(t->doc.get(), query, cs);
+    });
+    connect(m_textSearch, &TextSearch::found,
+            this, [this](const SearchResult& r) {
+        m_searchResults.append(r);
+        if (m_findBar) m_findBar->onFound();
+    });
+    connect(m_textSearch, &TextSearch::searchComplete,
+            this, [this](int total) {
+        m_searchCurrentIdx = total > 0 ? 0 : -1;
+        if (m_findBar) {
+            m_findBar->onSearchComplete(total);
+            if (total > 0) m_findBar->setCurrentMatch(0);
+        }
+        if (total > 0)
+            applySearchHighlights(m_searchResults, 0);
+    });
+    connect(m_findBar, &FindBar::navigateNext,
+            this, [this]() {
+        if (m_searchResults.isEmpty()) return;
+        m_textSearch->cancel();
+        int prevIdx = m_searchCurrentIdx;
+        m_searchCurrentIdx = (m_searchCurrentIdx + 1) % m_searchResults.size();
+        if (prevIdx > m_searchCurrentIdx)
+            statusBar()->showMessage("Reached end of document, continued from top", 3000);
+        const auto& r = m_searchResults[m_searchCurrentIdx];
+        onPageChanged(r.pageIndex);
+        if (m_continuousMode && m_continuousView)
+            m_continuousView->scrollToPage(r.pageIndex);
+        applySearchHighlights(m_searchResults, m_searchCurrentIdx);
+        if (m_findBar) m_findBar->setCurrentMatch(m_searchCurrentIdx);
+    });
+    connect(m_findBar, &FindBar::navigatePrev,
+            this, [this]() {
+        if (m_searchResults.isEmpty()) return;
+        m_textSearch->cancel();
+        int prevIdx = m_searchCurrentIdx;
+        m_searchCurrentIdx = (m_searchCurrentIdx - 1 + m_searchResults.size()) % m_searchResults.size();
+        if (prevIdx < m_searchCurrentIdx)
+            statusBar()->showMessage("Reached beginning of document, continued from end", 3000);
+        const auto& r = m_searchResults[m_searchCurrentIdx];
+        onPageChanged(r.pageIndex);
+        if (m_continuousMode && m_continuousView)
+            m_continuousView->scrollToPage(r.pageIndex);
+        applySearchHighlights(m_searchResults, m_searchCurrentIdx);
+        if (m_findBar) m_findBar->setCurrentMatch(m_searchCurrentIdx);
+    });
+    connect(m_findBar, &FindBar::clearSearchHighlights,
+            this, &MainWindow::clearAllSearchHighlights);
+    connect(m_thumbPanel, &ThumbnailPanel::searchCleared, this, [this] {
+        m_textSearch->cancel();
+        m_searchResults.clear();
+        m_searchCurrentIdx = -1;
+        clearAllSearchHighlights();
+        if (m_findBar) m_findBar->reset();
+        qDebug() << "[find] search cleared";
     });
 
     // Continuous view page/zoom sync
@@ -282,6 +425,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             m_thumbPanel->setCurrentPage(page);
             statusBar()->showMessage(
                 QString("Page %1 / %2").arg(page + 1).arg(t->doc->pageCount()), 2000);
+            refreshAnnotVisuals(t, page);
         }
     });
     connect(m_continuousView, &ContinuousView::zoomChanged,
@@ -523,6 +667,9 @@ void MainWindow::setupActionBar() {
                          << renderScale << "(tabZoom=" << t->zoom << ")";
                 m_continuousView->setZoom(renderScale);
                 m_continuousView->setDocument(t->doc.get(), t->renderer.get());
+                // Push annot visuals for current page to continuous view
+                if (t->annotMgr)
+                refreshAnnotVisuals(t, t->currentPage);
             }
         } else {
             m_docTabs->setMinimumHeight(0);
@@ -723,7 +870,13 @@ void MainWindow::onSaveFile() {
     const QString prevFile = t->doc->filePath();
     const QString tmp      = makeTmpPath(original);
 
-    // 1. Flush the in-memory document (page edits + annotations) to a temp file
+    // 1. Materialize deferred page content before saving
+    //    (annotations in /Annots are preserved by FPDF_SaveAsCopy only after GenerateContent).
+    for (int pg : t->pagesNeedGenerate)
+        t->annotMgr->generateContentForPage(pg);
+    t->pagesNeedGenerate.clear();
+
+    // 2. Flush the in-memory document (page edits + annotations) to a temp file
     //    (the document is still open, so FPDF_SaveAsCopy can read it).
     if (t->annotMgr) {
         t->annotMgr->setDocument(t->doc->raw(), tmp);
@@ -772,6 +925,10 @@ void MainWindow::onSaveAsFile() {
     const QString tmp         = makeTmpPath(dest);
 
     if (t->annotMgr) {
+        // Materialize deferred page content before saving
+        for (int pg : t->pagesNeedGenerate)
+            t->annotMgr->generateContentForPage(pg);
+        t->pagesNeedGenerate.clear();
         t->annotMgr->setDocument(t->doc->raw(), tmp);
         if (!t->annotMgr->saveDocument()) {
             QMessageBox::warning(this, "Save As", "Could not write to:\n" + dest);
@@ -797,107 +954,153 @@ void MainWindow::onSaveAsFile() {
     statusBar()->showMessage("Saved as: " + QFileInfo(dest).fileName(), 4000);
 }
 
+const QList<AnnotInfo>& MainWindow::annotsForPage(DocTab* t, int page) {
+    if (t->annotPageCache.contains(page)) {
+        qDebug().noquote() << "[perf] annotsForPage page=" << page
+                 << "cache=HIT count=" << t->annotPageCache[page].size();
+        return t->annotPageCache[page];
+    }
+    QElapsedTimer _perf;
+    _perf.start();
+    auto list = t->annotMgr ? t->annotMgr->loadPage(page) : QList<AnnotInfo>();
+    qint64 ms = _perf.elapsed();
+    t->annotPageCache[page] = list;
+    qDebug().noquote() << "[perf] annotsForPage page=" << page
+             << "cache=MISS count=" << list.size() << "ms=" << ms;
+    return t->annotPageCache[page];
+}
+
+void MainWindow::invalidateAnnotPage(DocTab* t, int page) {
+    t->annotPageCache.remove(page);
+}
+
+bool MainWindow::canFastPath(DocTab* t, int page) const {
+    return t->overlayCapablePage.value(page, false);
+}
+
+void MainWindow::refreshAnnotVisuals(DocTab* t, int page) {
+    if (!t || !t->annotMgr || !t->doc || !t->doc->isOpen()) {
+        if (t && t->view) t->view->clearAnnotVisuals();
+        return;
+    }
+    bool overlayCapable = false;
+    QList<AnnotVisual> visuals = t->annotMgr->loadPageVisuals(page, &overlayCapable);
+    t->overlayCapablePage[page] = overlayCapable;
+    if (!overlayCapable)
+        t->pagesNeedGenerate.insert(page);  // fallback path relies on renderer having annots
+    t->renderer->setPageAnnotRender(page, !overlayCapable);
+    if (overlayCapable) {
+        if (t->view) t->view->setAnnotVisuals(visuals);
+        if (m_continuousMode && m_continuousView)
+            m_continuousView->setAnnotVisualsForPage(page, visuals);
+    } else {
+        if (t->view) t->view->clearAnnotVisuals();
+        if (m_continuousMode && m_continuousView)
+            m_continuousView->setAnnotVisualsForPage(page, {});
+    }
+}
+
+void MainWindow::refreshCommentsForPage(DocTab* t, int page) {
+    if (!t) return;
+    invalidateAnnotPage(t, page);
+    if (!t->annotCacheValid) {
+        qDebug().noquote() << "[comments] cache build requested (was invalid)";
+        if (t == currentTab() && m_thumbPanel && m_thumbPanel->isCommentsTabVisible())
+            onCommentsRequested();
+        return;
+    }
+    QElapsedTimer _perf;
+    _perf.start();
+    const QList<AnnotInfo>& fresh = annotsForPage(t, page);
+    for (int i = t->annotCache.size() - 1; i >= 0; --i) {
+        if (t->annotCache[i].pageIndex == page)
+            t->annotCache.removeAt(i);
+    }
+    int insertPos = 0;
+    for (int i = 0; i < t->annotCache.size(); ++i) {
+        if (t->annotCache[i].pageIndex >= page) {
+            insertPos = i;
+            break;
+        }
+        insertPos = i + 1;
+    }
+    for (const auto& info : fresh)
+        t->annotCache.insert(insertPos++, info);
+    qint64 ms = _perf.elapsed();
+    qDebug().noquote() << "[perf] comments incremental page=" << page
+             << "entries=" << fresh.size() << "ms=" << ms;
+    if (t == currentTab() && m_thumbPanel && m_thumbPanel->isCommentsTabVisible())
+        m_thumbPanel->setComments(t->annotCache);
+}
+
 void MainWindow::deleteSelectedAnnot(int page, int index) {
     auto* t = currentTab();
     if (!t || !t->annotMgr || index < 0) return;
-    AnnotSnapshot snap = t->annotMgr->snapshotAnnot(page, index);
-    if (!t->annotMgr->removeAnnot(page, index)) return;
-    DrawAction da; da.kind = DrawAction::Delete; da.page = page; da.snap = snap;
-    m_undoStack.append(da); m_redoStack.clear();
+    const auto& list = annotsForPage(t, page);
+    if (index >= list.size()) return;
+    const QString annotType = list[index].type;
+    const QString annotUid  = list[index].uid;
+    int realIdx = index;
+    if (!annotUid.isEmpty()) {
+        int r = t->annotMgr->findAnnotIndexByUid(page, annotUid);
+        if (r >= 0) realIdx = r;
+    }
+    if (!t->annotMgr->removeAnnot(page, realIdx)) return;
+    invalidateAnnotPage(t, page);
     t->dirty = true; updateTabDirty(t);
     if (t->view) t->view->clearSelectedAnnot();
     m_selPage = -1; m_selIdx = -1;
-    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
-    t->annotCacheValid = false;
+    refreshAnnotVisuals(t, page);
+    t->pagesNeedGenerate.insert(page);
+    bool isPageObjectAnnot = (annotType == QLatin1String("FreeText") ||
+                              annotType == QLatin1String("Note"));
+    if (canFastPath(t, page) && !isPageObjectAnnot) {
+        if (t->view) t->view->update();
+    } else {
+        if (t->renderer) { t->renderer->invalidatePage(page); t->renderer->requestPage(page, t->zoom); }
+        if (t->view) t->view->invalidateTiles();
+        if (t->view) t->view->invalidateSharp();
+    }
+    refreshCommentsForPage(t, page);
 }
 
 void MainWindow::editSelectedAnnot(int page, int index) {
     auto* t = currentTab();
     if (!t || !t->annotMgr || index < 0) return;
-    auto list = t->annotMgr->loadPage(page);
+    const auto& list = annotsForPage(t, page);
     if (index >= list.size()) return;
-    NoteInputDialog dlg(list[index].text, this, /*singleLine=*/(list[index].type == QLatin1String("FreeText")));
+    const QString annotText = list[index].text;
+    const QString annotType = list[index].type;
+    const QString annotUid  = list[index].uid;
+    int realIdx = index;
+    if (!annotUid.isEmpty()) {
+        int r = t->annotMgr->findAnnotIndexByUid(page, annotUid);
+        if (r >= 0) realIdx = r;
+    }
+    NoteInputDialog dlg(annotText, this, /*singleLine=*/(annotType == QLatin1String("FreeText")));
     dlg.setWindowTitle("Edit text");
     if (dlg.exec() != QDialog::Accepted) return;
     QString newText = dlg.text();
-    AnnotSnapshot s = t->annotMgr->snapshotAnnot(page, index);
+    AnnotSnapshot s = t->annotMgr->snapshotAnnot(page, realIdx);
     if (!s.valid) return;
     s.contents = newText;
     if (s.subtype == FPDF_ANNOT_FREETEXT) {
         double w = qMax(24.0, static_cast<double>(newText.length()) * 5.5 + 6.0);
         s.rr = s.rl + static_cast<float>(w);
     }
-    if (!t->annotMgr->removeAnnot(page, index)) return;
+    if (!t->annotMgr->removeAnnot(page, realIdx)) return;
     t->annotMgr->addSnapshot(page, s);
+    invalidateAnnotPage(t, page);
     t->dirty = true; updateTabDirty(t);
     if (t->view) t->view->clearSelectedAnnot();
     m_selPage = -1; m_selIdx = -1;
-    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
-    t->annotCacheValid = false;
-}
-
-void MainWindow::doUndo() {
-    if (m_undoStack.isEmpty()) return;
-    auto* t = currentTab();
-    if (!t || !t->annotMgr) return;
-    DrawAction da = m_undoStack.takeLast();
-    bool ok = false;
-    if (da.kind == DrawAction::Add) {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        ok = (cnt > 0) && t->annotMgr->removeAnnot(da.page, cnt - 1);
-    } else if (da.kind == DrawAction::Move) {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
-        ok = t->annotMgr->addSnapshot(da.page, da.snap);
-    } else if (da.kind == DrawAction::NoteMove) {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        if (cnt > 0) ok = t->annotMgr->moveNote(da.page, cnt - 1, -da.a.x(), -da.a.y());
-    } else {
-        ok = t->annotMgr->addSnapshot(da.page, da.snap);
-    }
-    if (!ok) return;
-    m_redoStack.append(da);
-    t->dirty = true; updateTabDirty(t);
-    if (t->view) t->view->clearSelectedAnnot();
-    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); }
-    if (t->currentPage != da.page) { t->currentPage = da.page; m_thumbPanel->setCurrentPage(da.page); }
-    if (t->view) { t->view->setPendingPage(t->currentPage, t->doc->pageSize(t->currentPage)); t->view->beginLoading(); }
-    if (t->renderer) t->renderer->requestPage(da.page, t->zoom);
-    t->annotCacheValid = false;
-}
-
-void MainWindow::doRedo() {
-    if (m_redoStack.isEmpty()) return;
-    auto* t = currentTab();
-    if (!t || !t->annotMgr || !t->annotLayer) return;
-    DrawAction da = m_redoStack.takeLast();
-    if (da.kind == DrawAction::Add) {
-        if (da.isNote)
-            t->annotMgr->createPopupNote(da.page, da.a, da.text, da.author);
-        else if (da.isText)
-            t->annotMgr->createInlineNote(da.page,
-                (da.b.isNull() ? QRectF(da.a.x(), da.a.y(), 160, 20) : QRectF(da.a, da.b)),
-                da.text, da.author, da.textBg, da.style.strokeColor, da.style.fontSize);
-        else
-            t->annotLayer->commitAnnotation(da.page, da.tool, da.style, da.a, da.b, {});
-    } else if (da.kind == DrawAction::Move) {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
-        t->annotMgr->addSnapshot(da.page, da.snapAfter);
-    } else if (da.kind == DrawAction::NoteMove) {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        if (cnt > 0) t->annotMgr->moveNote(da.page, cnt - 1, da.a.x(), da.a.y());
-    } else {
-        int cnt = t->annotMgr->loadPage(da.page).size();
-        if (cnt > 0) t->annotMgr->removeAnnot(da.page, cnt - 1);
-    }
-    m_undoStack.append(da);
-    t->dirty = true; updateTabDirty(t);
-    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); }
-    if (t->currentPage != da.page) { t->currentPage = da.page; m_thumbPanel->setCurrentPage(da.page); }
-    if (t->view) { t->view->setPendingPage(t->currentPage, t->doc->pageSize(t->currentPage)); t->view->beginLoading(); }
-    if (t->renderer) t->renderer->requestPage(da.page, t->zoom);
-    t->annotCacheValid = false;
+    refreshAnnotVisuals(t, page);
+    t->pagesNeedGenerate.insert(page);
+    // editSelectedAnnot is always FreeText path → keep slow (page objects)
+    if (t->renderer) { t->renderer->invalidatePage(page); t->renderer->requestPage(page, t->zoom); }
+    refreshCommentsForPage(t, page);
+    if (t->view) t->view->invalidateTiles();
+    if (t->view) t->view->invalidateSharp();
 }
 
 void MainWindow::onMergeFiles() {
@@ -934,7 +1137,10 @@ void MainWindow::onSignPdf() {
             if (m_finalizeSigAct) m_finalizeSigAct->setVisible(true);
             if (m_cancelSigAct)   m_cancelSigAct->setVisible(true);
             statusBar()->showMessage("Move the signature to position, then click 'Finalize Signature'");
-            if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(page, t->zoom); }
+            refreshAnnotVisuals(t, page);
+            t->pagesNeedGenerate.insert(page);
+            if (t->renderer) { t->renderer->invalidatePage(page); t->renderer->requestPage(page, t->zoom); }
+            if (t->view) t->view->invalidateTiles();
         });
     t->view->beginSignaturePick();
 }
@@ -984,6 +1190,8 @@ void MainWindow::onFinalizeSignature() {
     QRectF rect = t->annotMgr->findSignatureDraftRect(m_pendPage, &idx);
     if (idx < 0) { QMessageBox::warning(this, "Sign", "Signature draft not found."); return; }
     t->annotMgr->removeAnnot(m_pendPage, idx);
+    t->pagesNeedGenerate.insert(m_pendPage);
+    refreshAnnotVisuals(t, m_pendPage);
     SignParams sp = m_pendSp;
     sp.pageIndex = m_pendPage;
     sp.rectPt = rect;
@@ -991,7 +1199,8 @@ void MainWindow::onFinalizeSignature() {
     if (m_finalizeSigAct) m_finalizeSigAct->setVisible(false);
     if (m_cancelSigAct)   m_cancelSigAct->setVisible(false);
     statusBar()->clearMessage();
-    if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(t->currentPage, t->zoom); }
+    if (t->renderer) { t->renderer->invalidatePage(t->currentPage); t->renderer->requestPage(t->currentPage, t->zoom); }
+    if (t->view) t->view->invalidateTiles();
     performSign(t, sp);
 }
 
@@ -1000,8 +1209,13 @@ void MainWindow::onCancelSignature() {
     if (t && m_pendActive) {
         int idx = -1;
         t->annotMgr->findSignatureDraftRect(m_pendPage, &idx);
-        if (idx >= 0) t->annotMgr->removeAnnot(m_pendPage, idx);
-        if (t->renderer) { t->renderer->setTileCache(nullptr); t->renderer->clearCache(); t->renderer->requestPage(t->currentPage, t->zoom); }
+        if (idx >= 0) {
+            t->annotMgr->removeAnnot(m_pendPage, idx);
+            t->pagesNeedGenerate.insert(m_pendPage);
+        }
+        refreshAnnotVisuals(t, m_pendPage);
+        if (t->renderer) { t->renderer->invalidatePage(m_pendPage); t->renderer->requestPage(t->currentPage, t->zoom); }
+        if (t->view) t->view->invalidateTiles();
     }
     m_pendActive = false; m_pendPage = -1;
     if (m_finalizeSigAct) m_finalizeSigAct->setVisible(false);
@@ -1115,6 +1329,11 @@ void MainWindow::syncSidebarToTab(int docIdx, bool forceRebuild) {
         m_thumbPanel->setAnnotMgr(t->annotMgr.get(), t->doc->pageCount());
         if (t->annotCacheValid)
             m_thumbPanel->setComments(t->annotCache);
+        else {
+            m_thumbPanel->setComments({});
+            if (m_thumbPanel->isCommentsTabVisible())
+                onCommentsRequested();
+        }
     }
 }
 
@@ -1139,6 +1358,9 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path) {
 
     t->doc->open(path);
     t->annotCacheValid = false;
+    t->annotPageCache.clear();
+    t->overlayCapablePage.clear();
+    t->pagesNeedGenerate.clear();
     t->renderer->setDocument(t->doc.get());
     t->annotMgr->setDocument(t->doc->raw(), path);
     if (t->annotLayer) {
@@ -1157,11 +1379,14 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path) {
             t->renderer->setTileCache(t->tileCache);
     }
 
+    refreshAnnotVisuals(t, t->currentPage);
     t->renderer->requestPage(t->currentPage, t->zoom);
     if (t == currentTab()) {
         // File vừa được mở lại (edit/save) trên cùng con trỏ doc → ép sidebar
         // dựng lại thumbnail + bookmark, nếu không panel giữ nội dung cũ.
         syncSidebarToTab(m_openDocs.indexOf(t), /*forceRebuild=*/true);
+        if (m_thumbPanel && m_thumbPanel->isCommentsTabVisible())
+            onCommentsRequested();
         if (m_continuousMode && m_continuousView) {
             auto pgSz = t->doc->pageSize(t->currentPage);
             double renderScale = PdfRenderer::kFullRenderMaxPx
@@ -1255,12 +1480,12 @@ void MainWindow::openFile(const QString& path) {
     });
 
     // ── Tile wiring ───────────────────────────────────────────────────────────
-    connect(tab->renderer.get(), &PdfRenderer::tileReady,
-            tab->view, [tab](int page, double scale, int col, int row, QImage img) {
-        if (tab->view) tab->view->setTile(page, scale, col, row, img);
-    });
     connect(tab->view, &PdfGpuView::tilesNeeded,
-            tab->renderer.get(), &PdfRenderer::requestTiles);
+            tab->renderer.get(), &PdfRenderer::requestRegion);
+    connect(tab->renderer.get(), &PdfRenderer::regionReady,
+            tab->view, [tab](int page, double scale, QRect regionPx, QImage img) {
+        if (tab->view) tab->view->setRegion(page, scale, regionPx, img);
+    });
 
     // ── Annotation signals ────────────────────────────────────────────────────
     connect(tab->view, &PdfGpuView::shapeCommitRequested,
@@ -1271,9 +1496,11 @@ void MainWindow::openFile(const QString& path) {
                  << "start=(" << start.x() << "," << start.y() << ")"
                  << "end=(" << end.x() << "," << end.y() << ")";
         AnnotStyle style = m_annotStyle;
+        QElapsedTimer _perfC;
+        _perfC.start();
         tab->annotLayer->commitAnnotation(pageIdx, tool, style, start, end, {});
-        {   int _n = tab->annotMgr ? tab->annotMgr->loadPage(pageIdx).size() : -1;
-            qDebug().noquote() << "[markup] committed page=" << pageIdx << "annotCountAfter=" << _n; }
+        qDebug().noquote() << "[perf] markup commit ms=" << _perfC.elapsed();
+        refreshAnnotVisuals(tab, pageIdx);
         { static const bool dump = qEnvironmentVariableIsSet("TORREADER_DUMP");
           if (dump) {
               QMutexLocker lock(&s_pdfiumMutex);
@@ -1289,18 +1516,56 @@ void MainWindow::openFile(const QString& path) {
               if (fpage) FPDF_ClosePage(fpage);
               qDebug().noquote() << "[dump] saved markup_debug.pdf ok=" << (saveOk ? "true" : "false") << "annots=" << annotCount;
           } }
-        { DrawAction da; da.page = pageIdx; da.isText = false;
-          da.tool = tool; da.style = style; da.a = start; da.b = end;
-          m_undoStack.append(da); m_redoStack.clear(); }
-        qDebug().noquote() << "[markup] request re-render page=" << pageIdx << "zoom=" << tab->zoom;
-        if (tab->renderer) {
-            tab->renderer->setTileCache(nullptr);
-            tab->annotCacheValid = false;
-            tab->renderer->clearCache();
-            tab->renderer->requestPage(pageIdx, tab->zoom);
-        }
         tab->dirty = true;
         updateTabDirty(tab);
+        invalidateAnnotPage(tab, pageIdx);
+        tab->pagesNeedGenerate.insert(pageIdx);
+        QElapsedTimer _perfR; _perfR.start();
+        if (canFastPath(tab, pageIdx)) {
+            if (tab->view) tab->view->update();
+            qDebug().noquote() << "[perf] markup FAST path page=" << pageIdx << "ms=" << _perfR.elapsed();
+        } else {
+            if (tab->view) tab->view->addPendingMarkup(tool, style, start, end);
+            qDebug().noquote() << "[perf] markup SLOW path (overlay incapable) page=" << pageIdx;
+            if (tab->renderer) {
+                if (tab->view) tab->view->invalidateTiles();
+                if (tab->view) tab->view->invalidateSharp();
+                tab->renderer->invalidatePage(pageIdx);
+                tab->renderer->requestPage(pageIdx, tab->zoom);
+            }
+        }
+        refreshCommentsForPage(tab, pageIdx);
+    });
+
+    connect(tab->view, &PdfGpuView::freehandCommitRequested,
+            this, [this, tab](int pageIdx, const QVector<QPointF>& pts) {
+        if (!tab->annotLayer) return;
+        qDebug().noquote() << "[markup] signal=freehandCommitRequested page=" << pageIdx
+                 << "pts=" << pts.size();
+        AnnotStyle style = m_annotStyle;
+        { QElapsedTimer _p; _p.start();
+          tab->annotLayer->commitAnnotation(pageIdx, AnnotTool::Freehand, style, {}, {}, pts);
+          qDebug().noquote() << "[perf] markup commit ms=" << _p.elapsed(); }
+        tab->dirty = true;
+        updateTabDirty(tab);
+        invalidateAnnotPage(tab, pageIdx);
+        tab->pagesNeedGenerate.insert(pageIdx);
+        refreshAnnotVisuals(tab, pageIdx);
+        QElapsedTimer _perfR2; _perfR2.start();
+        if (canFastPath(tab, pageIdx)) {
+            if (tab->view) tab->view->update();
+            qDebug().noquote() << "[perf] markup FAST path page=" << pageIdx << "ms=" << _perfR2.elapsed();
+        } else {
+            if (tab->view) tab->view->addPendingMarkup(AnnotTool::Freehand, style, QPointF(), QPointF(), pts);
+            qDebug().noquote() << "[perf] markup SLOW path (overlay incapable) page=" << pageIdx;
+            if (tab->renderer) {
+                if (tab->view) tab->view->invalidateTiles();
+                if (tab->view) tab->view->invalidateSharp();
+                tab->renderer->invalidatePage(pageIdx);
+                tab->renderer->requestPage(pageIdx, tab->zoom);
+            }
+        }
+        refreshCommentsForPage(tab, pageIdx);
     });
 
     connect(tab->view, &PdfGpuView::noteRequested,
@@ -1311,20 +1576,20 @@ void MainWindow::openFile(const QString& path) {
         NoteInputDialog dlg({}, this);
         if (dlg.exec() != QDialog::Accepted) return;
         tab->annotMgr->createPopupNote(pageIndex, pdfPoint, dlg.text(), dlg.author());
-        {   int _n = tab->annotMgr ? tab->annotMgr->loadPage(pageIndex).size() : -1;
-            qDebug().noquote() << "[markup] committed page=" << pageIndex << "annotCountAfter=" << _n; }
-        { DrawAction da; da.page = pageIndex; da.isNote = true; da.a = pdfPoint;
-          da.text = dlg.text(); da.author = dlg.author();
-          m_undoStack.append(da); m_redoStack.clear(); }
-        qDebug().noquote() << "[markup] request re-render page=" << pageIndex << "zoom=" << tab->zoom;
-        if (tab->renderer) {
-            tab->renderer->setTileCache(nullptr);
-            tab->annotCacheValid = false;
-            tab->renderer->clearCache();
-            tab->renderer->requestPage(pageIndex, tab->zoom);
-        }
         tab->dirty = true;
         updateTabDirty(tab);
+        invalidateAnnotPage(tab, pageIndex);
+        tab->pagesNeedGenerate.insert(pageIndex);
+        refreshAnnotVisuals(tab, pageIndex);
+        // Note uses page objects — must re-render (slow path always)
+        qDebug().noquote() << "[markup] request re-render page=" << pageIndex << "zoom=" << tab->zoom;
+        if (tab->renderer) {
+            if (tab->view) tab->view->invalidateTiles();
+            if (tab->view) tab->view->invalidateSharp();
+            tab->renderer->invalidatePage(pageIndex);
+            tab->renderer->requestPage(pageIndex, tab->zoom);
+        }
+        refreshCommentsForPage(tab, pageIndex);
     });
 
     connect(tab->view, &PdfGpuView::textBoxRequested, this,
@@ -1339,30 +1604,35 @@ void MainWindow::openFile(const QString& path) {
         double w = qMax(24.0, static_cast<double>(txt.length()) * 5.5 + 6.0);
         QRectF r(rectPdf.topLeft(), QSizeF(w, 18.0));
         tab->annotMgr->createInlineNote(page, r, txt, dlg.author(), false, m_annotStyle.strokeColor, m_annotStyle.fontSize);
-        {   int _n = tab->annotMgr ? tab->annotMgr->loadPage(page).size() : -1;
-            qDebug().noquote() << "[markup] committed page=" << page << "annotCountAfter=" << _n; }
-        { DrawAction da; da.page = page; da.isText = true;
-          da.a = r.topLeft(); da.b = r.bottomRight();
-          da.text = txt; da.author = dlg.author(); da.textBg = false; da.style = m_annotStyle;
-          m_undoStack.append(da); m_redoStack.clear(); }
+        tab->dirty = true;
+        updateTabDirty(tab);
+        invalidateAnnotPage(tab, page);
+        tab->pagesNeedGenerate.insert(page);
+        refreshAnnotVisuals(tab, page);
+        // FreeText uses page objects — must re-render (slow path always)
         qDebug().noquote() << "[markup] request re-render page=" << page << "zoom=" << tab->zoom;
         if (tab->renderer) {
-            tab->renderer->setTileCache(nullptr);
-            tab->annotCacheValid = false;
-            tab->renderer->clearCache();
+            if (tab->view) tab->view->invalidateTiles();
+            if (tab->view) tab->view->invalidateSharp();
+            tab->renderer->invalidatePage(page);
             tab->renderer->requestPage(page, tab->zoom);
         }
+        refreshCommentsForPage(tab, page);
     });
 
     connect(tab->view, &PdfGpuView::annotationPickRequested, this,
             [this, tab](int page, QPointF pt) {
         if (!tab->annotMgr) return;
-        auto list = tab->annotMgr->loadPage(page);
+        const auto& list = annotsForPage(tab, page);
         m_selPage = -1; m_selIdx = -1;
         for (int i = list.size() - 1; i >= 0; --i) {
-            if (list[i].type != QLatin1String("Widget") && list[i].rect.normalized().contains(pt)) {
+            if (list[i].type == QLatin1String("Widget")) continue;
+            QRectF hitRect = list[i].rect.normalized().adjusted(-3, -3, 3, 3);
+            if (hitRect.contains(pt)) {
                 m_selPage = page; m_selIdx = i;
+                qDebug().noquote() << "[markup] picked annot page=" << page << "idx=" << i << "type=" << list[i].type;
                 tab->view->setSelectedAnnot(list[i].rect.normalized());
+                m_thumbPanel->selectCommentFor(page, i);
                 if (!list[i].text.isEmpty()) {
                     showNotePopup(list[i].text, list[i].author);
                 }
@@ -1370,35 +1640,56 @@ void MainWindow::openFile(const QString& path) {
             }
         }
         tab->view->clearSelectedAnnot();
+        m_thumbPanel->selectCommentFor(-1, -1);
         hideNotePopup();
     });
 
     connect(tab->view, &PdfGpuView::annotationContextRequested, this,
             [this, tab](int page, QPointF pt, QPoint gpos) {
         if (!tab->annotMgr) return;
-        auto list = tab->annotMgr->loadPage(page);
+        QElapsedTimer _perfRC;
+        _perfRC.start();
         int idx = -1;
-        for (int i = list.size() - 1; i >= 0; --i)
-            if (list[i].type != QLatin1String("Widget") && list[i].rect.normalized().contains(pt)) { idx = i; break; }
-        if (idx < 0) { tab->view->clearSelectedAnnot(); return; }
+        QString ctxType, ctxUid;
+        QRectF ctxRect;
+        {
+            const auto& list = annotsForPage(tab, page);
+            for (int i = list.size() - 1; i >= 0; --i) {
+                if (list[i].type == QLatin1String("Widget")) continue;
+                QRectF hitRect = list[i].rect.normalized().adjusted(-3, -3, 3, 3);
+                if (hitRect.contains(pt)) { idx = i; break; }
+            }
+            if (idx < 0) { tab->view->clearSelectedAnnot(); m_thumbPanel->selectCommentFor(-1, -1); return; }
+            ctxType = list[idx].type;
+            ctxUid  = list[idx].uid;
+            ctxRect = list[idx].rect.normalized();
+        }
         m_selPage = page; m_selIdx = idx;
-        tab->view->setSelectedAnnot(list[idx].rect.normalized());
+        tab->view->setSelectedAnnot(ctxRect);
+        m_thumbPanel->selectCommentFor(page, idx);
         QMenu menu(this);
-        const bool canEditText = (list[idx].type == QLatin1String("FreeText") || list[idx].type == QLatin1String("Note"));
+        const bool canEditText = (ctxType == QLatin1String("FreeText") || ctxType == QLatin1String("Note"));
         QAction* editAct = canEditText ? menu.addAction("Edit text…") : nullptr;
         QAction* propAct = menu.addAction("Properties…");
         QAction* del     = menu.addAction("Delete");
+        qDebug().noquote() << "[perf] rightclick handled ms=" << _perfRC.elapsed();
         QAction* chosen  = menu.exec(gpos);
         if (chosen == del) {
             deleteSelectedAnnot(page, idx);
         } else if (editAct && chosen == editAct) {
             editSelectedAnnot(page, idx);
         } else if (chosen == propAct) {
+            int realIdxProp = idx;
+            if (!ctxUid.isEmpty()) {
+                int rp = tab->annotMgr->findAnnotIndexByUid(page, ctxUid);
+                if (rp >= 0) realIdxProp = rp;
+            }
             QDialog dlg(this);
             dlg.setWindowTitle("Markup properties");
             auto* form = new QFormLayout(&dlg);
             QString realType; QColor realColor = m_annotStyle.strokeColor; float realWidth = m_annotStyle.strokeWidth; float realFont = 11.0f;
-            tab->annotMgr->getAnnotEditState(page, idx, realType, realColor, realWidth, realFont);
+            bool curHasFill = false; int curFillAlpha = 255;
+            tab->annotMgr->getAnnotEditState(page, realIdxProp, realType, realColor, realWidth, realFont, &curHasFill, &curFillAlpha);
             QColor curColor = realColor;
             auto* colorBtn = new QPushButton("Choose…");
             colorBtn->setStyleSheet(QString("background:%1;color:white;").arg(curColor.name()));
@@ -1407,10 +1698,11 @@ void MainWindow::openFile(const QString& path) {
                 if (c.isValid()) { curColor = c; colorBtn->setStyleSheet(QString("background:%1;color:white;").arg(c.name())); }
             });
             form->addRow("Color", colorBtn);
-            const bool isText = (list[idx].type == QLatin1String("FreeText"));
+            const bool isText = (ctxType == QLatin1String("FreeText"));
             QSpinBox* widthSpin = nullptr;
             QCheckBox* fillChk = nullptr;
             QSpinBox* fontSpin = nullptr;
+            QSpinBox* fillOpacitySpin = nullptr;
             if (isText) {
                 fontSpin = new QSpinBox; fontSpin->setRange(6, 96);
                 fontSpin->setValue(qRound(realFont));
@@ -1419,8 +1711,14 @@ void MainWindow::openFile(const QString& path) {
                 widthSpin = new QSpinBox; widthSpin->setRange(1, 24);
                 widthSpin->setValue(qMax(1, qRound(realWidth)));
                 fillChk = new QCheckBox;
+                fillChk->setChecked(curHasFill);
                 form->addRow("Width (px)", widthSpin);
                 form->addRow("Fill", fillChk);
+                fillOpacitySpin = new QSpinBox;
+                fillOpacitySpin->setRange(0, 100);
+                fillOpacitySpin->setSuffix("%");
+                fillOpacitySpin->setValue(qBound(0, qRound(curFillAlpha * 100.0 / 255.0), 100));
+                form->addRow("Fill opacity", fillOpacitySpin);
             }
             auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
             form->addRow(bb);
@@ -1428,25 +1726,36 @@ void MainWindow::openFile(const QString& path) {
             connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
             if (dlg.exec() != QDialog::Accepted) return;
             if (isText) {
-                if (tab->annotMgr->rebuildTextNote(page, idx, curColor,
+                if (tab->annotMgr->rebuildTextNote(page, realIdxProp, curColor,
                                                    static_cast<float>(fontSpin->value()))) {
                     tab->dirty = true; updateTabDirty(tab);
-                    if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
-                    tab->annotCacheValid = false;
-                    m_annotStyle.strokeColor = curColor;
-                    m_annotStyle.fontSize    = static_cast<float>(fontSpin->value());
+                    invalidateAnnotPage(tab, page);
+                    tab->pagesNeedGenerate.insert(page);
+                    refreshAnnotVisuals(tab, page);
+                    if (tab->renderer) { tab->renderer->invalidatePage(page); tab->renderer->requestPage(page, tab->zoom); }
+                    if (tab->view) tab->view->invalidateTiles();
+                    if (tab->view) tab->view->invalidateSharp();
                     m_selPage = -1; m_selIdx = -1;
                     tab->view->clearSelectedAnnot();
+                    refreshCommentsForPage(tab, page);
                 }
             } else {
-                if (tab->annotMgr->setAnnotStyle(page, idx, curColor,
+                if (tab->annotMgr->setAnnotStyle(page, realIdxProp, curColor,
                                                  static_cast<float>(widthSpin->value()),
-                                                 fillChk->isChecked())) {
+                                                 fillChk->isChecked(),
+                                                 qBound(0, qRound(fillOpacitySpin->value() * 255.0 / 100.0), 255))) {
                     tab->dirty = true; updateTabDirty(tab);
-                    if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
-                    tab->annotCacheValid = false;
-                    m_annotStyle.strokeColor = curColor;
-                    m_annotStyle.strokeWidth = static_cast<float>(widthSpin->value());
+                    invalidateAnnotPage(tab, page);
+                    tab->pagesNeedGenerate.insert(page);
+                    refreshAnnotVisuals(tab, page);
+                    if (canFastPath(tab, page)) {
+                        if (tab->view) tab->view->update();
+                    } else {
+                        if (tab->renderer) { tab->renderer->invalidatePage(page); tab->renderer->requestPage(page, tab->zoom); }
+                        if (tab->view) tab->view->invalidateTiles();
+                        if (tab->view) tab->view->invalidateSharp();
+                    }
+                    refreshCommentsForPage(tab, page);
                 }
             }
         }
@@ -1455,26 +1764,35 @@ void MainWindow::openFile(const QString& path) {
     connect(tab->view, &PdfGpuView::annotationMoveRequested, this,
             [this, tab](int page, double dx, double dy) {
         if (m_selPage != page || m_selIdx < 0 || !tab->annotMgr) return;
-        // Note/FreeText: use moveNote (handles both annotation + page objects, no undo)
         {
-            auto list = tab->annotMgr->loadPage(page);
-            if (m_selIdx >= 0 && m_selIdx < list.size()) {
-                auto t = list[m_selIdx].type;
-                if (t == "FreeText" || t == "Note") {
-                    if (tab->annotMgr->moveNote(page, m_selIdx, dx, dy)) {
-                        auto nl = tab->annotMgr->loadPage(page);
-                        m_selIdx = nl.size() - 1;
-                        if (m_selIdx >= 0 && m_selIdx < nl.size())
-                            tab->view->setSelectedAnnot(nl[m_selIdx].rect.normalized());
-                        tab->dirty = true; updateTabDirty(tab);
-                        if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
-                        tab->annotCacheValid = false;
-                        DrawAction da; da.kind = DrawAction::NoteMove; da.page = page;
-                        da.a = QPointF(dx, dy);
-                        m_undoStack.append(da); m_redoStack.clear();
-                    }
-                    return;   // skip snapshot path
+            QString moveType, moveUid;
+            {
+                const auto& annots = annotsForPage(tab, page);
+                if (m_selIdx < 0 || m_selIdx >= annots.size()) return;
+                moveType = annots[m_selIdx].type;
+                moveUid  = annots[m_selIdx].uid;
+            }
+            int realMoveIdx = m_selIdx;
+            if (!moveUid.isEmpty()) {
+                int r = tab->annotMgr->findAnnotIndexByUid(page, moveUid);
+                if (r >= 0) realMoveIdx = r;
+            }
+            if (moveType == "FreeText" || moveType == "Note") {
+                if (tab->annotMgr->moveNote(page, realMoveIdx, dx, dy)) {
+                    invalidateAnnotPage(tab, page);
+                    const auto& nl = annotsForPage(tab, page);
+                    m_selIdx = nl.size() - 1;
+                    if (m_selIdx >= 0 && m_selIdx < nl.size())
+                        tab->view->setSelectedAnnot(nl[m_selIdx].rect.normalized());
+                    tab->dirty = true; updateTabDirty(tab);
+                    tab->pagesNeedGenerate.insert(page);
+                    refreshAnnotVisuals(tab, page);
+                    if (tab->renderer) { tab->renderer->invalidatePage(page); tab->renderer->requestPage(page, tab->zoom); }
+                    if (tab->view) tab->view->invalidateTiles();
+                    if (tab->view) tab->view->invalidateSharp();
+                    refreshCommentsForPage(tab, page);
                 }
+                return;
             }
         }
         AnnotSnapshot s = tab->annotMgr->snapshotAnnot(page, m_selIdx);
@@ -1496,23 +1814,29 @@ void MainWindow::openFile(const QString& path) {
                 FPDF_ClosePage(mp);
             }
         }
-        AnnotSnapshot before = s;
         s.rl += dxU; s.rr += dxU; s.rt += dyU; s.rb += dyU;
         for (auto& stroke : s.ink)
             for (auto& p : stroke) p = QPointF(p.x() + dxU, p.y() + dyU);
         if (!tab->annotMgr->removeAnnot(page, m_selIdx)) return;
         tab->annotMgr->addSnapshot(page, s);
-        {   int _n = tab->annotMgr ? tab->annotMgr->loadPage(page).size() : -1;
-            qDebug().noquote() << "[markup] committed page=" << page << "annotCountAfter=" << _n; }
-        { DrawAction da; da.kind = DrawAction::Move; da.page = page; da.snap = before; da.snapAfter = s; m_undoStack.append(da); m_redoStack.clear(); }
-        auto list = tab->annotMgr->loadPage(page);
-        m_selIdx = list.size() - 1;
-        if (m_selIdx >= 0 && m_selIdx < list.size())
-            tab->view->setSelectedAnnot(list[m_selIdx].rect.normalized());
+        const auto& list2 = annotsForPage(tab, page);
+        m_selIdx = list2.size() - 1;
+        if (m_selIdx >= 0 && m_selIdx < list2.size())
+            tab->view->setSelectedAnnot(list2[m_selIdx].rect.normalized());
         tab->dirty = true; updateTabDirty(tab);
-        qDebug().noquote() << "[markup] request re-render page=" << page << "zoom=" << tab->zoom;
-        if (tab->renderer) { tab->renderer->setTileCache(nullptr); tab->renderer->clearCache(); tab->renderer->requestPage(page, tab->zoom); }
-        tab->annotCacheValid = false;
+        invalidateAnnotPage(tab, page);
+        tab->pagesNeedGenerate.insert(page);
+        refreshAnnotVisuals(tab, page);
+        if (canFastPath(tab, page)) {
+            if (tab->view) tab->view->update();
+            qDebug().noquote() << "[perf] markup move FAST path page=" << page;
+        } else {
+            qDebug().noquote() << "[perf] markup move SLOW path (overlay incapable) page=" << page;
+            if (tab->renderer) { tab->renderer->invalidatePage(page); tab->renderer->requestPage(page, tab->zoom); }
+            if (tab->view) tab->view->invalidateTiles();
+            if (tab->view) tab->view->invalidateSharp();
+        }
+        refreshCommentsForPage(tab, page);
     });
 
     // ── Load PDF in background thread ─────────────────────────────────────────
@@ -1616,7 +1940,9 @@ void MainWindow::openFile(const QString& path) {
                          << "imgSize=" << img.size()
                          << "hasImage=" << tab->view->hasImage();
                 tab->view->setPage(idx, img, tab->doc->pageSize(idx));
-                // Clear the "Loading…" status from onPageChanged
+                refreshAnnotVisuals(tab, tab->currentPage);
+                if (!m_searchResults.isEmpty())
+                    applySearchHighlights(m_searchResults, m_searchCurrentIdx);
                 statusBar()->showMessage(
                     QString("Page %1 / %2").arg(idx + 1).arg(tab->doc->pageCount()), 5000);
             });
@@ -1641,10 +1967,13 @@ void MainWindow::openFile(const QString& path) {
             }
             tab->view->setPendingPage(0, sz);
         }
+        refreshAnnotVisuals(tab, 0);
         tab->renderer->requestPage(0, tab->zoom);
 
         if (tab == currentTab()) {
             syncSidebarToTab(tabIdx);
+            if (m_thumbPanel && m_thumbPanel->isCommentsTabVisible())
+                onCommentsRequested();
             if (m_continuousMode && m_continuousView) {
                 auto pgSz = tab->doc->pageSize(0);
                 double renderScale = PdfRenderer::kFullRenderMaxPx
@@ -1662,6 +1991,47 @@ void MainWindow::openFile(const QString& path) {
     }));
 }
 
+// ── Search highlight helpers (shared by FindBar + SearchPanel) ─────────────────
+void MainWindow::applySearchHighlights(const QList<SearchResult>& results, int currentIdx) {
+    auto* t = currentTab();
+    if (!t) return;
+    qDebug().noquote() << "[find] applySearchHighlights mode="
+             << (m_continuousMode ? "continuous" : "single")
+             << "page=" << t->currentPage << "rects=" << results.size() << "currentIdx=" << currentIdx;
+    // Filter results for the current page only
+    QList<QRectF> pageRects;
+    int pageLocalIdx = -1;
+    int localCount = 0;
+    for (int i = 0; i < results.size(); ++i) {
+        if (results[i].pageIndex == t->currentPage) {
+            pageRects.append(results[i].boundingBox);
+            if (i == currentIdx) pageLocalIdx = localCount;
+            ++localCount;
+        }
+    }
+    // FindBar passes currentIdx as the global index; adjust to page-local index
+    int effectiveIdx = pageLocalIdx;
+    if (m_continuousMode && m_continuousView) {
+        m_continuousView->setHighlights(t->currentPage, pageRects, effectiveIdx);
+        if (auto* view = t->view) view->clearHighlights();
+    } else {
+        if (auto* view = t->view) {
+            if (effectiveIdx >= 0)
+                view->setHighlights(pageRects, effectiveIdx);
+            else
+                view->setHighlights(pageRects);
+        }
+        if (m_continuousView) m_continuousView->clearHighlights();
+    }
+}
+
+void MainWindow::clearAllSearchHighlights() {
+    if (auto* t = currentTab()) {
+        if (t->view) t->view->clearHighlights();
+    }
+    if (m_continuousView) m_continuousView->clearHighlights();
+}
+
 // ── Tab switching / closing ───────────────────────────────────────────────────
 
 void MainWindow::onTabChanged(int) {
@@ -1670,6 +2040,11 @@ void MainWindow::onTabChanged(int) {
     m_selIdx = -1;
     auto* _t = currentTab();
     if (_t && _t->view) _t->view->clearSelectedAnnot();
+    // Reset search state when switching tabs
+    m_searchResults.clear();
+    m_searchCurrentIdx = -1;
+    if (m_findBar) m_findBar->reset();
+    clearAllSearchHighlights();
     auto* t = currentTab();
     if (t) {
         // Only sync sidebar if the document is already open.
@@ -1680,6 +2055,8 @@ void MainWindow::onTabChanged(int) {
             syncSidebarToTab(m_openDocs.indexOf(t));
         else
             m_thumbPanel->clearThumbnails();
+        if (m_thumbPanel && m_thumbPanel->isCommentsTabVisible())
+            onCommentsRequested();
         {
             QString nm = QFileInfo(t->originalPath.isEmpty()
                                    ? t->doc->filePath() : t->originalPath).fileName();
@@ -1697,6 +2074,7 @@ void MainWindow::onTabChanged(int) {
                      << renderScale << "(tabZoom=" << t->zoom << ")";
             m_continuousView->setZoom(renderScale);
             m_continuousView->setDocument(t->doc.get(), t->renderer.get());
+            if (t->annotMgr) refreshAnnotVisuals(t, t->currentPage);
         }
     } else {
         syncSidebarToTab(-1);
@@ -1714,22 +2092,102 @@ void MainWindow::onCommentsRequested() {
         m_thumbPanel->setComments(t->annotCache);
         return;
     }
+    if (t->annotScanInFlight) {
+        qDebug().noquote() << "[comments] FULL scan skipped (already in flight)";
+        return;
+    }
 
     int pageCount = t->doc->pageCount();
+    int startPage = qBound(0, t->currentPage, pageCount - 1);
     auto* mgr = t->annotMgr.get();
-    auto* watcher = new QFutureWatcher<QList<AnnotInfo>>(this);
-    connect(watcher, &QFutureWatcher<QList<AnnotInfo>>::finished, this,
-            [this, watcher, t]() {
+    t->annotScanInFlight = true;
+    t->annotCache.clear();
+    t->annotCacheValid = false;
+
+    qDebug().noquote() << "[comments] FULL scan start pages=" << pageCount
+             << "startPage=" << startPage;
+    m_thumbPanel->setCommentsLoading(true);
+
+    qint64 scanStartMs = QDateTime::currentMSecsSinceEpoch();
+
+    auto* watcher = new QFutureWatcher<void>(this);
+
+    // Throttle timer: limit UI updates to ~7/sec during streaming scan
+    auto* throttleTimer = new QTimer(this);
+    throttleTimer->setSingleShot(true);
+
+    QMetaObject::Connection pageConn;
+    // Connect streaming signal — disconnected explicitly in finished
+    pageConn = connect(mgr, &AnnotationManager::pageAnnotsLoaded, this,
+            [this, t, throttleTimer](int pageIndex, QList<AnnotInfo> annots) {
+        if (m_openDocs.indexOf(t) < 0) return;
+        if (annots.isEmpty()) return;
+
+        qDebug().noquote() << "[comments] recv page=" << pageIndex
+                 << "n=" << annots.size()
+                 << "cacheSize=" << t->annotCache.size();
+
+        // Remove any stale entries for this page (shouldn't happen in practice)
+        for (int i = t->annotCache.size() - 1; i >= 0; --i)
+            if (t->annotCache[i].pageIndex == pageIndex)
+                t->annotCache.removeAt(i);
+
+        // Insert in page-ascending order (same logic as refreshCommentsForPage)
+        int insertPos = 0;
+        for (int i = 0; i < t->annotCache.size(); ++i) {
+            if (t->annotCache[i].pageIndex >= pageIndex) break;
+            insertPos = i + 1;
+        }
+        for (const auto& info : annots)
+            t->annotCache.insert(insertPos++, info);
+
+        // Throttle: reset timer so setComments runs at most ~7×/sec
+        if (t == currentTab() && m_thumbPanel && m_thumbPanel->isCommentsTabVisible()) {
+            if (!throttleTimer->isActive())
+                throttleTimer->start(150);
+        }
+    });
+
+    // Connect scan progress to panel (updates placeholder text until first real results)
+    QMetaObject::Connection progressConn;
+    progressConn = connect(mgr, &AnnotationManager::scanProgress, this,
+            [this, t](int scanned, int total) {
+        if (m_openDocs.indexOf(t) < 0) return;
+        if (t == currentTab() && m_thumbPanel)
+            m_thumbPanel->setCommentsProgress(scanned, total);
+    });
+
+    // Timer fires: push accumulated results to panel
+    connect(throttleTimer, &QTimer::timeout, this, [this, t]() {
+        if (m_openDocs.indexOf(t) < 0) return;
+        if (t == currentTab() && m_thumbPanel)
+            m_thumbPanel->setComments(t->annotCache);
+    });
+
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [this, watcher, t, throttleTimer, scanStartMs, pageConn, progressConn]() {
+        disconnect(pageConn);
+        disconnect(progressConn);
         watcher->deleteLater();
         if (m_openDocs.indexOf(t) < 0) return;
-        auto comments = watcher->result();
-        t->annotCache = comments;
+
+        throttleTimer->stop();
         t->annotCacheValid = true;
-        if (t == currentTab())
-            m_thumbPanel->setComments(comments);
+        t->annotScanInFlight = false;
+
+        qDebug().noquote() << "[comments] scan DONE cacheSize=" << t->annotCache.size()
+                 << "valid=" << t->annotCacheValid;
+
+        if (t == currentTab()) {
+            m_thumbPanel->setComments(t->annotCache);
+            qint64 ms = QDateTime::currentMSecsSinceEpoch() - scanStartMs;
+            qDebug().noquote() << "[comments] FULL scan done pages=" << t->doc->pageCount()
+                     << "found=" << t->annotCache.size() << "ms=" << ms;
+        }
     });
-    watcher->setFuture(QtConcurrent::run([mgr, pageCount]() {
-        return mgr->loadAll(pageCount);
+
+    watcher->setFuture(QtConcurrent::run([mgr, pageCount, startPage]() {
+        mgr->loadAllStreaming(pageCount, startPage);
     }));
 }
 
@@ -1806,6 +2264,7 @@ void MainWindow::onPageChanged(int pageIndex) {
         if (pageIndex == oldPage) return;
         t->currentPage = pageIndex;
         t->renderer->setCurrentPage(pageIndex);
+        refreshAnnotVisuals(t, pageIndex);
 
         // Show placeholder from cache immediately — NO render wait
         QImage cached = t->renderer->bestCachedForPage(pageIndex);
@@ -1857,6 +2316,46 @@ void MainWindow::onPageChanged(int pageIndex) {
         QString("Page %1 / %2").arg(pageIndex + 1).arg(total));
 }
 
+void MainWindow::onCommentActivated(int pageIndex, int annotIndex) {
+    auto* t = currentTab();
+    if (!t || !t->doc->isOpen()) return;
+    pageIndex = qBound(0, pageIndex, t->doc->pageCount() - 1);
+
+    const auto& list = annotsForPage(t, pageIndex);
+    if (annotIndex < 0 || annotIndex >= list.size()) return;
+    QRectF r = list[annotIndex].rect.normalized();  // copy local — dangling guard
+
+    double oldZoom = t->zoom;
+    onPageChanged(pageIndex);
+
+    if (m_continuousMode && m_continuousView) {
+        m_continuousView->scrollToPage(pageIndex);
+        // ponytail: no zoom/center/select in continuous mode — would fight its layout
+        return;
+    }
+
+    double viewportW = t->view->width();
+    double want = viewportW * 0.5 / qMax(r.width(), 1.0);
+    double newZoom = qBound(oldZoom, want, 2.0);
+
+    t->zoom = newZoom;
+    t->view->setZoom(newZoom);
+    if (m_zoomEdit)
+        m_zoomEdit->setText(QString::number(qRound(newZoom * 100)) + "%");
+
+    t->view->centerOnPageRect(r);
+    refreshAnnotVisuals(t, pageIndex);
+    m_selPage = pageIndex;
+    m_selIdx  = annotIndex;
+    t->view->setSelectedAnnot(r);
+
+    qDebug().noquote() << QString("[comments] activated page=%1 idx=%2 zoom=%3→%4 rect=(%5,%6,%7,%8)")
+        .arg(pageIndex).arg(annotIndex)
+        .arg(oldZoom, 0, 'f', 3).arg(newZoom, 0, 'f', 3)
+        .arg(r.x(), 0, 'f', 1).arg(r.y(), 0, 'f', 1)
+        .arg(r.width(), 0, 'f', 1).arg(r.height(), 0, 'f', 1);
+}
+
 void MainWindow::onZoomChanged(double scale) {
     auto* t = currentTab();
     if (!t) return;
@@ -1868,6 +2367,9 @@ void MainWindow::onZoomChanged(double scale) {
     }
     if (m_zoomEdit)
         m_zoomEdit->setText(QString::number(qRound(t->zoom * 100)) + "%");
+    // Refresh annot visuals for current page (data unchanged but overlay re-scales)
+    if (t->view && t->doc && t->doc->isOpen())
+        refreshAnnotVisuals(t, t->currentPage);
 }
 
 // ── Drag-drop ─────────────────────────────────────────────────────────────────
@@ -1906,6 +2408,13 @@ void MainWindow::closeEvent(QCloseEvent* e) {
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == m_findBar->parent() && event->type() == QEvent::Resize && m_findBar->isVisible()) {
+        auto* p = qobject_cast<QWidget*>(m_findBar->parent());
+        if (p) {
+            int bw = m_findBar->sizeHint().width();
+            m_findBar->move(qMax(0, p->width() - bw - 8), 4);
+        }
+    }
     return QMainWindow::eventFilter(watched, event);
 }
 

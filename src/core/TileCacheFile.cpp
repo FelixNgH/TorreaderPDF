@@ -93,7 +93,7 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
     m_file.write(reinterpret_cast<char*>(&m_header), sizeof(m_header));
 
     m_pageCount = pageCount;
-    m_index.assign(pageCount * 4, TorEntry{});
+    m_index.fill(TorEntry{}, pageCount * 4);
     m_file.write(reinterpret_cast<char*>(m_index.data()), (qint64)m_index.size() * sizeof(TorEntry));
     m_file.flush();
     m_open = true;

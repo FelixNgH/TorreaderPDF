@@ -237,6 +237,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     auto* booksBtn = makeTabBtn("Bookmarks");
     auto* contBtn  = makeTabBtn("Comments");
     auto* propBtn  = makeTabBtn("Properties");
+    auto* searchBtn = makeTabBtn("Search");
     thumbBtn->setChecked(true);
 
     m_tabGroup = new QButtonGroup(this);
@@ -245,6 +246,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     m_tabGroup->addButton(booksBtn, 1);
     m_tabGroup->addButton(contBtn,  2);
     m_tabGroup->addButton(propBtn,  3);
+    m_tabGroup->addButton(searchBtn, 4);
 
     auto* tabGrid = new QWidget;
     auto* gl      = new QGridLayout(tabGrid);
@@ -252,10 +254,11 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     gl->setSpacing(1);
     gl->setColumnStretch(0, 1);
     gl->setColumnStretch(1, 1);
-    gl->addWidget(thumbBtn, 0, 0);
-    gl->addWidget(booksBtn, 0, 1);
-    gl->addWidget(contBtn,  1, 0);
-    gl->addWidget(propBtn,  1, 1);
+    gl->addWidget(thumbBtn,  0, 0);
+    gl->addWidget(booksBtn,  0, 1);
+    gl->addWidget(contBtn,   1, 0);
+    gl->addWidget(propBtn,   1, 1);
+    gl->addWidget(searchBtn, 2, 0, 1, 2);
 
     // Comments panel (idx 2): markup tools on top + list of PDF comments below
     m_commentsPanel = new QWidget;
@@ -270,17 +273,20 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         struct ToolDef { const char* label; int id; };
         const ToolDef tools[] = {
             {"Select", 0}, {"Line", 2}, {"Arrow", 3}, {"Rect", 4},
-            {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7}, {"Note", 1}
+            {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7}, {"Note", 1},
+            {"Freehand", 8}, {"Highlight", 9}
         };
         int r = 0, c = 0;
         for (const auto& td : tools) {
             auto* b = new QPushButton(QString::fromUtf8(td.label));
             b->setFixedHeight(24);
             const int id = td.id;
-            connect(b, &QPushButton::clicked, this, [this, id]{ emit annotToolSelected(id); });
+            m_toolButtons.insert(id, b);
+            connect(b, &QPushButton::clicked, this, [this, id]{ setActiveToolButton(id); emit annotToolSelected(id); });
             tgl->addWidget(b, r, c);
             if (++c == 2) { c = 0; ++r; }
         }
+        setActiveToolButton(0);
         cpLay->addWidget(toolWrap);
         auto* propWrap = new QWidget;
         auto* pgl = new QGridLayout(propWrap);
@@ -290,14 +296,18 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         widthCombo->addItems({ "1 px", "2 px", "3 px", "4 px", "5 px", "6 px",
                                "8 px", "10 px", "12 px", "16 px", "20 px", "24 px" });
         widthCombo->setCurrentIndex(1);
-        m_colorBtn = new QPushButton("Color");
+        m_colorBtn = new QPushButton;
         m_colorBtn->setStyleSheet("background:red; color:white;");
         auto* fillChk = new QCheckBox("Fill");
+        auto* fillOpacityCombo = new QComboBox;
+        fillOpacityCombo->addItems({"25%","50%","75%","100%"});
+        fillOpacityCombo->setCurrentIndex(1);
         pgl->addWidget(widthCombo, 0, 0);
         pgl->addWidget(m_colorBtn, 0, 1);
         pgl->addWidget(fillChk,    0, 2);
+        pgl->addWidget(fillOpacityCombo, 0, 3);
         cpLay->addWidget(propWrap);
-        auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill); };
+        auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill, m_annFillOpacity); };
         connect(widthCombo, &QComboBox::currentIndexChanged, this, [this, emitStyle](int i){
             const double w[] = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0 };
             m_annWidth = w[qBound(0, i, 11)];
@@ -315,13 +325,20 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
             m_annFill = on;
             emitStyle();
         });
+        {
+            const int vals[] = {25, 50, 75, 100};
+            connect(fillOpacityCombo, &QComboBox::currentIndexChanged, this, [this, vals, emitStyle](int i){
+                m_annFillOpacity = vals[qBound(0, i, 3)];
+                emitStyle();
+            });
+        }
         auto* sep = new QFrame;
         sep->setFrameShape(QFrame::HLine);
         sep->setFrameShadow(QFrame::Sunken);
         cpLay->addWidget(sep);
         m_commentsList = new QListWidget;
         connect(m_commentsList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it){
-            if (it) emit commentActivated(it->data(Qt::UserRole).toInt());
+            if (it) emit commentActivated(it->data(Qt::UserRole).toInt(), it->data(Qt::UserRole + 1).toInt());
         });
         cpLay->addWidget(m_commentsList, 1);
     }
@@ -331,6 +348,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     m_stack->addWidget(m_outline);        // idx 1 — Bookmarks
     m_stack->addWidget(m_commentsPanel);  // idx 2 — Comments
     m_stack->addWidget(m_propertiesTree); // idx 3 — Properties
+    m_stack->addWidget(m_searchPanel);    // idx 4 — Search
 
     connect(m_tabGroup, &QButtonGroup::idClicked, m_stack, &QStackedWidget::setCurrentIndex);
     connect(m_tabGroup, &QButtonGroup::idClicked, this, [this](int id) {
@@ -340,7 +358,16 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         // ponytail: lazy comment loading — load only when user opens the tab
         if (id == 2)
             emit requestComments();
+        if (id == 4)
+            m_searchPanel->focusInput();
     });
+    // Relay search signals from SearchPanel out through ThumbnailPanel
+    connect(m_searchPanel, &SearchPanel::searchRequested,
+            this, &ThumbnailPanel::searchRequested);
+    connect(m_searchPanel, &SearchPanel::resultSelected,
+            this, &ThumbnailPanel::searchResultSelected);
+    connect(m_searchPanel, &SearchPanel::searchCleared,
+            this, &ThumbnailPanel::searchCleared);
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -576,7 +603,26 @@ void ThumbnailPanel::addSearchResult(const SearchResult& result) {
     m_searchPanel->addResult(result);
 }
 void ThumbnailPanel::clearSearchResults() { m_searchPanel->clearResults(); }
-void ThumbnailPanel::activateSearch() {}
+void ThumbnailPanel::setSearchProgress(int pagesScanned, int totalPages) {
+    m_searchPanel->setSearchProgress(pagesScanned, totalPages);
+}
+void ThumbnailPanel::activateSearch() {
+    if (m_tabGroup->button(4)) {
+        m_tabGroup->button(4)->setChecked(true);
+        m_stack->setCurrentIndex(4);
+    }
+    m_searchPanel->focusInput();
+}
+
+// ── setActiveToolButton ────────────────────────────────────────────────────────
+void ThumbnailPanel::setActiveToolButton(int id) {
+    for (auto it = m_toolButtons.constBegin(); it != m_toolButtons.constEnd(); ++it) {
+        if (it.key() == id)
+            it.value()->setStyleSheet("background:#2d7dd2; color:white; font-weight:bold;");
+        else
+            it.value()->setStyleSheet("");
+    }
+}
 
 // ── setDarkMode ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::setDarkMode(bool dark) { Q_UNUSED(dark) }
@@ -882,18 +928,55 @@ void ThumbnailPanel::buildProperties() {
 
 void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
     if (!m_commentsList) return;
+    qDebug().noquote() << "[comments] setComments n=" << comments.size();
     m_commentsList->clear();
     for (const AnnotInfo& a : comments) {
         QString label = QString("p.%1  %2").arg(a.pageIndex + 1).arg(a.type);
         if (!a.text.isEmpty()) label += "  — " + a.text.left(60);
         auto* item = new QListWidgetItem(label, m_commentsList);
         item->setData(Qt::UserRole, a.pageIndex);
+        item->setData(Qt::UserRole + 1, a.indexInPage);
     }
     if (m_commentsList->count() == 0)
         m_commentsList->addItem(new QListWidgetItem(QStringLiteral("(no comments yet)")));
 }
 
+void ThumbnailPanel::setCommentsLoading(bool loading) {
+    if (!m_commentsList) return;
+    m_commentsList->clear();
+    if (loading) {
+        auto* item = new QListWidgetItem(QStringLiteral("Loading comments\u2026"), m_commentsList);
+        item->setFlags(Qt::NoItemFlags);
+    }
+}
+
+void ThumbnailPanel::setCommentsProgress(int scanned, int total) {
+    if (!m_commentsList) return;
+    if (m_commentsList->count() == 1) {
+        auto* item = m_commentsList->item(0);
+        if (item && item->flags() == Qt::NoItemFlags)
+            item->setText(QStringLiteral("Scanning comments\u2026 %1/%2").arg(scanned).arg(total));
+    }
+}
+
 void ThumbnailPanel::setAnnotMgr(AnnotationManager* mgr, int pageCount) {
     m_annotMgr   = mgr;
     m_annotPages = pageCount;
+}
+
+void ThumbnailPanel::selectCommentFor(int pageIndex, int annotIndex) {
+    if (!m_commentsList) return;
+    QSignalBlocker blocker(m_commentsList);
+    for (int i = 0; i < m_commentsList->count(); ++i) {
+        auto* item = m_commentsList->item(i);
+        if (item && item->data(Qt::UserRole).toInt() == pageIndex &&
+            item->data(Qt::UserRole + 1).toInt() == annotIndex) {
+            m_commentsList->setCurrentItem(item);
+            m_commentsList->scrollToItem(item);
+            qDebug().noquote() << "[comments] sync PDF→list page=" << pageIndex << "idx=" << annotIndex << "found=1";
+            return;
+        }
+    }
+    m_commentsList->clearSelection();
+    qDebug().noquote() << "[comments] sync PDF→list page=" << pageIndex << "idx=" << annotIndex << "found=0";
 }

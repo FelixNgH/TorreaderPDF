@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QThread>
 #include <fpdf_progressive.h>
+#include <fpdf_thumbnail.h>
 
 // Progressive-pause helpers (mirrors PdfRenderer.h pattern).
 struct ThumbPauseCtx {
@@ -32,7 +33,7 @@ ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cac
 
 void ThumbnailWorker::enqueue(int pageIndex, int priority) {
     QMutexLocker lock(&m_mutex);
-    if (m_queued.contains(pageIndex)) return;  // already queued, skip duplicate
+    if (m_queued.contains(pageIndex)) return;
     m_queued.insert(pageIndex);
     m_queue.push(ThumbRequest{pageIndex, priority});
     m_cond.wakeOne();
@@ -71,6 +72,7 @@ void ThumbnailWorker::run() {
         }
 
         // ── Progressive render via PDFium (releases mutex between slices) ──
+
         QImage image;
         QElapsedTimer timer;
         timer.start();
@@ -81,10 +83,8 @@ void ThumbnailWorker::run() {
 
         // Step 1: Start (lock mutex for this slice only)
         {
-            // Priority 2 (background): yield to main page render via tryLock
             if (req.priority >= 2) {
                 if (!s_pdfiumMutex.tryLock(5)) {
-                    // Main render holds mutex → re-queue, try another page
                     QMutexLocker lock(&m_mutex);
                     m_queued.insert(req.pageIndex);
                     m_queue.push(req);
@@ -98,6 +98,25 @@ void ThumbnailWorker::run() {
 
             fpdfPage = FPDF_LoadPage(m_doc, req.pageIndex);
             if (!fpdfPage) continue;
+
+            // ── Try embedded thumbnail first ──
+            FPDF_BITMAP tb = FPDFPage_GetThumbnailAsBitmap(fpdfPage);
+            if (tb) {
+                int tw = FPDFBitmap_GetWidth(tb);
+                int th = FPDFBitmap_GetHeight(tb);
+                int stride = FPDFBitmap_GetStride(tb);
+                const uchar* buf = (const uchar*)FPDFBitmap_GetBuffer(tb);
+                QImage embImg = QImage(buf, tw, th, stride, QImage::Format_ARGB32).copy();
+                FPDFBitmap_Destroy(tb);
+                qDebug() << "[perf] thumb done page=" << req.pageIndex
+                         << "engine=embedded ms=" << timer.elapsed();
+                if (m_cache && m_cache->isOpen())
+                    m_cache->writePage(req.pageIndex, CacheZoom::Thumb, embImg);
+                qDebug() << "[perf] thumb WORKER emit page=" << req.pageIndex << "worker=" << (void*)this << "thread=" << QThread::currentThreadId();
+                emit thumbnailReady(req.pageIndex, embImg);
+                FPDF_ClosePage(fpdfPage);
+                continue;
+            }
 
             double w = FPDF_GetPageWidth(fpdfPage);
             double h = FPDF_GetPageHeight(fpdfPage);
@@ -119,12 +138,11 @@ void ThumbnailWorker::run() {
 
             renderStatus = FPDF_RenderPageBitmap_Start(bmp, fpdfPage, 0, 0,
                                                        imgW, imgH, 0,
-                                                       FPDF_RENDER_LIMITEDIMAGECACHE,
+                                                       FPDF_RENDER_LIMITEDIMAGECACHE | FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHIMAGE | FPDF_RENDER_NO_SMOOTHPATH,
                                                        &pause);
-            // mutex released here
         }
 
-        // Step 2: Continue loop — mutex locked/unlocked per slice
+        // Step 2: Continue loop
         while (renderStatus == FPDF_RENDER_TOBECONTINUED) {
             {
                 QMutexLocker lock(&m_mutex);
@@ -141,7 +159,6 @@ void ThumbnailWorker::run() {
                 pause.user = &pctx;
 
                 renderStatus = FPDF_RenderPage_Continue(fpdfPage, &pause);
-                // mutex released here
             }
         }
 
@@ -208,7 +225,7 @@ bool ThumbnailRenderPool::open(const QString& pdfPath) {
         auto* w = new ThumbnailWorker(doc, i, &m_cache, this);
         auto c = connect(w, &ThumbnailWorker::thumbnailReady, this,
                          [this](int pg, QImage img) {
-                             qDebug() << "[perf] thumb POOL relay page=" << pg << "pool=" << (void*)this << "thread=" << QThread::currentThreadId();
+                             qDebug() << "[perf] thumb POOL relay page=" << pg;
                              emit thumbnailReady(pg, img);
                          });
         if (!c)
