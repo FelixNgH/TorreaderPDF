@@ -12,6 +12,7 @@
 
 class PdfDocument;
 class PdfRenderer;
+struct AnnotVisual;
 
 // Continuous-scroll PDF viewer.
 // All pages are laid out in a vertical strip with kGap pixels between them.
@@ -37,7 +38,10 @@ public:
 
     void setSelectedAnnotRect(const QRectF& rectPdf);
     void clearSelectedAnnotRect();
+    void setHighlights(int page, const QList<QRectF>& rects, int currentIdx = -1);
+    void clearHighlights();
     void invalidatePage(int pageIndex);
+    void setAnnotVisualsForPage(int page, const QList<AnnotVisual>& visuals);
 
 
 signals:
@@ -48,6 +52,9 @@ signals:
     // Emitted when user finishes dragging a selection rect in text mode.
     // pageRectPts is in PDF-point coordinates (origin bottom-left per PDF spec).
     void textRegionSelected(int pageIndex, QRectF pageRectPts, QPoint globalPos);
+    // Emitted 180 ms after the last scroll/zoom/resize to request a sharp-region
+    // render of the visible viewport at full zoom (high zoom only).
+    void regionNeeded(int pageIndex, double scale, QRect regionPx);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -126,10 +133,12 @@ private:
     int     m_lastEmittedPage = -1;
     QTimer* m_zoomTimer = nullptr;     // 150 ms debounce for zoomChanged
     QTimer* m_scrollTimer = nullptr;   // debounce for pageChanged on scroll
+    QTimer* m_sharpTimer = nullptr;    // 180 ms debounce for sharp-region request
 
-    // Renderer signal connection (kept so we can disconnect on document change).
+    // Renderer signal connections (kept so we can disconnect on document change).
     QMetaObject::Connection m_continuousPageReadyConn;
     QMetaObject::Connection m_regionReadyConn;
+    QMetaObject::Connection m_regionNeededConn;
 
     // Tracks which (page → zoom) pairs have already been probed from cache.
     // Prevents repeated synchronous disk reads when cached images don't match
@@ -153,6 +162,14 @@ private:
     double  m_lastRequestZoom = -1.0;
     bool    m_primaryRequested = false;
     void requestNeighborPages();
+
+    // ── Annotation overlay visuals (per page) ─────────────────────────────
+    QHash<int, QList<AnnotVisual>> m_pageAnnotVisuals;
+
+    // ── Search highlights ──────────────────────────────────────────────────
+    int           m_highlightPage = -1;
+    QList<QRectF> m_highlights;
+    int           m_highlightCurrentIdx = -1;
 
     // ── Selection state ──────────────────────────────────────────────────────
     QRectF      m_selRect;

@@ -2,7 +2,9 @@
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QDebug>
+#include <cmath>
 
 // ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
 // accumulation during pan; farthest-from-viewport tiles evicted when exceeded.
@@ -251,35 +253,32 @@ void PdfGpuView::paintGL() {
         p.fillRect(QRectF(orig.x() + pw, orig.y() + sh, sh, ph), QColor(0, 0, 0, 80));
         p.fillRect(QRectF(orig.x() + sh, orig.y() + ph, pw, sh), QColor(0, 0, 0, 80));
 
-        // ── Draw tile overlays (sharp textures on top of lo-res background) ──
-        if (m_tilePage == m_pageIndex && qAbs(m_tileScale - m_zoom) < 1e-6) {
-            const QRectF viewRect = rect();
+        // ── Draw sharp-region overlay (viewport re-rendered at true zoom) ──
+        if (m_sharpPage == m_pageIndex && qAbs(m_sharpScale - m_zoom) < 1e-6 && !m_sharpImage.isNull()) {
             p.save();
             p.setRenderHint(QPainter::Antialiasing, false);
             p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-            for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it) {
-                int col = it.key().first;
-                int row = it.key().second;
-                const qreal tx = orig.x() + col * 512.0;
-                const qreal ty = orig.y() + row * 512.0;
-                if (!viewRect.intersects(QRectF(tx, ty, 512.0, 512.0)))
-                    continue;
-                p.drawImage(QPoint(qRound(tx), qRound(ty)), it.value());
-            }
+            p.drawImage(QPoint(qRound(orig.x() + m_sharpRegion.x()),
+                               qRound(orig.y() + m_sharpRegion.y())), m_sharpImage);
             p.restore();
         }
 
-        // Highlights (PDF coords, Y up → convert)
+        // Highlights (display coords: Y-down, rotation applied)
         if (!m_highlights.isEmpty()) {
             p.save();
-            p.setBrush(QColor(255, 220, 0, 120));
-            p.setPen(QPen(QColor(255, 150, 0, 200), 1.5));
             double pageH = m_pageSizePt.height();
-            for (const QRectF& r : m_highlights) {
-                QRectF nr = r.normalized();
+            for (int hi = 0; hi < m_highlights.size(); ++hi) {
+                QRectF nr = m_highlights[hi].normalized();
                 if (nr.width() < 0.5 || nr.height() < 0.5) continue;
-                double wx = orig.x() + nr.x()          * m_zoom;
-                double wy = orig.y() + (pageH - nr.bottom()) * m_zoom;
+                double wx = orig.x() + nr.x()      * m_zoom;
+                double wy = orig.y() + nr.y()      * m_zoom;
+                if (hi == m_currentHighlightIdx) {
+                    p.setBrush(QColor(255, 140, 0, 220));
+                    p.setPen(QPen(QColor(200, 80, 0, 240), 2.0));
+                } else {
+                    p.setBrush(QColor(255, 220, 0, 90));
+                    p.setPen(QPen(QColor(255, 150, 0, 160), 1.0));
+                }
                 p.drawRect(QRectF(wx, wy, nr.width() * m_zoom, nr.height() * m_zoom));
             }
             p.restore();
@@ -321,6 +320,178 @@ void PdfGpuView::paintGL() {
             p.restore();
         }
 
+        // ── Pending markup overlay (instant feedback until the page re-render bakes it in) ──
+        if (!m_pendingMarkups.isEmpty()) {
+            p.save();
+            p.setRenderHint(QPainter::Antialiasing, true);
+            for (const PendingMarkup& pm : m_pendingMarkups) {
+                QPointF A = pdfToWidget(pm.a);
+                QPointF B = pdfToWidget(pm.b);
+                QPen pen(pm.color, qMax(1.0, pm.width * m_zoom));
+                p.setPen(pen);
+                p.setBrush(pm.fill.alpha() > 0 ? QBrush(pm.fill) : Qt::NoBrush);
+                QRectF r = QRectF(A, B).normalized();
+                switch (pm.tool) {
+                    case AnnotTool::Line:
+                        p.drawLine(A, B); break;
+                    case AnnotTool::Arrow: {
+                        p.drawLine(A, B);
+                        double ang = std::atan2(B.y() - A.y(), B.x() - A.x());
+                        const double hl = 14.0, d = 0.45;
+                        QPointF w1(B.x() - hl * std::cos(ang - d), B.y() - hl * std::sin(ang - d));
+                        QPointF w2(B.x() - hl * std::cos(ang + d), B.y() - hl * std::sin(ang + d));
+                        p.drawLine(B, w1); p.drawLine(B, w2);
+                        break; }
+                    case AnnotTool::Rectangle:
+                        p.drawRect(r); break;
+                    case AnnotTool::Cloud: {
+                        QPainterPath path;
+                        const double rad = 8.0;
+                        auto edge = [&](QPointF p0, QPointF p1, QPointF nrm){
+                            double dx=p1.x()-p0.x(), dy=p1.y()-p0.y();
+                            double len=std::hypot(dx,dy);
+                            if(len<1.0) return;
+                            int bumps=qMax(1,int(len/(2.0*rad)));
+                            double ux=dx/len, uy=dy/len, seg=len/bumps;
+                            for(int i=0;i<bumps;i++){
+                                double sx=p0.x()+ux*seg*i, sy=p0.y()+uy*seg*i;
+                                for(int k=0;k<=6;k++){
+                                    double t=k/6.0;
+                                    double px=sx+ux*seg*t, py=sy+uy*seg*t;
+                                    double bulge=std::sin(t*3.14159265)*rad;
+                                    QPointF q(px+nrm.x()*bulge, py+nrm.y()*bulge);
+                                    if(path.isEmpty()) path.moveTo(q); else path.lineTo(q);
+                                }
+                            }
+                        };
+                        edge(r.bottomLeft(),  r.bottomRight(), QPointF(0, 1));
+                        edge(r.bottomRight(), r.topRight(),    QPointF(1, 0));
+                        edge(r.topRight(),    r.topLeft(),     QPointF(0,-1));
+                        edge(r.topLeft(),     r.bottomLeft(),  QPointF(-1,0));
+                        path.closeSubpath();
+                        p.setBrush(Qt::NoBrush);
+                        p.drawPath(path);
+                        break; }
+                    case AnnotTool::Ellipse:
+                        p.drawEllipse(r); break;
+                    case AnnotTool::Highlight:
+                        p.fillRect(r, QColor(255, 255, 0, 110)); break;
+                    case AnnotTool::Freehand: {
+                        if (pm.freehand.size() >= 2) {
+                            QPolygonF poly;
+                            for (const QPointF& pt : pm.freehand) poly << pdfToWidget(pt);
+                            p.setBrush(Qt::NoBrush);
+                            p.drawPolyline(poly);
+                        }
+                        break; }
+                    default: break;
+                }
+            }
+            p.restore();
+        }
+
+        // ── Annotation overlay (step 1: drawn from model instead of PDFium render) ──
+        if (!m_annotVisuals.isEmpty()) {
+            { static int _lastLogPage = -1, _lastLogSize = -1;
+              bool anyMatch = false;
+              for (const auto& av : m_annotVisuals)
+                  if (av.page == m_pageIndex) { anyMatch = true; break; }
+              if (!anyMatch && (_lastLogPage != m_pageIndex || _lastLogSize != m_annotVisuals.size())) {
+                  _lastLogPage = m_pageIndex;
+                  _lastLogSize = m_annotVisuals.size();
+                  qDebug().noquote() << "[annot] overlay skipped — visualsPage="
+                      << (m_annotVisuals.isEmpty() ? -1 : m_annotVisuals.first().page)
+                      << "viewPage=" << m_pageIndex << "n=" << m_annotVisuals.size();
+              }
+            }
+            p.save();
+            p.setRenderHint(QPainter::Antialiasing, true);
+            QPointF orig = pageOrigin();
+            for (const AnnotVisual& av : m_annotVisuals) {
+                if (av.page != m_pageIndex) continue;
+                // FreeText/Note are page objects in the renderer — overlay skips them to avoid double-draw
+                if (!av.paintByOverlay) continue;
+                QPointF dOrig = orig + QPointF(av.rect.x() * m_zoom, av.rect.y() * m_zoom);
+                QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
+                QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
+                p.setPen(strokePen);
+                p.setBrush(av.fill.isValid() && av.fill.alpha() > 0 ? QBrush(av.fill) : Qt::NoBrush);
+
+                switch (av.subtype) {
+                    case FPDF_ANNOT_INK: {
+                        for (const auto& stroke : av.ink) {
+                            if (stroke.size() < 2) continue;
+                            QPolygonF poly;
+                            for (const QPointF& pt : stroke)
+                                poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
+                            p.setBrush(Qt::NoBrush);
+                            p.drawPolyline(poly);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_SQUARE:
+                        p.drawRect(dRect);
+                        break;
+                    case FPDF_ANNOT_CIRCLE:
+                        p.drawEllipse(dRect);
+                        break;
+                    case FPDF_ANNOT_HIGHLIGHT: {
+                        if (!av.quads.isEmpty()) {
+                            p.setBrush(QColor(255, 255, 0, 90));
+                            p.setPen(Qt::NoPen);
+                            for (const QRectF& qr : av.quads) {
+                                QPointF qo(orig.x() + qr.x() * m_zoom, orig.y() + qr.y() * m_zoom);
+                                p.drawRect(QRectF(qo, QSizeF(qr.width() * m_zoom, qr.height() * m_zoom)));
+                            }
+                        } else {
+                            p.setBrush(QColor(255, 255, 0, 90));
+                            p.setPen(Qt::NoPen);
+                            p.drawRect(dRect);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_LINE: {
+                        QPointF lA(orig.x() + av.rect.left() * m_zoom, orig.y() + av.rect.top() * m_zoom);
+                        QPointF lB(orig.x() + av.rect.right() * m_zoom, orig.y() + av.rect.bottom() * m_zoom);
+                        p.drawLine(lA, lB);
+                        break;
+                    }
+                    case FPDF_ANNOT_POLYGON: {
+                        // Polygon uses ink strokes as vertex list (first stroke = boundary)
+                        if (!av.ink.isEmpty() && av.ink[0].size() >= 3) {
+                            QPolygonF poly;
+                            for (const QPointF& pt : av.ink[0])
+                                poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
+                            p.drawPolygon(poly);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_FREETEXT: {
+                        double fs = qMax(6.0, av.fontSize * m_zoom);
+                        QFont ft = p.font();
+                        ft.setPointSizeF(fs);
+                        p.setFont(ft);
+                        p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
+                        p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
+                        break;
+                    }
+                    case FPDF_ANNOT_TEXT: {
+                        // Sticky note icon badge
+                        QRectF badge(dRect.center().x() - 14, dRect.center().y() - 14, 28, 28);
+                        p.setBrush(QColor(245, 158, 11, 220));
+                        p.setPen(QColor(180, 100, 0, 200));
+                        p.drawRoundedRect(badge, 6, 6);
+                        p.setPen(Qt::white);
+                        QFont fnt = p.font(); fnt.setPointSize(10); fnt.setBold(true); p.setFont(fnt);
+                        p.drawText(badge, Qt::AlignCenter, "N");
+                        break;
+                    }
+                    default: break;
+                }
+            }
+            p.restore();
+        }
+
     }
 
     // Text selection overlay (Ctrl+drag)
@@ -341,10 +512,23 @@ void PdfGpuView::paintGL() {
         QRectF sr(m_shapeStart, m_shapeEnd);
         if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow) {
             p.drawLine(m_shapeStart, m_shapeEnd);
-        } else if (m_tool == ViewTool::Rectangle || m_tool == ViewTool::FreeText || m_tool == ViewTool::Cloud) {
+        } else if (m_tool == ViewTool::Rectangle || m_tool == ViewTool::FreeText || m_tool == ViewTool::Cloud || m_tool == ViewTool::Highlight) {
             p.drawRect(sr.normalized());
         } else if (m_tool == ViewTool::Ellipse) {
             p.drawEllipse(sr.normalized());
+        }
+        p.restore();
+    }
+
+    // Freehand preview while drawing
+    if (m_drawingFreehand && m_freehandPoints.size() >= 2) {
+        p.save();
+        p.setPen(QPen(Qt::blue, 2, Qt::DashLine));
+        QPointF orig = pageOrigin();
+        for (int i = 1; i < m_freehandPoints.size(); ++i) {
+            QPointF a = m_freehandPoints[i-1] * m_zoom + orig;
+            QPointF b = m_freehandPoints[i]   * m_zoom + orig;
+            p.drawLine(a, b);
         }
         p.restore();
     }
@@ -397,7 +581,9 @@ void PdfGpuView::paintGL() {
 // ── Page management ───────────────────────────────────────────────────────────
 
 void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt) {
-    bool newPage = (pageIndex != m_pageIndex) || !m_hasImage;
+    bool pageChanged = (pageIndex != m_pageIndex);
+    bool newPage = pageChanged || !m_hasImage;
+    int oldPage = m_pageIndex;
     // Low-res guard: only skip when the incoming image is from the SAME page
     // as the last cached image, AND is significantly smaller (= blurry).
     // The tolerance (0.9) prevents 1px rounding differences (e.g. 3999 vs 4000)
@@ -430,7 +616,7 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
         qDebug() << "[GpuView] auto-fix pageSizePt from image page=" << pageIndex;
     }
     qDebug() << "[GpuView] setPage idx=" << pageIndex
-             << "newPage=" << newPage
+             << "pageChanged=" << pageChanged
              << "imgSize=" << pageImage.size()
              << "pageSizePt=" << pageSizePt
              << "loading=" << m_loading;
@@ -453,13 +639,19 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
         m_pendingImage = pageImage;
         m_textureDirty = true;
     }
+    if (pageChanged) {
+        m_highlights.clear();
+        m_currentHighlightIdx = -1;
+        qDebug().noquote() << "[find] highlights cleared (page change" << oldPage << "→" << pageIndex << ")";
+    }
     if (newPage) {
         m_panOffset = {};
-        m_highlights.clear();
+        m_annotVisuals.clear();
         m_hasSel = false;
         m_tiles.clear();
         m_tilePage = -1;
         m_tileScale = 0.0;
+        m_sharpPage = -1; m_sharpImage = {};
         m_tileTimer->start();
     }
     update();
@@ -472,6 +664,7 @@ void PdfGpuView::setSecondPage(int, const QImage&, QSizeF) {
 void PdfGpuView::updatePageImage(const QImage& pageImage) {
     m_loading  = false;
     m_hasImage = !pageImage.isNull();
+    m_pendingMarkups.clear();
     if (!pageImage.isNull()) {
         m_pendingImage = pageImage;
         m_textureDirty = true;
@@ -537,15 +730,20 @@ void PdfGpuView::setPendingPage(int pageIndex, QSizeF pageSizePt) {
     if (pageChanged) {
         m_panOffset  = {};
         m_highlights.clear();
+        m_currentHighlightIdx = -1;
+        qDebug().noquote() << "[find] highlights cleared (page change" << m_pageIndex << "→" << pageIndex << ")";
         m_hasSel     = false;
+        m_annotVisuals.clear();
         m_tiles.clear();
         m_tilePage = -1;
         m_tileScale = 0.0;
+        m_sharpPage = -1; m_sharpImage = {};
         m_hasImage   = false;
         m_lastImage  = {};
         m_lastImagePage = -1;
         m_placeholder = {};
         m_loading    = true;
+        m_pendingMarkups.clear();
         qDebug() << "[GpuView] setPendingPage cleared old image — showing placeholder/loading";
     }
     update();
@@ -564,12 +762,24 @@ void PdfGpuView::setZoom(double scale) {
     m_tiles.clear();
     m_tilePage = -1;
     m_tileScale = 0.0;
+    m_sharpPage = -1; m_sharpImage = {};
     m_tileTimer->start();
     update();
 }
 
 void PdfGpuView::requestTiles() {
     if (!m_hasImage || m_pageSizePt.isEmpty()) return;
+    // Only pay for a sharp-region render when the base full-page image
+    // (capped at 4000px long edge, = PdfRenderer::kFullRenderMaxPx) is being
+    // upscaled. Below that the base is already sharp, so a region render is
+    // wasted work and stalls markup/page renders on the shared PDFium mutex.
+    constexpr double kBaseMaxPx = 4000.0;
+    const double longSidePx = qMax(m_pageSizePt.width(), m_pageSizePt.height()) * m_zoom;
+    if (longSidePx <= kBaseMaxPx * 1.02) {
+        m_sharpPage = -1; m_sharpImage = {};
+        update();
+        return;
+    }
     double pw = m_pageSizePt.width()  * m_zoom;
     double ph = m_pageSizePt.height() * m_zoom;
     QPointF orig = pageOrigin();
@@ -620,6 +830,44 @@ void PdfGpuView::setTile(int page, double scale, int col, int row, const QImage&
     update();
 }
 
+void PdfGpuView::setRegion(int page, double scale, QRect regionPx, const QImage& img) {
+    if (img.isNull()) return;
+    if (page != m_pageIndex) return;
+    if (qAbs(scale - m_zoom) > 1e-6) return;
+    m_sharpPage   = page;
+    m_sharpScale  = scale;
+    m_sharpRegion = regionPx;
+    m_sharpImage  = img;
+    update();
+}
+
+void PdfGpuView::invalidateSharp() {
+    m_sharpPage  = -1;
+    m_sharpImage = {};
+    update();
+    m_tileTimer->start();
+}
+
+void PdfGpuView::invalidateTiles() {
+    m_tiles.clear();
+    m_tilePage = -1;
+    m_tileScale = 0.0;
+    m_tileTimer->start();
+    update();
+}
+
+void PdfGpuView::addPendingMarkup(AnnotTool tool, const AnnotStyle& style,
+                                  QPointF a, QPointF b, const QVector<QPointF>& freehand) {
+    PendingMarkup pm;
+    pm.tool = tool;
+    pm.color = style.strokeColor;
+    pm.width = style.strokeWidth;
+    pm.fill = style.fillColor;
+    pm.a = a; pm.b = b; pm.freehand = freehand;
+    m_pendingMarkups.append(pm);
+    update();
+}
+
 void PdfGpuView::setViewMode(ViewMode mode) {
     m_viewMode = mode;
     update();
@@ -658,11 +906,19 @@ void PdfGpuView::clearSelectedAnnot() {
 
 void PdfGpuView::setHighlights(const QList<QRectF>& rects) {
     m_highlights = rects;
+    m_currentHighlightIdx = -1;
+    update();
+}
+
+void PdfGpuView::setHighlights(const QList<QRectF>& all, int currentIdx) {
+    m_highlights = all;
+    m_currentHighlightIdx = currentIdx;
     update();
 }
 
 void PdfGpuView::clearHighlights() {
     m_highlights.clear();
+    m_currentHighlightIdx = -1;
     update();
 }
 
@@ -676,7 +932,26 @@ void PdfGpuView::clearAnnotOverlays() {
     update();
 }
 
+void PdfGpuView::setAnnotVisuals(const QList<AnnotVisual>& visuals) {
+    m_annotVisuals = visuals;
+    update();
+}
+
+void PdfGpuView::clearAnnotVisuals() {
+    m_annotVisuals.clear();
+    update();
+}
+
 // ── Coordinate helpers ────────────────────────────────────────────────────────
+
+void PdfGpuView::centerOnPageRect(const QRectF& rectDisp) {
+    double pw = m_pageSizePt.width()  * m_zoom;
+    double ph = m_pageSizePt.height() * m_zoom;
+    QPointF c = rectDisp.center();
+    m_panOffset = QPointF(pw / 2.0 - c.x() * m_zoom,
+                          ph / 2.0 - c.y() * m_zoom);
+    update();
+}
 
 QPointF PdfGpuView::widgetToPdf(const QPointF& wp) const {
     return (wp - pageOrigin()) / m_zoom;
@@ -714,6 +989,7 @@ void PdfGpuView::wheelEvent(QWheelEvent* e) {
         m_tiles.clear();
         m_tilePage = -1;
         m_tileScale = 0.0;
+        m_sharpPage = -1; m_sharpImage = {};
         m_tileTimer->start();
         update();
         m_zoomTimer->start();
@@ -764,11 +1040,13 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         update();
         return;
     }
-    if (m_tool == ViewTool::Pan && m_hasImage) {
+    if (m_hasImage) {
         if (e->button() == Qt::RightButton) {
             emit annotationContextRequested(m_pageIndex, widgetToPdf(e->position()), e->globalPosition().toPoint());
             return;
         }
+    }
+    if (m_tool == ViewTool::Pan && m_hasImage) {
         if (e->button() == Qt::LeftButton) {
             if (m_hasSel) {
                 QPointF a = pdfToWidget(m_selRect.topLeft());
@@ -791,10 +1069,18 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         }
         if (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow ||
             m_tool == ViewTool::Rectangle || m_tool == ViewTool::Ellipse ||
-            m_tool == ViewTool::Cloud || m_tool == ViewTool::FreeText) {
+            m_tool == ViewTool::Cloud || m_tool == ViewTool::FreeText ||
+            m_tool == ViewTool::Highlight) {
             m_drawingShape = true;
             m_shapeStart = e->position();
             m_shapeEnd = e->position();
+            return;
+        }
+        if (m_tool == ViewTool::Freehand) {
+            m_drawingFreehand = true;
+            m_freehandPoints.clear();
+            m_freehandPoints.append(widgetToPdf(e->position()));
+            m_freehandLastWidgetPt = e->position();
             return;
         }
     }
@@ -828,6 +1114,28 @@ void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
     }
     if (m_drawingShape) {
         m_shapeEnd = e->position();
+        if ((e->modifiers() & Qt::ShiftModifier) &&
+            (m_tool == ViewTool::Line || m_tool == ViewTool::Arrow)) {
+            const double kPi = 3.14159265358979323846;
+            QPointF d = m_shapeEnd - m_shapeStart;
+            double len = std::hypot(d.x(), d.y());
+            if (len > 0.0) {
+                double ang = std::atan2(d.y(), d.x());
+                double step = kPi / 4.0;
+                double snapped = std::round(ang / step) * step;
+                m_shapeEnd = m_shapeStart + QPointF(std::cos(snapped) * len,
+                                                    std::sin(snapped) * len);
+            }
+        }
+        update();
+        return;
+    }
+    if (m_drawingFreehand) {
+        QPointF cur = e->position();
+        if (m_freehandPoints.isEmpty() || (cur - m_freehandLastWidgetPt).manhattanLength() > 2.0) {
+            m_freehandPoints.append(widgetToPdf(cur));
+            m_freehandLastWidgetPt = cur;
+        }
         update();
         return;
     }
@@ -891,6 +1199,7 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
                     case ViewTool::Rectangle: at = AnnotTool::Rectangle; break;
                     case ViewTool::Ellipse:   at = AnnotTool::Ellipse; break;
                     case ViewTool::Cloud:     at = AnnotTool::Cloud; break;
+                    case ViewTool::Highlight: at = AnnotTool::Highlight; break;
                     default:                  at = AnnotTool::Line; break;
                 }
                 emit shapeCommitRequested(m_pageIndex, at, startPdf, endPdf);
@@ -898,6 +1207,15 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         } else {
             m_drawingShape = false;
         }
+        setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+        update();
+        return;
+    }
+    if (m_drawingFreehand) {
+        m_drawingFreehand = false;
+        if (m_freehandPoints.size() >= 2)
+            emit freehandCommitRequested(m_pageIndex, m_freehandPoints);
+        m_freehandPoints.clear();
         setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
         update();
         return;

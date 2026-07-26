@@ -11,13 +11,17 @@
 // Flat record for one annotation read from a PDF page.
 struct AnnotInfo {
     int     pageIndex = 0;
+    int     indexInPage = -1;
     QString type;      // "Note", "FreeText", "Highlight", "Underline", etc.
     QString text;      // /Contents
     QString author;    // /T
     QRectF  rect;      // in PDF points, Y upward
     QColor  color;
     bool isDraft = false;
+    QString uid;
 };
+
+Q_DECLARE_METATYPE(AnnotInfo)
 
 struct AnnotSnapshot {
     bool  valid = false;
@@ -31,7 +35,26 @@ struct AnnotSnapshot {
     bool isDraft = false;
     QString da;
     QString contents;
+    QString uid;
     QVector<QVector<QPointF>> ink;
+};
+
+// Overlay annotation data — coordinates in display space (Y-down, rotation applied).
+struct AnnotVisual {
+    int      page = 0;
+    QString  uid;
+    int      subtype = 0;      // FPDF_ANNOT_*
+    QRectF   rect;             // display coords (via pdfToDisp)
+    QColor   stroke = QColor(Qt::red);
+    QColor   fill = QColor(Qt::transparent);
+    float    border = 2.0f;
+    QVector<QVector<QPointF>> ink;    // INK: strokes, display coords
+    QVector<QRectF>           quads;  // HIGHLIGHT: quad points, display coords
+    QString  text;
+    float    fontSize = 11.0f;
+    bool     isNote = false;
+    // ponytail: FreeText/Note are drawn as page objects in renderer, not by overlay
+    bool     paintByOverlay = true;
 };
 
 // Reads and creates annotations via PDFium.
@@ -48,6 +71,12 @@ public:
 
     // Read all annotations across the whole document.
     QList<AnnotInfo> loadAll(int pageCount);
+
+    // Stream annotations page-by-page, emitting pageAnnotsLoaded per non-empty page.
+    void loadAllStreaming(int pageCount, int startPage = 0);
+
+    // Read annotations as overlay visuals for one page.
+    QList<AnnotVisual> loadPageVisuals(int page, bool* outOverlayCapable);
 
     // Create a sticky-note annotation (FPDF_ANNOT_TEXT) at a point on the page.
     // Saves the document to disk.
@@ -68,8 +97,10 @@ public:
 
     bool removeAnnot(int pageIndex, int index);
     int removeNotePageObjects(int pageIndex, unsigned int noteId);
-    bool setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill);
+    bool setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill, int fillAlpha = 255);
     bool rebuildTextNote(int pageIndex, int index, QColor newColor, float newFontSize);
+    int findAnnotIndexByUid(int pageIndex, const QString& uid);
+    QString generateUid();
     bool moveNote(int pageIndex, int index, double dxDisp, double dyDisp);
 
     AnnotSnapshot snapshotAnnot(int pageIndex, int index);
@@ -77,16 +108,23 @@ public:
 
     // Read-back for Properties dialog. Returns false if annot does not exist.
     bool getAnnotEditState(int pageIndex, int index, QString& outType,
-                           QColor& outColor, float& outWidth, float& outFontSize);
+                           QColor& outColor, float& outWidth, float& outFontSize,
+                           bool* outHasFill = nullptr, int* outFillAlpha = nullptr);
 
     bool createSignatureDraft(int pageIndex, QRectF rectPt, const QString& text);
     QRectF findSignatureDraftRect(int pageIndex, int* outIndex);
 
+    // Generate content for a single page (called just before save from deferred set).
+    void generateContentForPage(int page);
+
     bool saveDocument();
     QString lastError() const { return m_lastError; }
+    QString lastCreatedUid() const { return m_lastCreatedUid; }
 
 signals:
     void annotationAdded(int pageIndex, AnnotInfo info);
+    void pageAnnotsLoaded(int pageIndex, QList<AnnotInfo> annots);
+    void scanProgress(int pagesScanned, int totalPages);
 
 private:
 
@@ -94,4 +132,5 @@ private:
     QString       m_path;
     QString       m_lastError;
     unsigned int  m_nextNoteId = 1;
+    QString m_lastCreatedUid;
 };

@@ -8,7 +8,6 @@
 #include <QUrl>
 #include <QApplication>
 #include <QPixmap>
-#include <QTimer>
 #include <QDebug>
 
 GateDialog::GateDialog(const QString& title, const QString& body,
@@ -19,8 +18,8 @@ GateDialog::GateDialog(const QString& title, const QString& body,
     setModal(true);
     resize(460, 300);
     setMinimumSize(460, 300);
-    // Remove close button (X) from title bar in ALL cases
-    setWindowFlags(windowFlags() & ~Qt::WindowCloseButtonHint);
+    if (blocking)
+        setWindowFlags(windowFlags() & ~Qt::WindowCloseButtonHint);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 20, 20, 20);
@@ -43,18 +42,16 @@ GateDialog::GateDialog(const QString& title, const QString& body,
 
     // ── Body text ─────────────────────────────────────────────────────────
     QString displayBody = body.isEmpty()
-        ? "A new version is available.\nPlease download the latest version."
+        ? "A new version is available.<br>Please download from "
+          "<a href=\"https://torreader.cloud\">torreader.cloud</a>."
         : body;
     auto* bodyLbl = new QLabel(displayBody, this);
     bodyLbl->setWordWrap(true);
+    bodyLbl->setTextFormat(Qt::RichText);
+    bodyLbl->setOpenExternalLinks(true);
+    bodyLbl->setTextInteractionFlags(Qt::TextBrowserInteraction);
     bodyLbl->setStyleSheet("font-size:10pt;");
     root->addWidget(bodyLbl);
-
-    // ── Countdown label ───────────────────────────────────────────────────
-    m_countdownLbl = new QLabel(this);
-    m_countdownLbl->setAlignment(Qt::AlignCenter);
-    m_countdownLbl->setStyleSheet("font-size:10pt; color:#888;");
-    root->addWidget(m_countdownLbl);
 
     root->addStretch();
 
@@ -71,59 +68,39 @@ GateDialog::GateDialog(const QString& title, const QString& body,
     });
     btnRow->addWidget(downloadBtn);
 
-    // Exit button (blocking only, hidden until countdown finishes)
-    m_exitBtn = new QPushButton("Exit", this);
-    m_exitBtn->setVisible(false);
-    connect(m_exitBtn, &QPushButton::clicked, this, [this]() {
-        qDebug() << "[gate] blocking exit";
-        qApp->quit();
-    });
-    btnRow->addWidget(m_exitBtn);
+    if (blocking) {
+        m_exitBtn = new QPushButton("Exit", this);
+        connect(m_exitBtn, &QPushButton::clicked, this, [this]() {
+            qDebug() << "[gate] blocking exit";
+            qApp->quit();
+        });
+        btnRow->addWidget(m_exitBtn);
+    } else {
+        auto* closeBtn = new QPushButton("Close", this);
+        connect(closeBtn, &QPushButton::clicked, this, [this]() {
+            accept();
+        });
+        btnRow->addWidget(closeBtn);
+    }
 
     root->addLayout(btnRow);
 
-    // ── Countdown timer ───────────────────────────────────────────────────
-    m_secondsLeft = 10;
-    m_countdownLbl->setText(
-        QString("This window will close in %1 seconds…").arg(m_secondsLeft));
-    m_countdownTimer = new QTimer(this);
-    m_countdownTimer->setInterval(1000);
-    connect(m_countdownTimer, &QTimer::timeout, this, &GateDialog::onTick);
-    m_countdownTimer->start();
-
-    qDebug() << "[gate] auto-close countdown started" << m_secondsLeft << "s";
     qDebug() << "[gate] dialog created blocking=" << (blocking ? 1 : 0);
 }
 
-void GateDialog::onTick() {
-    --m_secondsLeft;
-    if (m_secondsLeft > 0) {
-        if (m_blocking)
-            m_countdownLbl->setText(
-                QString("Auto-close disabled — this window will close in %1 seconds…").arg(m_secondsLeft));
-        else
-            m_countdownLbl->setText(
-                QString("This window will close in %1 seconds…").arg(m_secondsLeft));
-        return;
-    }
-
-    m_countdownTimer->stop();
-    qDebug() << "[gate] auto-closed after countdown";
-
-    if (m_blocking) {
-        m_countdownLbl->setText("Please download the new version or exit the application.");
-        m_exitBtn->setVisible(true);
-        qDebug() << "[gate] blocking — showing Exit button, waiting for user";
-    } else {
-        accept();
-    }
-}
-
 void GateDialog::closeEvent(QCloseEvent* e) {
-    qDebug() << "[gate] closeEvent ignored (blocking=" << (m_blocking ? 1 : 0) << ")";
-    e->ignore();
+    if (m_blocking) {
+        qDebug() << "[gate] closeEvent ignored (blocking)";
+        e->ignore();
+    } else {
+        e->accept();
+    }
 }
 
 void GateDialog::reject() {
-    qDebug() << "[gate] Esc pressed — ignored (blocking=" << (m_blocking ? 1 : 0) << ")";
+    if (m_blocking) {
+        qDebug() << "[gate] Esc pressed — ignored (blocking)";
+    } else {
+        QDialog::reject();
+    }
 }

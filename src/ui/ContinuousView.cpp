@@ -1,6 +1,7 @@
 #include "ContinuousView.h"
 #include "../core/PdfDocument.h"
 #include "../core/PdfRenderer.h"
+#include "../annotations/AnnotationManager.h"
 
 #include <QPainter>
 #include <QScrollBar>
@@ -74,6 +75,43 @@ ContinuousView::ContinuousView(QWidget* parent)
         m_renderer->requestPageForContinuous(m_primaryPage, m_zoom);
         m_primaryRequested = true;
     });
+
+    // Sharp-region timer: debounced 180ms, requests crisp overlay for the primary
+    // page when zoom is high enough that the base page image is being upscaled.
+    m_sharpTimer = new QTimer(this);
+    m_sharpTimer->setSingleShot(true);
+    m_sharpTimer->setInterval(180);
+    connect(m_sharpTimer, &QTimer::timeout, this, [this]() {
+        if (!m_renderer || m_pageCount == 0 || m_primaryPage < 0) {
+            qDebug() << "[perf] cont sharp request SKIP reason=noPrimaryPage";
+            return;
+        }
+        const double longSidePx = qMax(m_pageSizePt[m_primaryPage].width(), m_pageSizePt[m_primaryPage].height()) * m_zoom;
+        if (longSidePx <= PdfRenderer::kFullRenderMaxPx * 1.02) {
+            m_sharpPage = -1;
+            m_sharpPixmap = {};
+            qDebug() << "[perf] cont sharp request SKIP reason=lowZoom longSidePx=" << longSidePx;
+            return;
+        }
+        int scrollX = horizontalScrollBar()->value();
+        int scrollY = verticalScrollBar()->value();
+        int vpW = viewport()->width();
+        int vpH = viewport()->height();
+        int pg = m_primaryPage;
+        int pL = pageLeftX(pg);
+        int pT = pageTopY(pg);
+        int visL = qMax(scrollX, pL);
+        int visT = qMax(scrollY, pT);
+        int visR = qMin(scrollX + vpW, pL + pageW(pg));
+        int visB = qMin(scrollY + vpH, pT + pageH(pg));
+        if (visR <= visL || visB <= visT) {
+            qDebug() << "[perf] cont sharp request SKIP reason=emptyRegion";
+            return;
+        }
+        QRect regionPx(visL - pL, visT - pT, visR - visL, visB - visT);
+        qDebug() << "[perf] cont sharp request page=" << pg << "scale=" << m_zoom << "region=" << regionPx;
+        emit regionNeeded(pg, m_zoom, regionPx);
+    });
 }
 
 ContinuousView::~ContinuousView() = default;
@@ -90,6 +128,7 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
     if (m_renderer) {
         disconnect(m_continuousPageReadyConn);
         disconnect(m_regionReadyConn);
+        disconnect(m_regionNeededConn);
     }
 
     // Guard: same doc+renderer → keep m_pageImages, just reconnect signals & refresh
@@ -154,16 +193,22 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
                 m_sharpPixmap = QPixmap::fromImage(img);
                 viewport()->update();
             });
+        m_regionNeededConn = connect(this, &ContinuousView::regionNeeded,
+                                     m_renderer, &PdfRenderer::requestRegion);
+        m_sharpPage = -1;
+        m_sharpPixmap = {};
         requestVisiblePages();
         viewport()->update();
         return;
     }
 
     m_sharpPage = -1;
+    m_sharpPixmap = {};
     m_doc      = doc;
     m_renderer = renderer;
     m_pageImages.clear();
     m_pageImageZoom.clear();
+    m_pageAnnotVisuals.clear();
     m_continuousRequested.clear();
     m_lastEmittedPage = -1;
 
@@ -237,6 +282,9 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
                 m_sharpPixmap = QPixmap::fromImage(img);
                 viewport()->update();
             });
+
+        m_regionNeededConn = connect(this, &ContinuousView::regionNeeded,
+                                     m_renderer, &PdfRenderer::requestRegion);
     }
 
     rebuildLayout();
@@ -277,6 +325,7 @@ void ContinuousView::setZoom(double scale)
     verticalScrollBar()->setValue(newScrollY);
 
     m_sharpPage = -1;
+    m_sharpPixmap = {};
     m_primaryPage = -1;
     m_lastRequestZoom = -1.0;
     m_primaryRequested = false;
@@ -286,6 +335,7 @@ void ContinuousView::setZoom(double scale)
     m_cacheProbed.clear();
     viewport()->update();
     m_zoomTimer->start();
+    m_sharpTimer->start();
 }
 
 void ContinuousView::setDarkMode(bool dark)
@@ -544,10 +594,31 @@ void ContinuousView::clearSelectedAnnotRect() {
     viewport()->update();
 }
 
+void ContinuousView::setHighlights(int page, const QList<QRectF>& rects, int currentIdx) {
+    m_highlightPage = page;
+    m_highlights = rects;
+    m_highlightCurrentIdx = currentIdx;
+    qDebug().noquote() << QString("[find] paint highlights page=%1 n=%2").arg(page).arg(rects.size());
+    viewport()->update();
+}
+
+void ContinuousView::clearHighlights() {
+    m_highlightPage = -1;
+    m_highlights.clear();
+    m_highlightCurrentIdx = -1;
+    viewport()->update();
+}
+
+void ContinuousView::setAnnotVisualsForPage(int page, const QList<AnnotVisual>& visuals) {
+    m_pageAnnotVisuals[page] = visuals;
+    viewport()->update();
+}
+
 void ContinuousView::invalidatePage(int pageIndex) {
     m_pageImages.remove(pageIndex);
     m_pageImageZoom.remove(pageIndex);
     m_continuousRequested.remove(pageIndex);
+    m_pageAnnotVisuals.remove(pageIndex);
     qDebug() << "[markup] invalidatePage page=" << pageIndex;
 }
 
@@ -558,6 +629,7 @@ void ContinuousView::scrollContentsBy(int /*dx*/, int /*dy*/)
     viewport()->update();
     requestVisiblePages();
     m_scrollTimer->start();
+    m_sharpTimer->start();
 }
 
 void ContinuousView::resizeEvent(QResizeEvent* event)
@@ -565,6 +637,7 @@ void ContinuousView::resizeEvent(QResizeEvent* event)
     QAbstractScrollArea::resizeEvent(event);
     updateScrollBars();
     requestVisiblePages();
+    m_sharpTimer->start();
 }
 
 // ── Paint ─────────────────────────────────────────────────────────────────────
@@ -632,6 +705,124 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
         }
     }
 
+    // Search highlights (display coords per page)
+    if (!m_highlights.isEmpty() && m_highlightPage >= 0 && m_highlightPage < m_pageCount) {
+        int pg = m_highlightPage;
+        for (int hi = 0; hi < m_highlights.size(); ++hi) {
+            QRectF nr = m_highlights[hi].normalized();
+            if (nr.width() < 0.5 || nr.height() < 0.5) continue;
+            int vx = pageLeftX(pg) - horizontalScrollBar()->value();
+            int vy = pageTopY(pg) - verticalScrollBar()->value();
+            double pw = pageW(pg);
+            double ph = pageH(pg);
+            double pwPt = m_pageSizePt[pg].width();
+            double phPt = m_pageSizePt[pg].height();
+            double hx = vx + nr.x() / pwPt * pw;
+            double hy = vy + nr.y() / phPt * ph;
+            double hw = nr.width() / pwPt * pw;
+            double hh = nr.height() / phPt * ph;
+            if (hi == m_highlightCurrentIdx) {
+                p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 140, 0, 220));
+                p.setPen(QPen(QColor(200, 80, 0, 240), 2.0));
+                p.drawRect(QRectF(hx, hy, hw, hh));
+            } else {
+                p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 220, 0, 90));
+            }
+        }
+    }
+
+    // ── Annotation overlay visuals ────────────────────────────────────────────
+    if (!m_pageAnnotVisuals.isEmpty()) {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        for (int i = 0; i < m_pageCount; ++i) {
+            auto vit = m_pageAnnotVisuals.constFind(i);
+            if (vit == m_pageAnnotVisuals.constEnd() || vit->isEmpty()) continue;
+
+            int vx = pageLeftX(i) - scrollX;
+            int vy = pageTopY(i) - scrollY;
+
+            for (const AnnotVisual& av : *vit) {
+                // FreeText/Note are page objects in the renderer — overlay skips them to avoid double-draw
+                if (!av.paintByOverlay) continue;
+                QPointF dOrig(vx + av.rect.x() * m_zoom, vy + av.rect.y() * m_zoom);
+                QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
+                QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
+                p.setPen(strokePen);
+                p.setBrush(av.fill.isValid() && av.fill.alpha() > 0 ? QBrush(av.fill) : Qt::NoBrush);
+
+                switch (av.subtype) {
+                    case FPDF_ANNOT_INK: {
+                        for (const auto& stroke : av.ink) {
+                            if (stroke.size() < 2) continue;
+                            QPolygonF poly;
+                            for (const QPointF& pt : stroke)
+                                poly << QPointF(vx + pt.x() * m_zoom, vy + pt.y() * m_zoom);
+                            p.setBrush(Qt::NoBrush);
+                            p.drawPolyline(poly);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_SQUARE:
+                        p.drawRect(dRect);
+                        break;
+                    case FPDF_ANNOT_CIRCLE:
+                        p.drawEllipse(dRect);
+                        break;
+                    case FPDF_ANNOT_HIGHLIGHT: {
+                        if (!av.quads.isEmpty()) {
+                            p.setBrush(QColor(255, 255, 0, 90));
+                            p.setPen(Qt::NoPen);
+                            for (const QRectF& qr : av.quads) {
+                                QPointF qo(vx + qr.x() * m_zoom, vy + qr.y() * m_zoom);
+                                p.drawRect(QRectF(qo, QSizeF(qr.width() * m_zoom, qr.height() * m_zoom)));
+                            }
+                        } else {
+                            p.setBrush(QColor(255, 255, 0, 90));
+                            p.setPen(Qt::NoPen);
+                            p.drawRect(dRect);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_LINE: {
+                        QPointF lA(vx + av.rect.left() * m_zoom, vy + av.rect.top() * m_zoom);
+                        QPointF lB(vx + av.rect.right() * m_zoom, vy + av.rect.bottom() * m_zoom);
+                        p.drawLine(lA, lB);
+                        break;
+                    }
+                    case FPDF_ANNOT_POLYGON: {
+                        if (!av.ink.isEmpty() && av.ink[0].size() >= 3) {
+                            QPolygonF poly;
+                            for (const QPointF& pt : av.ink[0])
+                                poly << QPointF(vx + pt.x() * m_zoom, vy + pt.y() * m_zoom);
+                            p.drawPolygon(poly);
+                        }
+                        break;
+                    }
+                    case FPDF_ANNOT_FREETEXT: {
+                        double fs = qMax(6.0, av.fontSize * m_zoom);
+                        QFont ft = p.font();
+                        ft.setPointSizeF(fs);
+                        p.setFont(ft);
+                        p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
+                        p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
+                        break;
+                    }
+                    case FPDF_ANNOT_TEXT: {
+                        QRectF badge(dRect.center().x() - 14, dRect.center().y() - 14, 28, 28);
+                        p.setBrush(QColor(245, 158, 11, 220));
+                        p.setPen(QColor(180, 100, 0, 200));
+                        p.drawRoundedRect(badge, 6, 6);
+                        p.setPen(Qt::white);
+                        QFont fnt = p.font(); fnt.setPointSize(10); fnt.setBold(true); p.setFont(fnt);
+                        p.drawText(badge, Qt::AlignCenter, "N");
+                        break;
+                    }
+                    default: break;
+                }
+            }
+        }
+    }
+
     // Draw Alt+drag selection rect on top of all pages
     if (m_selecting || m_selStart != m_selEnd)
         drawSelection(p);
@@ -672,6 +863,7 @@ void ContinuousView::wheelEvent(QWheelEvent* event)
         verticalScrollBar()->setValue(newScrollY);
 
         m_sharpPage = -1;
+        m_sharpPixmap = {};
         m_primaryPage = -1;
         m_lastRequestZoom = -1.0;
         m_primaryRequested = false;
@@ -680,6 +872,7 @@ void ContinuousView::wheelEvent(QWheelEvent* event)
         m_cacheProbed.clear();
         viewport()->update();
         m_zoomTimer->start();
+        m_sharpTimer->start();
         event->accept();
     } else {
         // Normal scroll — let QAbstractScrollArea handle it (moves scrollbars)

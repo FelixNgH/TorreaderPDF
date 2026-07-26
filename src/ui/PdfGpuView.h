@@ -16,9 +16,11 @@
 #include <QHash>
 #include <QSet>
 #include <QPair>
+#include <QVector>
 #include <QKeyEvent>
 
 #include "annotations/AnnotationTypes.h"
+#include "annotations/AnnotationManager.h"
 
 // GPU-accelerated PDF page viewer with viewport tiling.
 // Renders the page as a low-res full-page background texture plus a grid of
@@ -26,13 +28,22 @@
 class PdfGpuView : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
-    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText };
+    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText, Freehand, Highlight };
     enum class ViewMode { Single, Double };
 
     struct AnnotOverlay {
         int     pageIndex;
         QRectF  pdfRect;
         QString snippet;
+    };
+
+    struct PendingMarkup {
+        AnnotTool tool;
+        QColor    color;
+        float     width;
+        QColor    fill;
+        QPointF   a, b;
+        QVector<QPointF> freehand;
     };
 
     explicit PdfGpuView(QWidget* parent = nullptr);
@@ -53,14 +64,23 @@ public:
     void setTool(ViewTool tool);
     void beginSignaturePick();
     void setHighlights(const QList<QRectF>& rects);
+    void setHighlights(const QList<QRectF>& all, int currentIdx);
     void clearHighlights();
     void setAnnotOverlays(const QList<AnnotOverlay>& overlays);
     void clearAnnotOverlays();
+    void setAnnotVisuals(const QList<AnnotVisual>& visuals);
+    void clearAnnotVisuals();
+    void addPendingMarkup(AnnotTool tool, const AnnotStyle& style, QPointF a, QPointF b, const QVector<QPointF>& freehand = {});
     void setSelectedAnnot(const QRectF& rectPdf);
     void clearSelectedAnnot();
 
     // Insert or update a tile in the current view.
     void setTile(int page, double scale, int col, int row, const QImage& img);
+
+    // Accept a sharp region overlay rendered at true zoom (reuses PdfRenderer::requestRegion path).
+    void setRegion(int page, double scale, QRect regionPx, const QImage& img);
+    void invalidateSharp();
+    void invalidateTiles();
 
     // Show a blurred placeholder (thumbnail) while the full render loads.
     void setPlaceholder(const QImage& img);
@@ -74,6 +94,7 @@ public:
     QPointF widgetToPdf(const QPointF& wp) const;
     QPointF pdfToWidget(const QPointF& pp) const;
     QRectF  pdfRectToWidget(const QRectF& r) const;
+    void    centerOnPageRect(const QRectF& rectDisp);
 
 signals:
     void zoomChanged(double scale);
@@ -87,6 +108,7 @@ signals:
     void annotationContextRequested(int pageIndex, QPointF pdfPoint, QPoint globalPos);
     void annotationMoveRequested(int pageIndex, double dx, double dy);
     void signatureRectPicked(int pageIndex, QRectF rectPt);
+    void freehandCommitRequested(int pageIndex, const QVector<QPointF>& points);
     // Emitted after debounce (~120ms) when pan/zoom changes the visible region.
     void tilesNeeded(int page, double scale, QRect viewportPx);
 
@@ -164,14 +186,22 @@ private:
     QPointF m_dragStart;
     QRectF  m_dragOrigRect;
 
+    // Freehand drawing
+    bool    m_drawingFreehand = false;
+    QVector<QPointF> m_freehandPoints;
+    QPointF m_freehandLastWidgetPt;
+
     // ponytail: most recent partial skipped during pan — flushed on pan-end
     QImage  m_pendingPartImg;
     double  m_pendingPartScale = 0.0;
     int     m_pendingPartPage  = -1;
 
     // Overlays (drawn via QPainter on top of GL)
+    QList<AnnotVisual>      m_annotVisuals;
     QList<QRectF>           m_highlights;
+    int                     m_currentHighlightIdx = -1;
     QList<AnnotOverlay>     m_annotOverlays;
+    QVector<PendingMarkup>  m_pendingMarkups;
 
     QTimer* m_zoomTimer     = nullptr;
 
@@ -181,5 +211,9 @@ private:
     QHash<QPair<int,int>, QImage> m_tiles;
     int     m_tilePage     = -1;
     double  m_tileScale    = 0.0;
+    int     m_sharpPage    = -1;
+    double  m_sharpScale   = 0.0;
+    QRect   m_sharpRegion;
+    QImage  m_sharpImage;
     void requestTiles();
 };

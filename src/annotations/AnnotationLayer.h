@@ -16,6 +16,7 @@ public:
     void setAnnotationManager(AnnotationManager* mgr) { m_annotMgr = mgr; }
     void commitAnnotation(int pageIndex, AnnotTool tool, const AnnotStyle& style,
                           QPointF start, QPointF end, const QVector<QPointF>& freehand);
+    QString lastCreatedUid() const { return m_lastCreatedUid; }
 
 signals:
     void annotationAdded(int pageIndex);
@@ -23,4 +24,5 @@ signals:
 private:
     FPDF_DOCUMENT m_doc = nullptr;
     AnnotationManager* m_annotMgr = nullptr;
+    QString m_lastCreatedUid;
 };

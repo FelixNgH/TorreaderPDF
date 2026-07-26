@@ -5,7 +5,6 @@
 class QWidget;
 class QLabel;
 class QPushButton;
-class QTimer;
 
 class GateDialog : public QDialog {
     Q_OBJECT
@@ -18,11 +17,6 @@ protected:
     void reject() override;
 
 private:
-    void onTick();
-
-    QLabel* m_countdownLbl = nullptr;
     QPushButton* m_exitBtn = nullptr;
-    QTimer* m_countdownTimer = nullptr;
-    int m_secondsLeft = 10;
     bool m_blocking;
 };

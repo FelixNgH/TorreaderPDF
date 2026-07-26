@@ -1,35 +1,51 @@
 #include "AnnotationLayer.h"
 #include "AnnotationManager.h"
+#include "../core/PdfCoords.h"
 #include <fpdf_edit.h>
+#include <fpdf_text.h>
 #include <QString>
 #include <QMutex>
+#include <QMap>
 #include <cmath>
 #include <vector>
 #include <cstdio>
 
 extern QMutex s_pdfiumMutex;
 
-// ── Rotation-aware point transform ─────────────────────────────────────────────
-// (xd, yd) = display coordinates (Y down from top of DISPLAYED page)
-// (Wd, Hd) = display size = FPDF_GetPageWidth/Height
-// returns  (xu, yu) = unrotated PDF space (Y up from bottom)
-static QPointF dispToPdf(double xd, double yd, double Wd, double Hd, int rot) {
-    switch (rot) {
-        case 1:  return { yd,       xd };
-        case 2:  return { Wd - xd,  yd };
-        case 3:  return { Hd - yd,  Wd - xd };
-        default: return { xd,       Hd - yd };   // 0
-    }
-}
-
 AnnotationLayer::AnnotationLayer(QObject* parent) : QObject(parent) {}
 
 void AnnotationLayer::setDocument(FPDF_DOCUMENT doc) { m_doc = doc; }
 
+static const char* toolName(AnnotTool t) {
+    switch (t) {
+        case AnnotTool::Line:         return "Line";
+        case AnnotTool::Arrow:        return "Arrow";
+        case AnnotTool::Freehand:     return "Freehand";
+        case AnnotTool::Cloud:        return "Cloud";
+        case AnnotTool::Highlight:    return "Highlight";
+        case AnnotTool::Rectangle:    return "Rectangle";
+        case AnnotTool::Ellipse:      return "Ellipse";
+        case AnnotTool::Underline:    return "Underline";
+        case AnnotTool::Strikethrough:return "Strikethrough";
+        case AnnotTool::TextComment:  return "Note";
+        default:                      return "Annotation";
+    }
+}
+
 void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const AnnotStyle& style,
                                        QPointF start, QPointF end,
-                                       const QVector<QPointF>& /*freehand*/) {
+                                       const QVector<QPointF>& freehand) {
     if (!m_doc) return;
+
+    auto setUid = [&](FPDF_ANNOTATION a) {
+        if (!m_annotMgr) return;
+        m_lastCreatedUid = m_annotMgr->generateUid();
+        FPDFAnnot_SetStringValue(a, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
+    };
+    auto setTool = [&](FPDF_ANNOTATION a) {
+        QString tn = QString::fromLatin1(toolName(tool));
+        FPDFAnnot_SetStringValue(a, "TRTOOL", reinterpret_cast<FPDF_WIDESTRING>(tn.utf16()));
+    };
 
     QMutexLocker lock(&s_pdfiumMutex);
     FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
@@ -81,8 +97,45 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
             FPDFAnnot_SetStringValue(ink, "TRC", reinterpret_cast<FPDF_WIDESTRING>(trc.utf16()));
         }
         FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
+        setUid(ink);
+        setTool(ink);
         FPDFPage_CloseAnnot(ink);
-        FPDFPage_GenerateContent(page);
+        FPDF_ClosePage(page);
+        lock.unlock();
+        emit annotationAdded(pageIndex);
+        return;
+    }
+
+    // Freehand → INK annotation from collected points
+    if (tool == AnnotTool::Freehand) {
+        FPDF_ANNOTATION ink = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
+        if (!ink) { FPDF_ClosePage(page); return; }
+        int n = freehand.size();
+        if (n == 0) { FPDFPage_CloseAnnot(ink); FPDF_ClosePage(page); return; }
+        std::vector<FS_POINTF> pts(n);
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+        for (int i = 0; i < n; ++i) {
+            QPointF p = dispToPdf(freehand[i].x(), freehand[i].y(), pageW, pageH, rot);
+            pts[i] = { static_cast<float>(p.x()), static_cast<float>(p.y()) };
+            x0 = qMin(x0, pts[i].x); x1 = qMax(x1, pts[i].x);
+            y0 = qMin(y0, pts[i].y); y1 = qMax(y1, pts[i].y);
+        }
+        FPDFAnnot_AddInkStroke(ink, pts.data(), n);
+        FS_RECTF rr{ x0 - 3, y1 + 3, x1 + 3, y0 - 3 };
+        FPDFAnnot_SetRect(ink, &rr);
+        unsigned int ir = style.strokeColor.red();
+        unsigned int ig = style.strokeColor.green();
+        unsigned int ib = style.strokeColor.blue();
+        unsigned int ia = static_cast<unsigned int>(style.opacity * 255);
+        FPDFAnnot_SetColor(ink, FPDFANNOT_COLORTYPE_Color, ir, ig, ib, ia);
+        {
+            QString trc = QString("%1,%2,%3").arg(ir).arg(ig).arg(ib);
+            FPDFAnnot_SetStringValue(ink, "TRC", reinterpret_cast<FPDF_WIDESTRING>(trc.utf16()));
+        }
+        FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
+        setUid(ink);
+        setTool(ink);
+        FPDFPage_CloseAnnot(ink);
         FPDF_ClosePage(page);
         lock.unlock();
         emit annotationAdded(pageIndex);
@@ -137,8 +190,93 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
             FPDFAnnot_SetStringValue(ck, "TRC", reinterpret_cast<FPDF_WIDESTRING>(trc.utf16()));
         }
         FPDFAnnot_SetBorder(ck, 0.0f, 0.0f, style.strokeWidth);
+        setUid(ck);
+        setTool(ck);
         FPDFPage_CloseAnnot(ck);
-        FPDFPage_GenerateContent(page);
+        FPDF_ClosePage(page);
+        lock.unlock();
+        emit annotationAdded(pageIndex);
+        return;
+    }
+
+    // Highlight with text-bound QuadPoints (fallback to rect if no text)
+    if (tool == AnnotTool::Highlight) {
+        FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_HIGHLIGHT);
+        if (!annot) { FPDF_ClosePage(page); return; }
+
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        float l = static_cast<float>(qMin(pa.x(), pb.x()));
+        float b = static_cast<float>(qMin(pa.y(), pb.y()));
+        float r = static_cast<float>(qMax(pa.x(), pb.x()));
+        float t = static_cast<float>(qMax(pa.y(), pb.y()));
+
+        FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+        bool hasQuads = false;
+        if (textPage) {
+            int charCount = FPDFText_CountChars(textPage);
+            QMap<double, QVector<int>> lineChars;
+            for (int i = 0; i < charCount; ++i) {
+                double cl, ct, cr, cb;
+                FPDFText_GetCharBox(textPage, i, &cl, &cr, &cb, &ct);
+                if (cl < r && cr > l && ct < t && cb > b) {
+                    double key = std::round((ct + cb) / 10.0) * 10.0;
+                    lineChars[key].append(i);
+                }
+            }
+            if (!lineChars.isEmpty()) {
+                hasQuads = true;
+                float ql = l, qr = r, qt = t, qb = b;
+                for (auto it = lineChars.constBegin(); it != lineChars.constEnd(); ++it) {
+                    const auto& chars = it.value();
+                    if (chars.isEmpty()) continue;
+                    double ll = 1e9, lr = -1e9, lt = 1e9, lb = -1e9;
+                    for (int idx : chars) {
+                        double cl, ct, cr, cb;
+                        FPDFText_GetCharBox(textPage, idx, &cl, &cr, &cb, &ct);
+                        ll = qMin(ll, cl); lr = qMax(lr, cr);
+                        lt = qMin(lt, ct); lb = qMax(lb, cb);
+                    }
+                    FS_QUADPOINTSF qp;
+                    qp.x1 = static_cast<float>(ll); qp.y1 = static_cast<float>(lt);
+                    qp.x2 = static_cast<float>(lr); qp.y2 = static_cast<float>(lt);
+                    qp.x3 = static_cast<float>(ll); qp.y3 = static_cast<float>(lb);
+                    qp.x4 = static_cast<float>(lr); qp.y4 = static_cast<float>(lb);
+                    FPDFAnnot_AppendAttachmentPoints(annot, &qp);
+                    ql = qMin(ql, static_cast<float>(ll)); qr = qMax(qr, static_cast<float>(lr));
+                    qt = qMin(qt, static_cast<float>(lt)); qb = qMax(qb, static_cast<float>(lb));
+                }
+                l = ql; r = qr; t = qt; b = qb;
+            }
+            FPDFText_ClosePage(textPage);
+        }
+
+        // ponytail: guard against degenerate rect — min 6pt height, skip if near-zero area
+        float rw = r - l, rh = t - b;
+        if (rw < 1.0f && rh < 1.0f) {
+            FPDFText_ClosePage(textPage);
+            FPDFPage_CloseAnnot(annot);
+            FPDF_ClosePage(page);
+            lock.unlock();
+            return;
+        }
+        if (rh < 6.0f) { float pad = (6.0f - rh) / 2.0f; b -= pad; t += pad; }
+        if (rw < 6.0f) { float pad = (6.0f - rw) / 2.0f; l -= pad; r += pad; }
+        FS_RECTF rect{ l, b, r, t };
+        FPDFAnnot_SetRect(annot, &rect);
+        unsigned int cr = style.strokeColor.red();
+        unsigned int cg = style.strokeColor.green();
+        unsigned int cb = style.strokeColor.blue();
+        if (cr == 255 && cg == 0 && cb == 0) { cr = 255; cg = 255; cb = 0; }
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, cr, cg, cb,
+                           static_cast<unsigned int>(style.opacity * 255));
+        {
+            QString trc = QString("%1,%2,%3").arg(cr).arg(cg).arg(cb);
+            FPDFAnnot_SetStringValue(annot, "TRC", reinterpret_cast<FPDF_WIDESTRING>(trc.utf16()));
+        }
+        setUid(annot);
+        setTool(annot);
+        FPDFPage_CloseAnnot(annot);
         FPDF_ClosePage(page);
         lock.unlock();
         emit annotationAdded(pageIndex);
@@ -151,7 +289,6 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         case AnnotTool::Rectangle:     subtype = FPDF_ANNOT_SQUARE;    break;
         case AnnotTool::Ellipse:       subtype = FPDF_ANNOT_CIRCLE;    break;
         case AnnotTool::TextComment:   subtype = FPDF_ANNOT_TEXT;      break;
-        case AnnotTool::Highlight:     subtype = FPDF_ANNOT_HIGHLIGHT; break;
         case AnnotTool::Underline:     subtype = FPDF_ANNOT_UNDERLINE; break;
         case AnnotTool::Strikethrough: subtype = FPDF_ANNOT_STRIKEOUT; break;
         case AnnotTool::FreeText:
@@ -201,8 +338,9 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
             reinterpret_cast<FPDF_WIDESTRING>(kNewComment));
     }
 
-    FPDFPage_CloseAnnot(annot);         // must close annot before generating content
-    FPDFPage_GenerateContent(page);
+    setUid(annot);
+    setTool(annot);
+    FPDFPage_CloseAnnot(annot);
     FPDF_ClosePage(page);
     lock.unlock();
 

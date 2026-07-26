@@ -28,6 +28,7 @@ class TranslationPopup;
 class GoogleAuth;
 class UpdateChecker;
 class QTimer;
+class FindBar;
 
 struct DocTab {
     std::unique_ptr<PdfDocument>       doc;
@@ -43,6 +44,10 @@ struct DocTab {
     QMetaObject::Connection scrollConn;
     QList<AnnotInfo> annotCache;
     bool     annotCacheValid = false;
+    bool     annotScanInFlight = false;  // guards concurrent full annot scans
+    QHash<int, QList<AnnotInfo>> annotPageCache;
+    QHash<int, bool> overlayCapablePage;   // cached per-page overlay capability
+    QSet<int>        pagesNeedGenerate;     // pages needing FPDFPage_GenerateContent before save
     QString  originalPath;        // real on-disk file — Save target & tab name source
     bool     dirty = false;       // has unsaved in-memory edits (working copy != original)
 };
@@ -72,6 +77,7 @@ private slots:
     void onTabChanged(int idx);
     void onTabClose(int idx);
     void onPageChanged(int pageIndex);
+    void onCommentActivated(int pageIndex, int annotIndex);
     void onZoomChanged(double scale);
     void onTextRegionSelected(int pageIdx, QRectF rectPts, QPoint globalPos);
 
@@ -88,6 +94,7 @@ private:
     void onFinalizeSignature();
     void onCancelSignature();
     void onCommentsRequested();
+    void refreshCommentsForPage(DocTab* t, int page);
 
     SignParams m_pendSp;
     int  m_pendPage = -1;
@@ -109,6 +116,7 @@ private:
 
     std::unique_ptr<PdfEditor>  m_editor;
     TextSearch*                 m_textSearch    = nullptr;
+    FindBar*                    m_findBar       = nullptr;
 
     // Translation feature
     Translator*        m_translator  = nullptr;
@@ -121,24 +129,6 @@ private:
     int m_selIdx  = -1;
     AnnotStyle m_annotStyle;
 
-    struct DrawAction {
-        enum Kind { Add, Delete, Move, NoteMove };
-        Kind kind = Add;
-        int        page = 0;
-        bool       isText = false;
-        AnnotTool  tool = AnnotTool::Line;
-        AnnotStyle style;
-        QPointF    a, b;
-        QString    text, author;
-        bool       textBg = true;
-        bool       isNote = false;
-        AnnotSnapshot snap;
-        AnnotSnapshot snapAfter;
-    };
-    QList<DrawAction> m_undoStack;
-    QList<DrawAction> m_redoStack;
-    void doUndo();
-    void doRedo();
     void deleteSelectedAnnot(int page, int index);
     void editSelectedAnnot(int page, int index);
     void showNotePopup(const QString& text, const QString& author);
@@ -154,8 +144,22 @@ private:
     // ── Markup helpers ───────────────────────────────────────────────────────
     void showAnnotOverlayImmediate(DocTab* tab, int pageIdx);
     void scheduleReRender(DocTab* tab, int pageIdx);
+    void refreshAnnotVisuals(DocTab* t, int page);
+    bool canFastPath(DocTab* t, int page) const;
+
+    const QList<AnnotInfo>& annotsForPage(DocTab* t, int page);
+    void invalidateAnnotPage(DocTab* t, int page);
+    // annotsForPage returns a reference into the cache — DO NOT retain it
+    // across any call that may invalidate the cache (invalidateAnnotPage,
+    // removeAnnot, refreshAnnotVisuals, refreshCommentsForPage, etc.).
     QTimer* m_markupTimer = nullptr;
     DocTab* m_markupTab   = nullptr;
     int     m_markupPage  = -1;
     bool    m_commentsVisible = false;
+
+    // ── Search state (shared between FindBar and SearchPanel) ─────────────
+    QList<SearchResult> m_searchResults;
+    int                 m_searchCurrentIdx = -1;
+    void applySearchHighlights(const QList<SearchResult>& results, int currentIdx);
+    void clearAllSearchHighlights();
 };

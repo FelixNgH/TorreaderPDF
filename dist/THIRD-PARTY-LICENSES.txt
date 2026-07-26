@@ -1,0 +1,149 @@
+================================================================================
+  TorReader PDF 2.2.4 — Third-Party Software Notices
+  Copyright (c) 2026 B&B Creations. Author: FelixNgH (Loc Nguyen Huy)
+================================================================================
+
+TorReader PDF is distributed with the third-party components listed below.
+Full license texts are in the accompanying "licenses" folder.
+
+--------------------------------------------------------------------------------
+1. Qt 6.8.3  —  GNU Lesser General Public License v3.0 (LGPL-3.0)
+--------------------------------------------------------------------------------
+Files shipped: Qt6Core.dll, Qt6Gui.dll, Qt6Widgets.dll, Qt6Network.dll,
+               Qt6OpenGL.dll, Qt6OpenGLWidgets.dll, Qt6PrintSupport.dll,
+               Qt6Svg.dll, and the Qt plugins in the "plugins"/"platforms"
+               folders (qwindows.dll, qgif.dll, qico.dll, qjpeg.dll, qsvg.dll,
+               qsvgicon.dll, qmodernwindowsstyle.dll, qcertonlybackend.dll,
+               qschannelbackend.dll, qnetworklistmanager.dll,
+               qtuiotouchplugin.dll)
+Copyright (c) The Qt Company Ltd. and other contributors.
+License text: licenses/lgpl-3.0.txt (and licenses/gpl-3.0.txt, referenced by it)
+Source code:  https://download.qt.io/official_releases/qt/6.8/6.8.3/single/
+
+IMPORTANT (LGPL-3.0 compliance):
+  * TorReader PDF uses Qt under the terms of the LGPL-3.0. TorReader PDF itself
+    is NOT covered by the LGPL.
+  * Qt is used via DYNAMIC LINKING ONLY (the .dll files listed above). Qt has
+    not been modified.
+  * You may replace the bundled Qt libraries with your own compatible build of
+    Qt: replace the corresponding .dll files in the application folder. This
+    satisfies the LGPL-3.0 requirement to allow relinking with a modified
+    version of the library.
+  * A copy of the complete corresponding Qt source code is available from the
+    URL above.
+
+--------------------------------------------------------------------------------
+2. PDFium  —  BSD 3-Clause License
+--------------------------------------------------------------------------------
+File shipped: pdfium.dll
+Copyright (c) 2014 The PDFium Authors. Copyright (c) 2006 The Chromium Authors.
+License text: licenses/pdfium-BSD-3-Clause.txt, licenses/pdfium.txt
+Binaries obtained from the bblanchon/pdfium-binaries distribution.
+
+PDFium itself bundles the following components; their license texts are
+included in the "licenses" folder:
+    Abseil (Apache-2.0) .................... licenses/abseil.txt
+    AGG 2.3 (permissive) ................... licenses/agg23.txt
+    fast_float (Apache-2.0/MIT/BSL-1.0) .... licenses/fast_float.txt
+    FreeType (FTL / GPLv2 dual) ............ licenses/freetype.txt
+    ICU (Unicode) .......................... licenses/icu.txt
+    Little-CMS (MIT) ....................... licenses/lcms.txt
+    libjpeg-turbo (IJG/BSD) ................ licenses/libjpeg_turbo.ijg,
+                                             licenses/libjpeg_turbo.md
+    OpenJPEG (BSD-2-Clause) ................ licenses/libopenjpeg.txt
+    libpng (PNG Reference Library) ......... licenses/libpng.txt
+    libtiff (BSD-like) ..................... licenses/libtiff.txt
+    llvm-libc (Apache-2.0 with exceptions) . licenses/llvm-libc.txt
+    simdutf (Apache-2.0/MIT) ............... licenses/simdutf.txt
+    zlib (zlib License) .................... licenses/zlib.txt
+
+--------------------------------------------------------------------------------
+3. QPDF  —  Apache License 2.0
+--------------------------------------------------------------------------------
+File shipped: qpdf30.dll
+Copyright (c) 2005-2021 Jay Berkenbilt, 2022-2025 Jay Berkenbilt and Manfred Holger.
+License text: licenses/apache-2.0.txt
+Source: https://github.com/qpdf/qpdf
+
+--------------------------------------------------------------------------------
+4. OpenSSL 3.x  —  Apache License 2.0
+--------------------------------------------------------------------------------
+File shipped: libcrypto-3-x64.dll
+Copyright (c) 1998-2025 The OpenSSL Project Authors.
+License text: licenses/apache-2.0.txt
+Source: https://github.com/openssl/openssl
+Used for: PKCS#7 digital signature creation and verification (Windows build).
+
+--------------------------------------------------------------------------------
+5. zlib  —  zlib License
+--------------------------------------------------------------------------------
+File shipped: z.dll
+Copyright (c) 1995-2024 Jean-loup Gailly and Mark Adler.
+License text: licenses/zlib.txt
+
+--------------------------------------------------------------------------------
+6. libjpeg-turbo  —  IJG / BSD-3-Clause
+--------------------------------------------------------------------------------
+File shipped: jpeg62.dll
+License text: licenses/libjpeg_turbo.ijg, licenses/libjpeg_turbo.md
+
+--------------------------------------------------------------------------------
+7. Mesa 3D "llvmpipe" software OpenGL  —  MIT License
+--------------------------------------------------------------------------------
+File shipped: opengl32sw.dll  (fallback software renderer, deployed by Qt)
+Copyright (c) Mesa 3D contributors.
+License: MIT — https://docs.mesa3d.org/license.html
+
+--------------------------------------------------------------------------------
+8. yaml-cpp  —  MIT License
+--------------------------------------------------------------------------------
+Statically linked.
+Copyright (c) 2008-2015 Jesse Beder.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the
+    rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+    sell copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+9. FormibPDF (in-house Rust engine) and its Rust dependencies
+--------------------------------------------------------------------------------
+FormibPDF is developed by B&B Creations and statically linked.
+It depends on the following crates (all dual-licensed MIT OR Apache-2.0 unless
+noted); license text for Apache-2.0 is in licenses/apache-2.0.txt:
+    rayon    (MIT OR Apache-2.0)
+    flate2   (MIT OR Apache-2.0)
+    fontdue  (MIT OR Apache-2.0)
+    image    (MIT OR Apache-2.0)
+    lcms2    (MIT) — Rust binding to Little-CMS (MIT, see licenses/lcms.txt)
+
+--------------------------------------------------------------------------------
+10. Google Fonts / icon assets
+--------------------------------------------------------------------------------
+Application icons and logo are original works of B&B Creations.
+No third-party font files are redistributed with the Windows build.
+
+================================================================================
+  Notes
+================================================================================
+* This notice covers the TorReader PDF (Windows x64) distribution. The Linux
+  AppImage ships the same components except OpenSSL (digital signature support
+  is not built on Linux).
+* Translation and AI features send only the text you explicitly select to the
+  configured online service (Google Translate / Google Gemini). No document is
+  uploaded automatically. See privacy.html on torreader.cloud.
+* This file is provided for attribution and license-compliance purposes. It is
+  not legal advice.

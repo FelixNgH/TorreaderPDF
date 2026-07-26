@@ -172,7 +172,9 @@ void PageRenderTask::run() {
         FPDF_BITMAP bmp = FPDFBitmap_CreateEx(imgW, imgH, FPDFBitmap_BGRA,
                                                 image.bits(), image.bytesPerLine());
         PdfRenderer::s_renderCount.fetch_add(1);
-        FPDF_RenderPageBitmap(bmp, page, 0, 0, imgW, imgH, 0, FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE);
+        int renderFlags = FPDF_RENDER_LIMITEDIMAGECACHE;
+        if (m_req.renderAnnotations) renderFlags |= FPDF_ANNOT;
+        FPDF_RenderPageBitmap(bmp, page, 0, 0, imgW, imgH, 0, renderFlags);
         if (m_pdfDoc && FPDF_GetFormType(m_pdfDoc->raw()) != FORMTYPE_NONE) {
             FPDF_FORMFILLINFO ffi;
             memset(&ffi, 0, sizeof(ffi));
@@ -346,10 +348,12 @@ void ProgressiveRenderTask::run() {
         pause.user = &pctx;
 
         PdfRenderer::s_renderCount.fetch_add(1);
+        { int rflags = FPDF_RENDER_LIMITEDIMAGECACHE;
+          if (m_req.renderAnnotations) rflags |= FPDF_ANNOT;
         m_renderStatus = FPDF_RenderPageBitmap_Start(m_bmp, m_fpdfPage, 0, 0,
                                                        m_bmpW, m_bmpH, 0,
-                                                       FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE,
-                                                       &pause);
+                                                       rflags,
+                                                       &pause); }
         // Mutex unlocked here
     }
 
@@ -441,11 +445,13 @@ void ProgressiveRenderTask::run() {
 RegionRenderTask::RegionRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc,
                                    int pageIndex, double scale, QRect regionPx,
                                    QObject* receiver,
-                                   std::shared_ptr<QAtomicInt> genRef)
+                                   std::shared_ptr<QAtomicInt> genRef,
+                                   bool renderAnnotations)
     : m_renderer(renderer), m_pdfDoc(pdfDoc)
     , m_pageIndex(pageIndex), m_scale(scale), m_regionPx(regionPx)
     , m_genRef(std::move(genRef))
     , m_reqGen(m_genRef ? m_genRef->loadRelaxed() : 0)
+    , m_renderAnnotations(renderAnnotations)
 {
     setAutoDelete(true);
     connect(this, &RegionRenderTask::finished, receiver,
@@ -484,9 +490,11 @@ void RegionRenderTask::run() {
     FPDF_BITMAP bmp = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA,
                                            image.bits(), image.bytesPerLine());
     PdfRenderer::s_renderCount.fetch_add(1);
+    { int rflags = FPDF_RENDER_LIMITEDIMAGECACHE;
+      if (m_renderAnnotations) rflags |= FPDF_ANNOT;
     FPDF_RenderPageBitmap(bmp, page,
                           -m_regionPx.x(), -m_regionPx.y(),
-                          fullW, fullH, 0, FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE);
+                          fullW, fullH, 0, rflags); }
     if (m_pdfDoc && FPDF_GetFormType(m_pdfDoc->raw()) != FORMTYPE_NONE) {
         FPDF_FORMFILLINFO ffi;
         memset(&ffi, 0, sizeof(ffi));
@@ -517,12 +525,14 @@ TileBatchRenderTask::TileBatchRenderTask(PdfRenderer* renderer, PdfDocument* pdf
                                          int pageIndex, double scale,
                                          QVector<QPoint> tiles,
                                          QObject* receiver,
-                                         std::shared_ptr<QAtomicInt> genRef)
+                                         std::shared_ptr<QAtomicInt> genRef,
+                                         bool renderAnnotations)
     : m_renderer(renderer), m_pdfDoc(pdfDoc)
     , m_pageIndex(pageIndex), m_scale(scale)
     , m_tiles(std::move(tiles))
     , m_genRef(std::move(genRef))
     , m_reqGen(m_genRef ? m_genRef->loadRelaxed() : 0)
+    , m_renderAnnotations(renderAnnotations)
 {
     setAutoDelete(true);
     connect(this, &TileBatchRenderTask::tileDone, receiver,
@@ -582,9 +592,11 @@ void TileBatchRenderTask::run() {
             FPDF_BITMAP bmp = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA,
                                                    image.bits(), image.bytesPerLine());
             PdfRenderer::s_renderCount.fetch_add(1);
+            { int rflags = 0;
+              if (m_renderAnnotations) rflags |= FPDF_ANNOT;
             FPDF_RenderPageBitmap(bmp, page,
                                   -col * kTileSize, -row * kTileSize,
-                                  fullW, fullH, 0, FPDF_ANNOT);
+                                  fullW, fullH, 0, rflags); }
             if (form) {
                 FPDF_FFLDraw(form, bmp, page,
                              -col * kTileSize, -row * kTileSize,
@@ -654,6 +666,7 @@ void PdfRenderer::setDocument(PdfDocument* doc) {
     clearCache();
     m_formibDoc.reset();
     m_pageObjectCount.clear();
+    m_pageAnnotRender.clear();
     m_formibGate = std::make_shared<FormibGate>();
 }
 
@@ -770,7 +783,8 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
         }
     }
 
-    RenderRequest req{pageIndex, scale, true, fullQuality, gen};
+    bool renderAnnots = m_pageAnnotRender.value(pageIndex, true);
+    RenderRequest req{pageIndex, scale, renderAnnots, fullQuality, gen};
 
     if (fullQuality) {
         auto* ptask = new ProgressiveRenderTask(this, m_doc, req, this,
@@ -886,9 +900,10 @@ void PdfRenderer::requestRegion(int pageIndex, double scale, QRect regionPx) {
     if (!m_doc || !m_doc->isOpen()) return;
     m_regionGeneration->fetchAndAddOrdered(1);
     auto genRef = m_regionGeneration;
+    bool regionRenderAnnots = m_pageAnnotRender.value(pageIndex, true);
     auto* task = new RegionRenderTask(this, m_doc,
                                        pageIndex, scale, regionPx,
-                                       this, genRef);
+                                       this, genRef, regionRenderAnnots);
     connect(task, &RegionRenderTask::finished, this,
             [this](int idx, double sc, QRect reg, QImage img) {
         if (!img.isNull()) {
@@ -987,7 +1002,8 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double /*scale*/)
     m_continuousRunning.fetch_add(1);
 
     int gen = m_continuousGen->loadRelaxed();
-    RenderRequest req{pageIndex, renderedScale, true, true, gen};
+    bool renderAnnots = m_pageAnnotRender.value(pageIndex, true);
+    RenderRequest req{pageIndex, renderedScale, renderAnnots, true, gen};
 
     auto* ptask = new ProgressiveRenderTask(this, m_doc, req, this,
                                              m_continuousGen, m_formibDoc, m_formibGate);

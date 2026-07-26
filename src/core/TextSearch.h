@@ -28,7 +28,7 @@ signals:
     void progress(int pagesScanned, int totalPages);
 
 private:
-    bool m_cancelled = false;
+    QAtomicInt m_cancelled{false};
     QList<SearchResult> searchPage(FPDF_DOCUMENT doc, int pageIndex, const QString& query,
                                    Qt::CaseSensitivity cs);
 };

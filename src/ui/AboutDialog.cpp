@@ -7,6 +7,16 @@
 #include <QPushButton>
 #include <QFont>
 #include <QPixmap>
+#include <QFile>
+#include <QTextStream>
+#include <QMessageBox>
+#include <QCoreApplication>
+#include <QDialog>
+#include <QPlainTextEdit>
+
+#ifndef FELIXPDF_VERSION
+#define FELIXPDF_VERSION "0.0.0"
+#endif
 
 static const char* kLicenseText = R"(
 <h3>Third-party open-source components</h3>
@@ -39,17 +49,18 @@ JPEG image decoding.<br><br>
 Copyright &copy; Marti Maria Saguer.<br>
 ICC colour management for colour-accurate rendering.<br><br>
 
+<b>Mesa 3D (llvmpipe)</b> — MIT License<br>
+Copyright &copy; Mesa 3D contributors.<br>
+Software OpenGL renderer (opengl32sw.dll) — fallback GPU.<br><br>
+
+
+<b>yaml-cpp</b> — MIT License<br>
+Copyright &copy; 2008-2015 Jesse Beder.<br>
+YAML configuration file parsing.<br><br>
+
 <b>Rust preview engine (formibpdf)</b> — MIT / Apache-2.0<br>
-Built on the crates rayon, flate2, fontdue, and image, each under the MIT or Apache-2.0 license.<br>
+Built on the crates rayon, flate2, fontdue, image, and lcms2, each under the MIT or Apache-2.0 license.<br>
 Low-resolution thumbnail / preview rendering.<br><br>
-
-<b>Tesseract OCR</b> — Apache License 2.0 (optional)<br>
-Copyright &copy; Google LLC and contributors.<br>
-Optical character recognition — OCR-enabled builds only.<br><br>
-
-<b>Noto Sans</b> — SIL Open Font License 1.1<br>
-Copyright &copy; Google LLC.<br>
-UI font — free for commercial use.<br><br>
 
 <p style='color:#6B7280; font-size:11px;'>
 All third-party libraries are used in compliance with their respective licenses.
@@ -85,7 +96,7 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     }
     aLayout->addWidget(logoCard);
 
-    auto* versionLabel = new QLabel("TorReader PDF — Version 2.2");
+    auto* versionLabel = new QLabel(QStringLiteral("TorReader PDF — Version %1").arg(QStringLiteral(FELIXPDF_VERSION)));
     versionLabel->setAlignment(Qt::AlignCenter);
     versionLabel->setStyleSheet("color: #6B7280; font-size: 11px;");
     aLayout->addWidget(versionLabel);
@@ -143,7 +154,40 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     auto* licBrowser = new QTextBrowser;
     licBrowser->setHtml(kLicenseText);
     licBrowser->setOpenExternalLinks(true);
-    lLayout->addWidget(licBrowser);
+    lLayout->addWidget(licBrowser, 1);
+    auto* fullBtn = new QPushButton("Open full notices\u2026");
+    lLayout->addWidget(fullBtn, 0, Qt::AlignRight);
+    connect(fullBtn, &QPushButton::clicked, this, [this]() {
+        QString path = QCoreApplication::applicationDirPath() + "/THIRD-PARTY-LICENSES.txt";
+        QFile file(path);
+        QString content;
+        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream stream(&file);
+            content = stream.readAll();
+            file.close();
+        } else {
+            content = "Full notices file not found next to the executable.";
+        }
+        auto* dialog = new QDialog(this);
+        dialog->setWindowTitle("Third-Party Licenses");
+        dialog->resize(800, 600);
+        auto* layout = new QVBoxLayout(dialog);
+        auto* textEdit = new QPlainTextEdit(content);
+        textEdit->setReadOnly(true);
+        QFont monoFont("Courier New", 9);
+        monoFont.setStyleHint(QFont::Monospace);
+        textEdit->setFont(monoFont);
+        layout->addWidget(textEdit);
+        auto* licClose = new QPushButton("Close");
+        licClose->setFixedWidth(80);
+        auto* licBtnRow = new QHBoxLayout;
+        licBtnRow->addStretch();
+        licBtnRow->addWidget(licClose);
+        layout->addLayout(licBtnRow);
+        connect(licClose, &QPushButton::clicked, dialog, &QDialog::accept);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->show();
+    });
     tabs->addTab(licWidget, "Licenses");
 
     // ── Main layout ───────────────────────────────────────────────────────────

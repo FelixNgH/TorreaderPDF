@@ -1,12 +1,19 @@
 #include "AnnotationManager.h"
+#include "../core/PdfCoords.h"
 #include <fpdf_edit.h>
 #include <fpdf_save.h>
 #include <QMutex>
 #include <QFile>
 #include <QStringList>
+#include <QFontMetricsF>
+#include <QVector>
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QThread>
 #include <QDebug>
 
 // ── PDF escape helper (shared by both AP generators) ───────────────────────
@@ -37,27 +44,7 @@ struct FileWriter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ── Rotation-aware point transforms ─────────────────────────────────────────────
-// (xd, yd) = display coordinates (Y down from top of DISPLAYED page)
-// (Wd, Hd) = display size = FPDF_GetPageWidth/Height
-// forward:  display → unrotated PDF (Y up from bottom)
-static QPointF dispToPdf(double xd, double yd, double Wd, double Hd, int rot) {
-    switch (rot) {
-        case 1:  return { yd,       xd };
-        case 2:  return { Wd - xd,  yd };
-        case 3:  return { Hd - yd,  Wd - xd };
-        default: return { xd,       Hd - yd };
-    }
-}
-// inverse:  unrotated PDF → display
-static QPointF pdfToDisp(double xu, double yu, double Wd, double Hd, int rot) {
-    switch (rot) {
-        case 1:  return { yu,       xu };
-        case 2:  return { Wd - xu,  yu };
-        case 3:  return { Hd - yu,  Wd - xu };
-        default: return { xu,       Hd - yu };
-    }
-}
+// Rotation transforms moved to core/PdfCoords.h
 
 static QString readAnnotString(FPDF_ANNOTATION annot, const char* key) {
     unsigned long len = FPDFAnnot_GetStringValue(annot, key, nullptr, 0);
@@ -105,7 +92,9 @@ static bool parseDA(const QString& da, QColor& outColor, float& outSize) {
 
 // ── AnnotationManager ─────────────────────────────────────────────────────────
 
-AnnotationManager::AnnotationManager(QObject* parent) : QObject(parent) {}
+AnnotationManager::AnnotationManager(QObject* parent) : QObject(parent) {
+    qRegisterMetaType<QList<AnnotInfo>>("QList<AnnotInfo>");
+}
 
 void AnnotationManager::setDocument(FPDF_DOCUMENT doc, const QString& filePath) {
     m_doc  = doc;
@@ -131,7 +120,12 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
 
         AnnotInfo info;
         info.pageIndex = pageIndex;
+        info.indexInPage = i;
         info.type   = subtypeName(FPDFAnnot_GetSubtype(annot));
+        {
+            QString trtool = readAnnotString(annot, "TRTOOL");
+            if (!trtool.isEmpty()) info.type = trtool;
+        }
         info.text   = readAnnotString(annot, "Contents");
         info.author = readAnnotString(annot, "T");
 
@@ -154,6 +148,7 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
             info.color = QColor(255, 220, 0);
         }
         info.isDraft = FPDFAnnot_HasKey(annot, "TRSD") != 0;
+        info.uid = readAnnotString(annot, "TRUID");
 
         result.append(info);
         FPDFPage_CloseAnnot(annot);
@@ -165,9 +160,223 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
 
 QList<AnnotInfo> AnnotationManager::loadAll(int pageCount) {
     QList<AnnotInfo> all;
-    for (int i = 0; i < pageCount; ++i)
+    for (int i = 0; i < pageCount; ++i) {
         all.append(loadPage(i));
+        QThread::yieldCurrentThread();
+    }
     return all;
+}
+
+void AnnotationManager::loadAllStreaming(int pageCount, int startPage) {
+    if (!m_doc) return;
+    startPage = qBound(0, startPage, pageCount - 1);
+
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    int pagesWithAnnots = 0;
+    int totalAnnots = 0;
+    int pagesScanned = 0;
+
+    // Spiral scan order: startPage first, then alternate outward
+    QVector<int> order;
+    order.reserve(pageCount);
+    order.append(startPage);
+    for (int d = 1; d < pageCount; ++d) {
+        if (startPage + d < pageCount) order.append(startPage + d);
+        if (startPage - d >= 0) order.append(startPage - d);
+    }
+
+    for (int i : order) {
+        QElapsedTimer pageTimer;
+        pageTimer.start();
+        QList<AnnotInfo> pageAnnots = loadPage(i);
+        qint64 pageMs = pageTimer.elapsed();
+
+        if (pageMs > 150)
+            qDebug().noquote() << "[comments] slow page=" << i << "ms=" << pageMs;
+
+        if (!pageAnnots.isEmpty()) {
+            ++pagesWithAnnots;
+            totalAnnots += pageAnnots.size();
+            qDebug().noquote() << "[comments] scan page=" << i << "annots=" << pageAnnots.size();
+            emit pageAnnotsLoaded(i, pageAnnots);
+        }
+        ++pagesScanned;
+        if (pagesScanned % 5 == 0)
+            emit scanProgress(pagesScanned, pageCount);
+
+        QThread::yieldCurrentThread();
+        QThread::msleep(1);
+    }
+    emit scanProgress(pageCount, pageCount);
+    qint64 totalMs = totalTimer.elapsed();
+    qDebug().noquote() << "[comments] scan finished pages=" << pageCount
+             << "pagesWithAnnots=" << pagesWithAnnots << "totalAnnots=" << totalAnnots << "ms=" << totalMs;
+}
+
+QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlayCapable) {
+    QList<AnnotVisual> result;
+    if (!m_doc) { if (outOverlayCapable) *outOverlayCapable = false; return result; }
+    QElapsedTimer _perf;
+    _perf.start();
+
+    QMutexLocker lock(&s_pdfiumMutex);
+    FPDF_PAGE fpage = FPDF_LoadPage(m_doc, page);
+    if (!fpage) { if (outOverlayCapable) *outOverlayCapable = false; return result; }
+
+    double Wd = FPDF_GetPageWidth(fpage);
+    double Hd = FPDF_GetPageHeight(fpage);
+    int rot = FPDFPage_GetRotation(fpage);
+    int count = FPDFPage_GetAnnotCount(fpage);
+    bool capable = true;
+
+    for (int i = 0; i < count; ++i) {
+        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(fpage, i);
+        if (!annot) continue;
+
+        int sub = FPDFAnnot_GetSubtype(annot);
+        // Skip hidden annotations
+        if (FPDFAnnot_GetFlags(annot) & FPDF_ANNOT_FLAG_HIDDEN) {
+            FPDFPage_CloseAnnot(annot);
+            continue;
+        }
+        // Skip POPUP — they are children of other annotations, never standalone
+        if (sub == FPDF_ANNOT_POPUP) {
+            FPDFPage_CloseAnnot(annot);
+            continue;
+        }
+
+        // Check if subtype is overlay-drawable
+        bool drawable = (sub == FPDF_ANNOT_INK || sub == FPDF_ANNOT_SQUARE ||
+                         sub == FPDF_ANNOT_CIRCLE || sub == FPDF_ANNOT_HIGHLIGHT ||
+                         sub == FPDF_ANNOT_LINE || sub == FPDF_ANNOT_POLYGON ||
+                         sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT);
+        if (!drawable) {
+            capable = false;
+            qDebug() << "[annot] page=" << page << "overlayCapable=0 reason=subtype=" << sub;
+            FPDFPage_CloseAnnot(annot);
+            continue;
+        }
+
+        AnnotVisual av;
+        av.page = page;
+        av.subtype = sub;
+
+        // UID
+        av.uid = readAnnotString(annot, "TRUID");
+
+        // Rect → display coords
+        FS_RECTF r{};
+        if (FPDFAnnot_GetRect(annot, &r))
+            av.rect = pdfRectToDisp(QRectF(r.left, r.bottom, r.right - r.left, r.top - r.bottom), Wd, Hd, rot);
+
+        // Color: use C key, fallback to TRC custom key
+        unsigned int cr = 0, cg = 0, cb = 0, ca = 255;
+        if (FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &cr, &cg, &cb, &ca)) {
+            av.stroke = QColor(cr, cg, cb, ca);
+        } else {
+            unsigned long tn = FPDFAnnot_GetStringValue(annot, "TRC", nullptr, 0);
+            if (tn > 2) {
+                std::vector<unsigned short> tb(tn / 2 + 1, 0);
+                FPDFAnnot_GetStringValue(annot, "TRC", reinterpret_cast<FPDF_WCHAR*>(tb.data()), tn);
+                QString trc = QString::fromUtf16(reinterpret_cast<const char16_t*>(tb.data()));
+                QStringList parts = trc.split(',');
+                if (parts.size() == 3) {
+                    av.stroke = QColor(parts[0].toUInt(), parts[1].toUInt(), parts[2].toUInt());
+                }
+            }
+        }
+
+        // Fill / interior color — guard with HasKey because GetColor returns
+        // true and writes 0,0,0,255 even when the /IC key is absent
+        unsigned int fr = 255, fg = 255, fb = 255, fa = 0;
+        if (FPDFAnnot_HasKey(annot, "IC") &&
+            FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &fr, &fg, &fb, &fa) &&
+            fa > 0)
+            av.fill = QColor(fr, fg, fb, fa);
+        else
+            av.fill = QColor(Qt::transparent);
+
+        // Border
+        float bh = 0.f, bv = 0.f, bw = 2.f;
+        if (FPDFAnnot_GetBorder(annot, &bh, &bv, &bw))
+            av.border = bw;
+
+        // Subtype-specific data
+        if (sub == FPDF_ANNOT_INK) {
+            int nStrokes = FPDFAnnot_GetInkListCount(annot);
+            for (int s = 0; s < nStrokes; ++s) {
+                unsigned long pc = FPDFAnnot_GetInkListPath(annot, s, nullptr, 0);
+                if (pc == 0) continue;
+                std::vector<FS_POINTF> pts(pc);
+                FPDFAnnot_GetInkListPath(annot, s, pts.data(), pc);
+                QVector<QPointF> stroke;
+                for (auto& p : pts)
+                    stroke.append(pdfToDisp(p.x, p.y, Wd, Hd, rot));
+                av.ink.append(stroke);
+            }
+        } else if (sub == FPDF_ANNOT_HIGHLIGHT) {
+            size_t nQuads = FPDFAnnot_CountAttachmentPoints(annot);
+            for (size_t q = 0; q < nQuads; ++q) {
+                FS_QUADPOINTSF qp{};
+                if (FPDFAnnot_GetAttachmentPoints(annot, q, &qp)) {
+                    QPointF tl = pdfToDisp(qp.x1, qp.y1, Wd, Hd, rot);
+                    QPointF tr = pdfToDisp(qp.x2, qp.y2, Wd, Hd, rot);
+                    QPointF bl = pdfToDisp(qp.x3, qp.y3, Wd, Hd, rot);
+                    QPointF br = pdfToDisp(qp.x4, qp.y4, Wd, Hd, rot);
+                    // QuadPoints order: x1/y1=top-left, x2/y2=top-right,
+                    // x3/y3=bottom-left (actually bottom-left in PDF coords),
+                    // x4/y4=bottom-right
+                    // After pdfToDisp: tl, tr, bl, br are in display coords
+                    // Build bounding rect of all 4 corners
+                    double l = std::min({tl.x(), tr.x(), bl.x(), br.x()});
+                    double t = std::min({tl.y(), tr.y(), bl.y(), br.y()});
+                    double r2 = std::max({tl.x(), tr.x(), bl.x(), br.x()});
+                    double b2 = std::max({tl.y(), tr.y(), bl.y(), br.y()});
+                    av.quads.append(QRectF(l, t, r2 - l, b2 - t));
+                }
+            }
+        } else if (sub == FPDF_ANNOT_LINE) {
+            FS_POINTF ptA{}, ptB{};
+            if (FPDFAnnot_GetLine(annot, &ptA, &ptB)) {
+                // Store line endpoints in the rect for drawing
+                QPointF dA = pdfToDisp(ptA.x, ptA.y, Wd, Hd, rot);
+                QPointF dB = pdfToDisp(ptB.x, ptB.y, Wd, Hd, rot);
+                av.rect = QRectF(dA, dB);
+            }
+        }
+
+        // Contents and DA for FreeText/Text
+        if (sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT) {
+            av.text = readAnnotString(annot, "Contents");
+            if (sub == FPDF_ANNOT_FREETEXT) {
+                QColor daColor; float daSize;
+                if (parseDA(readAnnotString(annot, "DA"), daColor, daSize)) {
+                    if (daSize > 0) av.fontSize = daSize;
+                    if (daColor.isValid()) av.stroke = daColor;
+                }
+            } else {
+                av.isNote = true;
+            }
+        }
+
+        // FreeText and Note are drawn as page objects in the renderer — overlay
+        // must NOT paint them (would double the text/icon).
+        if (sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT)
+            av.paintByOverlay = false;
+
+        result.append(av);
+        FPDFPage_CloseAnnot(annot);
+    }
+
+    FPDF_ClosePage(fpage);
+    lock.unlock();
+
+    qint64 ms = _perf.elapsed();
+    qDebug().noquote() << QString("[perf] loadPageVisuals page=%1 count=%2 capable=%3 ms=%4")
+                              .arg(page).arg(result.size()).arg(capable ? 1 : 0).arg(ms);
+    if (outOverlayCapable) *outOverlayCapable = capable;
+    return result;
 }
 
 bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
@@ -274,6 +483,9 @@ bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
     QString trid = QString::number(noteId);
     FPDFAnnot_SetStringValue(annot, "TRID",
         reinterpret_cast<FPDF_WIDESTRING>(trid.utf16()));
+    m_lastCreatedUid = generateUid();
+    FPDFAnnot_SetStringValue(annot, "TRUID",
+        reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
 
     // Hide annotation so PDFium does not draw its built-in 20x20 icon
     FPDFAnnot_SetFlags(annot, FPDFAnnot_GetFlags(annot) | FPDF_ANNOT_FLAG_HIDDEN);
@@ -415,6 +627,9 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
         QString trid = QString::number(noteId);
         FPDFAnnot_SetStringValue(annot, "TRID",
             reinterpret_cast<FPDF_WIDESTRING>(trid.utf16()));
+        m_lastCreatedUid = generateUid();
+        FPDFAnnot_SetStringValue(annot, "TRUID",
+            reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
 
         FPDFAnnot_SetFlags(annot, FPDFAnnot_GetFlags(annot) | FPDF_ANNOT_FLAG_HIDDEN);
         FPDFPage_CloseAnnot(annot);
@@ -497,6 +712,7 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     QString contents = readAnnotString(annot, "Contents");
     QString author = readAnnotString(annot, "T");
     QString tridStr = readAnnotString(annot, "TRID");
+    QString oldUid = readAnnotString(annot, "TRUID");
     unsigned int noteId = tridStr.toUInt();
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
@@ -514,13 +730,30 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
         removeNotePageObjects(pageIndex, noteId);
     removeAnnot(pageIndex, index);
     createInlineNote(pageIndex, fitRect, contents, author, false, newColor, newFontSize);
+    // Preserve original uid across rebuild
+    if (!oldUid.isEmpty() && !m_lastCreatedUid.isEmpty()) {
+        QMutexLocker lock2(&s_pdfiumMutex);
+        FPDF_PAGE p2 = FPDF_LoadPage(m_doc, pageIndex);
+        if (p2) {
+            int nc = FPDFPage_GetAnnotCount(p2);
+            if (nc > 0) {
+                FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(p2, nc - 1);
+                if (a2) {
+                    FPDFAnnot_SetStringValue(a2, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(oldUid.utf16()));
+                    m_lastCreatedUid = oldUid;
+                    FPDFPage_CloseAnnot(a2);
+                }
+            }
+            FPDF_ClosePage(p2);
+        }
+    }
     return true;
 }
 
 bool AnnotationManager::moveNote(int pageIndex, int index, double dxDisp, double dyDisp) {
     if (!m_doc) return false;
 
-    QString contents, author, tridStr;
+    QString contents, author, tridStr, uidStr;
     unsigned int noteId = 0;
     int subtype = 0;
     FS_RECTF r{};
@@ -546,6 +779,7 @@ bool AnnotationManager::moveNote(int pageIndex, int index, double dxDisp, double
         author = readAnnotString(annot, "T");
         tridStr = readAnnotString(annot, "TRID");
         noteId = tridStr.toUInt();
+        uidStr = readAnnotString(annot, "TRUID");
         pageH = FPDF_GetPageHeight(page);
         pageW = FPDF_GetPageWidth(page);
         rot = FPDFPage_GetRotation(page);
@@ -577,6 +811,23 @@ bool AnnotationManager::moveNote(int pageIndex, int index, double dxDisp, double
     else
         createPopupNote(pageIndex, newRect.topLeft(), contents, author);
 
+    // Preserve old uid on the newly created annot
+    if (!uidStr.isEmpty()) {
+        QMutexLocker lock2(&s_pdfiumMutex);
+        FPDF_PAGE p2 = FPDF_LoadPage(m_doc, pageIndex);
+        if (p2) {
+            int nc = FPDFPage_GetAnnotCount(p2);
+            if (nc > 0) {
+                FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(p2, nc - 1);
+                if (a2) {
+                    FPDFAnnot_SetStringValue(a2, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(uidStr.utf16()));
+                    FPDFPage_CloseAnnot(a2);
+                }
+            }
+            FPDF_ClosePage(p2);
+        }
+    }
+
     return true;
 }
 
@@ -585,14 +836,63 @@ bool AnnotationManager::removeAnnot(int pageIndex, int index) {
     QMutexLocker lock(&s_pdfiumMutex);
     FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
     if (!page) return false;
+
+    // Remove associated page objects for Text/FreeText (BUG 2)
+    bool subNeedsGen = false;
+    FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
+    if (annot) {
+        auto sub = FPDFAnnot_GetSubtype(annot);
+        subNeedsGen = (sub == FPDF_ANNOT_TEXT || sub == FPDF_ANNOT_FREETEXT);
+        if (subNeedsGen) {
+            QString tridStr = readAnnotString(annot, "TRID");
+            unsigned int noteId = tridStr.toUInt();
+            if (noteId) {
+                int count = FPDFPage_CountObjects(page);
+                QVector<FPDF_PAGEOBJECT> toRemove;
+                int foundCount = 0;
+                for (int i = 0; i < count && foundCount < 6; ++i) {
+                    FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+                    if (!obj) continue;
+                    int nMarks = FPDFPageObj_CountMarks(obj);
+                    for (int m = 0; m < nMarks; ++m) {
+                        FPDF_PAGEOBJECTMARK mark = FPDFPageObj_GetMark(obj, static_cast<unsigned long>(m));
+                        if (!mark) continue;
+                        unsigned long nameLen = 0;
+                        if (!FPDFPageObjMark_GetName(mark, nullptr, 0, &nameLen)) continue;
+                        std::vector<unsigned short> nameBuf(nameLen / 2 + 1, 0);
+                        if (!FPDFPageObjMark_GetName(mark, reinterpret_cast<FPDF_WCHAR*>(nameBuf.data()), nameLen, &nameLen)) continue;
+                        QString markName = QString::fromUtf16(reinterpret_cast<const char16_t*>(nameBuf.data()));
+                        if (markName != QLatin1String("TRNote")) continue;
+                        int val = 0;
+                        if (!FPDFPageObjMark_GetParamIntValue(mark, "id", &val)) continue;
+                        if (static_cast<unsigned int>(val) == noteId) {
+                            toRemove.append(obj);
+                            ++foundCount;
+                            break;
+                        }
+                    }
+                }
+                for (auto obj : toRemove) {
+                    FPDFPage_RemoveObject(page, obj);
+                    FPDFPageObj_Destroy(obj);
+                }
+            }
+        }
+        FPDFPage_CloseAnnot(annot);
+    }
+
     bool ok = FPDFPage_RemoveAnnot(page, index);
-    if (ok) FPDFPage_GenerateContent(page);
+    // Only generate content when page objects were actually removed (Text/FreeText).
+    // For pure annotation subtypes (INK, SQUARE, CIRCLE, HIGHLIGHT, LINE) that live
+    // only in /Annots, GenerateContent is deferred until save.
+    if (ok && subNeedsGen)
+        FPDFPage_GenerateContent(page);
     FPDF_ClosePage(page);
     lock.unlock();
     return ok;
 }
 
-bool AnnotationManager::setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill) {
+bool AnnotationManager::setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill, int fillAlpha) {
     AnnotSnapshot s = snapshotAnnot(pageIndex, index);
     if (!s.valid) return false;
     s.hasColor = true;
@@ -603,7 +903,8 @@ bool AnnotationManager::setAnnotStyle(int pageIndex, int index, QColor color, fl
     s.border = width;
     if (fill) {
         s.hasFill = true;
-        s.fr = s.r; s.fg = s.g; s.fb = s.b; s.fa = s.a;
+        s.fr = s.r; s.fg = s.g; s.fb = s.b;
+        s.fa = static_cast<unsigned int>(qBound(0, fillAlpha, 255));
     } else {
         s.hasFill = false;
     }
@@ -654,7 +955,13 @@ AnnotSnapshot AnnotationManager::snapshotAnnot(int pageIndex, int index) {
             FPDFAnnot_GetStringValue(annot, "Contents", reinterpret_cast<FPDF_WCHAR*>(buf.data()), len);
             s.contents = QString::fromUtf16(reinterpret_cast<const char16_t*>(buf.data()));
         }
-        { unsigned long dlen = FPDFAnnot_GetStringValue(annot, "DA", nullptr, 0);
+            { unsigned long ulen = FPDFAnnot_GetStringValue(annot, "TRUID", nullptr, 0);
+          if (ulen > 2) {
+              std::vector<unsigned short> ubuf(ulen / 2 + 1, 0);
+              FPDFAnnot_GetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WCHAR*>(ubuf.data()), ulen);
+              s.uid = QString::fromUtf16(reinterpret_cast<const char16_t*>(ubuf.data()));
+          } }
+    { unsigned long dlen = FPDFAnnot_GetStringValue(annot, "DA", nullptr, 0);
           if (dlen > 2) {
               std::vector<unsigned short> dbuf(dlen / 2 + 1, 0);
               FPDFAnnot_GetStringValue(annot, "DA", reinterpret_cast<FPDF_WCHAR*>(dbuf.data()), dlen);
@@ -700,6 +1007,8 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
             FPDFAnnot_SetStringValue(annot, "Contents", reinterpret_cast<FPDF_WIDESTRING>(s.contents.utf16()));
         if (!s.da.isEmpty())
             FPDFAnnot_SetStringValue(annot, "DA", reinterpret_cast<FPDF_WIDESTRING>(s.da.utf16()));
+        if (!s.uid.isEmpty())
+            FPDFAnnot_SetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(s.uid.utf16()));
         if (s.isDraft)
             FPDFAnnot_SetStringValue(annot, "TRSD", reinterpret_cast<FPDF_WIDESTRING>(QStringLiteral("1").utf16()));
         for (const auto& stroke : s.ink) {
@@ -708,7 +1017,8 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
             if (pts.size() >= 2) FPDFAnnot_AddInkStroke(annot, pts.data(), pts.size());
         }
         FPDFPage_CloseAnnot(annot);
-        FPDFPage_GenerateContent(page);
+        // GenerateContent deferred to save time — annotations in /Annots are
+        // preserved by FPDF_SaveAsCopy without explicit GenerateContent.
     }
     bool ok = (annot != nullptr);
     FPDF_ClosePage(page);
@@ -717,7 +1027,8 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
 
 bool AnnotationManager::getAnnotEditState(int pageIndex, int index,
                                           QString& outType, QColor& outColor,
-                                          float& outWidth, float& outFontSize) {
+                                          float& outWidth, float& outFontSize,
+                                          bool* outHasFill, int* outFillAlpha) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
     FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
@@ -775,6 +1086,15 @@ bool AnnotationManager::getAnnotEditState(int pageIndex, int index,
             outFontSize = 11.0f;
     }
 
+    {
+        unsigned int fr = 255, fg = 255, fb = 255, fa = 255;
+        bool hasIC = FPDFAnnot_HasKey(annot, "IC") &&
+                     FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &fr, &fg, &fb, &fa) != 0;
+        bool hasFill = (hasIC && fa > 0);
+        if (outHasFill) *outHasFill = hasFill;
+        if (outFillAlpha) *outFillAlpha = static_cast<int>(fa);
+    }
+
     FPDFPage_CloseAnnot(annot);
     FPDF_ClosePage(page);
     return true;
@@ -806,6 +1126,38 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
     return ok;
 }
 
+
+
+int AnnotationManager::findAnnotIndexByUid(int pageIndex, const QString& uid) {
+    if (!m_doc || uid.isEmpty()) return -1;
+    QMutexLocker lock(&s_pdfiumMutex);
+    FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
+    if (!page) return -1;
+    int count = FPDFPage_GetAnnotCount(page);
+    for (int i = 0; i < count; ++i) {
+        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
+        if (!annot) continue;
+        unsigned long len = FPDFAnnot_GetStringValue(annot, "TRUID", nullptr, 0);
+        if (len > 2) {
+            std::vector<unsigned short> buf(len / 2 + 1, 0);
+            FPDFAnnot_GetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WCHAR*>(buf.data()), len);
+            QString existing = QString::fromUtf16(reinterpret_cast<const char16_t*>(buf.data()));
+            if (existing == uid) {
+                FPDFPage_CloseAnnot(annot);
+                FPDF_ClosePage(page);
+                return i;
+            }
+        }
+        FPDFPage_CloseAnnot(annot);
+    }
+    FPDF_ClosePage(page);
+    return -1;
+}
+
+QString AnnotationManager::generateUid() {
+    return QString::number(m_nextNoteId++) + "_" + QString::number(QDateTime::currentMSecsSinceEpoch());
+}
+
 bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const QString& text) {
     if (!m_doc) return false;
 
@@ -835,6 +1187,9 @@ bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const
 
     FPDFAnnot_SetStringValue(annot, "TRSD",
         reinterpret_cast<FPDF_WIDESTRING>(QStringLiteral("1").utf16()));
+    m_lastCreatedUid = generateUid();
+    FPDFAnnot_SetStringValue(annot, "TRUID",
+        reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
 
     FPDFPage_CloseAnnot(annot);
     FPDFPage_GenerateContent(page);
@@ -904,6 +1259,16 @@ int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId)
 
     FPDF_ClosePage(page);
     return removed;
+}
+
+void AnnotationManager::generateContentForPage(int page) {
+    if (!m_doc) return;
+    QMutexLocker lock(&s_pdfiumMutex);
+    FPDF_PAGE fpage = FPDF_LoadPage(m_doc, page);
+    if (fpage) {
+        FPDFPage_GenerateContent(fpage);
+        FPDF_ClosePage(fpage);
+    }
 }
 
 bool AnnotationManager::saveDocument() {

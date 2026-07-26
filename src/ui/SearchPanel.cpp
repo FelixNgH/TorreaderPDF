@@ -12,6 +12,7 @@ SearchPanel::SearchPanel(QWidget* parent) : QWidget(parent) {
     m_countLabel= new QLabel(this);
 
     m_input->setPlaceholderText("Search text… (Ctrl+F)");
+    m_input->setClearButtonEnabled(true);
     m_results->setAlternatingRowColors(true);
 
     auto* topRow = new QHBoxLayout;
@@ -35,6 +36,12 @@ SearchPanel::SearchPanel(QWidget* parent) : QWidget(parent) {
         QRectF rect = item->data(Qt::UserRole + 1).toRectF();
         emit resultSelected(page, rect);
     });
+    connect(m_input, &QLineEdit::textChanged, this, [this](const QString& t) {
+        if (t.isEmpty()) {
+            clearResults();
+            emit searchCleared();
+        }
+    });
 }
 
 void SearchPanel::focusInput() {
@@ -51,6 +58,10 @@ void SearchPanel::addResult(const SearchResult& result) {
     item->setData(Qt::UserRole + 1, result.boundingBox);
     ++m_count;
     m_countLabel->setText(QString("%1 result(s)").arg(m_count));
+}
+
+void SearchPanel::setSearchProgress(int pagesScanned, int totalPages) {
+    m_countLabel->setText(QString("Scanning… %1 / %2").arg(pagesScanned).arg(totalPages));
 }
 
 void SearchPanel::clearResults() {
