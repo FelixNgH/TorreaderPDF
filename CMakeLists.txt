@@ -418,6 +418,7 @@ target_link_libraries(TorReader PRIVATE
     $<$<NOT:$<BOOL:${TORREADER_NO_PDFIUM}>>:${QPDF_TARGET}>
     $<$<NOT:$<BOOL:${TORREADER_NO_PDFIUM}>>:OpenSSL::Crypto>
     ${DWF_LIBS}
+    $<$<NOT:$<BOOL:${WIN32}>>:lcms2>
     $<$<BOOL:${FELIXPDF_ENABLE_OCR}>:Tesseract::libtesseract>
     $<$<BOOL:${WIN32}>:rpcrt4>
     $<$<BOOL:${WIN32}>:psapi>
