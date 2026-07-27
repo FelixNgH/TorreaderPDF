@@ -25,38 +25,19 @@ off-screen pages so RAM stays flat no matter how many pages you flip through.
 
 ### ⬇ Download
 
-| Platform | Download |
-|----------|----------|
-| **Windows** (x64) | [`TorReaderPDF-2.2.3-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
-| **Linux** (x86_64) | [`TorReaderPDF-2.2.3-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (Ubuntu 22.04+, glibc 2.35+) |
+| Platform | Install |
+|----------|---------|
+| **Windows** (x64) | [`TorReaderPDF-2.2.4-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Ubuntu / Debian** (APT repo) | `sudo mkdir -p /etc/apt/keyrings`<br>`sudo curl -fsSL https://torreader.cloud/apt/torreader-archive-keyring.gpg -o /etc/apt/keyrings/torreader.gpg`<br>`echo "deb [signed-by=/etc/apt/keyrings/torreader.gpg] https://torreader.cloud/apt stable main" \| sudo tee /etc/apt/sources.list.d/torreader.list`<br>`sudo apt update && sudo apt install torreader`<br>→ auto-updates via `apt upgrade` |
+| **Ubuntu / Debian** (standalone .deb) | Download `.deb` from [Releases](https://github.com/FelixNgH/TorreaderPDF/releases) & run:<br>`sudo apt install ./torreader_2.2.4_amd64.deb` |
+| **Arch Linux** | `yay -S torreader-bin` *(pending publication on AUR)* |
+| **Any distro** (AppImage) | [`TorReaderPDF-2.2.4-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (glibc 2.35+, Ubuntu 22.04+; requires system OpenGL) |
+
+The app ships a freedesktop-compatible `.desktop` file and AppStream metadata, so it appears in your application menu and "Open with" for PDF files.
 
 See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
 
-### ✨ What's new in 2.2.3
-
-- **Large-file rendering overhaul** — the 2.2 release had rendering regressions on
-  big multi-page drawings (missed pages in single view, severe lag in continuous
-  scroll). 2.2.3 rebuilds the render pipeline around progressive, interruptible
-  rendering + a two-layer cache: 200–300 page large-format drawing sets now open
-  and scroll smoothly.
-- **Markup on rotated pages fixed** — annotations now land in the right place on
-  `/Rotate 90/180/270` pages; the arrow tool keeps its arrowhead; sticky notes are
-  selectable and upright.
-- **Text markup** — inline text reads horizontally, the box fits the text, and you
-  can change **font size and colour** via right-click → Properties (it now shows the
-  markup's real current values).
-- **Move + Undo/Redo** for text/note markup; the Linux build is rebuilt for broad
-  compatibility (runs on Ubuntu 22.04, 24.04 and newer).
-
-> Heavy CAD pages (millions of vector operations) still take ~2–3s for the *first*
-> full-resolution render — a physical ceiling shared by every PDF engine — but
-> navigation across the whole document stays responsive.
-
-![TorReader PDF demo](docs/screenshots/demo.gif)
-
-### New in 2.2.4
-
-![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
+### ✨ What's new in 2.2.4
 
 - **Sharp zoom in Continuous scroll** — the visible area is re-rendered at true
   resolution, so zoomed-in text stays crisp in scroll mode too, not just single-page.
@@ -66,6 +47,10 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
   the sidebar listing every hit with context.
 - Markup is now painted as an overlay instead of going through the page raster, so
   adding, deleting or moving it is instant even on heavy CAD drawings.
+
+![TorReader PDF demo](docs/screenshots/demo.gif)
+
+![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
 
 <details>
 <summary>More screenshots (viewer, dark mode, markup, digital signature, merge)</summary>

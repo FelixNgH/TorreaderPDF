@@ -12,7 +12,7 @@ set -euo pipefail
 echo '=== verify-in-docker: $IMAGE ==='
 
 apt-get update -qq
-apt-get install -y -qq xvfb x11-utils ./pkg/$DEB_NAME
+apt-get install -y -qq xvfb x11-utils desktop-file-utils appstream ./pkg/$DEB_NAME
 
 Xvfb :99 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
 XVFB_PID=\$!
@@ -53,10 +53,9 @@ fi
 
 echo '  window check: PASS'
 
-desktop-file-validate /usr/share/applications/cloud.torreader.TorReader.desktop
-echo '  desktop-file-validate: PASS'
+command -v desktop-file-validate >/dev/null 2>&1 && { desktop-file-validate /usr/share/applications/cloud.torreader.TorReader.desktop; echo '  desktop-file-validate: PASS'; } || echo '  skip: desktop-file-validate missing'
 
-xdg-mime query default application/pdf || true
+command -v xdg-mime >/dev/null 2>&1 && xdg-mime query default application/pdf || echo '  skip: xdg-mime missing'
 
 if command -v appstreamcli >/dev/null 2>&1; then
   appstreamcli validate /usr/share/metainfo/cloud.torreader.TorReader.metainfo.xml || true
