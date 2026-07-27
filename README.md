@@ -11,7 +11,7 @@ and insert** pages, **sign PDFs** digitally, and **translate PDFs for free**.
 Everything runs **locally on your machine**, with **no installation required** —
 unzip (or `chmod +x`) and run.
 
-Open a 200MB PDF in a second or two, combine files **without losing bookmarks**,
+Open a 900MB PDF in a second or two, combine files **without losing bookmarks**,
 pull out or split pages, insert pages from another PDF, add a digital signature,
 and translate text in place — free and open-source (MIT).
 
