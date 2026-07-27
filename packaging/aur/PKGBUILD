@@ -1,0 +1,43 @@
+# Maintainer: FelixNgH <felixnguyenhuy@gmail.com>
+# Contributor: FelixNgH <felixnguyenhuy@gmail.com>
+
+pkgname=torreader-bin
+pkgver=2.2.4
+pkgrel=1
+pkgdesc="Fast offline PDF reader, editor and merger — prebuilt AppImage"
+arch=('x86_64')
+url="https://torreader.cloud"
+license=('MIT')
+depends=('fuse2')
+options=(!strip)
+source=("$pkgname-$pkgver.AppImage::https://github.com/FelixNgH/TorreaderPDF/releases/download/v$pkgver/TorreaderPDF-$pkgver-x86_64.AppImage"
+        "LICENSE::https://raw.githubusercontent.com/FelixNgH/TorreaderPDF/v$pkgver/LICENSE")
+# TODO: thay SKIP bằng sha256 thật khi publish
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  chmod +x "$srcdir/$pkgname-$pkgver.AppImage"
+  cd "$srcdir"
+  ./"$pkgname-$pkgver.AppImage" --appimage-extract
+}
+
+package() {
+  install -d "$pkgdir/opt/torreader"
+  cp -r "$srcdir/squashfs-root/"* "$pkgdir/opt/torreader/"
+
+  install -d "$pkgdir/usr/bin"
+  ln -s /opt/torreader/AppRun "$pkgdir/usr/bin/torreader"
+
+  install -Dm644 "$srcdir/squashfs-root/cloud.torreader.TorReader.desktop" \
+    "$pkgdir/usr/share/applications/cloud.torreader.TorReader.desktop"
+
+  install -Dm644 "$srcdir/squashfs-root/cloud.torreader.TorReader.metainfo.xml" \
+    "$pkgdir/usr/share/metainfo/cloud.torreader.TorReader.metainfo.xml"
+
+  install -Dm644 "$srcdir/squashfs-root/cloud.torreader.TorReader.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/cloud.torreader.TorReader.png"
+
+  install -Dm644 "$srcdir/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
