@@ -52,13 +52,18 @@ find_package(Qt6 REQUIRED COMPONENTS
 )
 
 # ── Viewer MOC (always needed — AUTOMOC may be OFF in AI-only mode) ───────────
+if(WIN32)
 qt6_wrap_cpp(VIEWER_MOC_SRCS
     src/viewer/DWFRenderer.h
     src/viewer/DWFViewer.h
     src/viewer/DWFMainWindow.h
 )
+else()
+set(VIEWER_MOC_SRCS "")
+endif()
 
 # ── DWF Toolkit 7.7 (ODA pre-built) ──────────────────────────────────────────
+if(WIN32)
 set(DWF_DIR "${CMAKE_SOURCE_DIR}/third_party/dwf" CACHE PATH "DWF Toolkit directory")
 set(DWF_INCLUDE_DIR "${DWF_DIR}/include" "${DWF_DIR}/include/dwf")
 
@@ -128,6 +133,13 @@ else()
     )
 
     set(DWF_LIBS dwf_toolkit dwf_whiptk dwf_w3dtk dwf_core dwf_zlib dwf_alloc dwf_jpeg)
+endif()
+endif()
+
+if(NOT WIN32)
+set(DWF_DIR "")
+set(DWF_INCLUDE_DIR "")
+set(DWF_LIBS "")
 endif()
 
 # ── yaml-cpp (rule engine) ─────────────────────────────────────────────────────
@@ -351,6 +363,11 @@ set(HEADERS
 if(FELIXPDF_ENABLE_OCR)
     list(APPEND SOURCES src/core/OcrEngine.cpp)
     list(APPEND HEADERS src/core/OcrEngine.h)
+endif()
+
+if(NOT WIN32)
+    list(FILTER SOURCES EXCLUDE REGEX "(src/dwf/|src/viewer/DWF|src/core/Issue|src/core/Reporter|src/rules/|src/ai/AICopilot)")
+    list(FILTER HEADERS EXCLUDE REGEX "(src/dwf/|src/viewer/DWF|src/core/Issue|src/core/Reporter|src/rules/|src/ai/AICopilot)")
 endif()
 
 # ── Executable ────────────────────────────────────────────────────────────────

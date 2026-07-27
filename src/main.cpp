@@ -34,6 +34,7 @@
 #include <fpdf_text.h>
 extern QMutex s_pdfiumMutex;
 #endif
+#ifdef _WIN32
 #include "dwf/DWFLoader.h"
 #include "viewer/DWFViewer.h"
 #include "viewer/DWFMainWindow.h"
@@ -41,6 +42,7 @@ extern QMutex s_pdfiumMutex;
 #include "rules/RuleEngine.h"
 #include "core/Reporter.h"
 #include "ai/AICopilot.h"
+#endif
 #ifdef _WIN32
 #include <psapi.h>
 #endif
@@ -103,6 +105,7 @@ int main(int argc, char* argv[]) {
     app.setOrganizationName("Loc Nguyen Huy");
     app.setOrganizationDomain("torreader.cloud");
 
+#ifdef _WIN32
     // DWF AI headless CLI mode
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-info") {
         QTextStream out(stdout);
@@ -174,7 +177,9 @@ int main(int argc, char* argv[]) {
         }
         return ok ? 0 : 1;
     }
+#endif
 
+#ifdef _WIN32
     // usage: --dwf-uitest <file.dwf> [out.png]  (bấm THỬ MỌI control GUI, kiểm hiệu ứng, ghi PASS/FAIL từng nút)
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-uitest")) {
         QString dwf = QString::fromLocal8Bit(argv[2]);
@@ -424,7 +429,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "UITEST %d/%d\n", pass, total);
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // usage: --dwf-objects <file.dwf>  (verify: trích object BIM từ ObjectDefinition, dump objects_report.txt)
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-objects")) {
         DWFParse parser;
@@ -462,7 +469,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "OBJECTS_OK total=%d bim_like=%d\n", grandTotal, bimLike);
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // usage: --dwf-props <file.dwf>  (probe: dump property tờ thật từ descriptor ra props_report.txt cạnh exe)
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-props")) {
         DWFParse parser;
@@ -490,7 +499,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "PROPS_OK sections=%d\n", (int)sheets.size());
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // usage: --dwf-guitest <file.dwf> [out.png]  (tự lái GUI: AI Check → chọn issue → Giải thích → chờ Gemini)
     // Test end-to-end wiring của AICopilotPanel headless (offscreen). Ghi guitest_report.txt cạnh exe.
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-guitest")) {
@@ -583,7 +594,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, (gotReply && !gotErr) ? "GUITEST_OK issues=%d\n" : gotErr ? "GUITEST_AI_ERR issues=%d\n" : "GUITEST_TIMEOUT issues=%d\n", issueCount);
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // usage: --dwf-aiexplain <file.dwf> [sheetIndex]  (headless, gọi Gemini giải thích issue)
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-aiexplain")) {
         QString dwf = QString::fromLocal8Bit(argv[2]);
@@ -634,7 +647,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "AIEXPLAIN_OK count=%d/%d\n", done, cap);
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // DWF AI rule-check: detect issues and draw markups, optionally save snapshot
     // usage: --dwf-aicheck <file.dwf> [out.png] [W] [H]
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-aicheck")) {
@@ -671,7 +686,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "AICHECK_OK issues=%d\n", (int)issues.size());
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // DWF headless snapshot: grab the full window including toolbar
     // usage: --dwf-snap <file.dwf> <out.png> [W] [H] [zoom] [fx] [fy] [sheet]
     if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-snap")) {
@@ -709,7 +726,9 @@ int main(int argc, char* argv[]) {
                 out.toLocal8Bit().constData(), W, H);
         return ok ? 0 : 1;
     }
+#endif
 
+#ifdef _WIN32
     // DWF text dump: print all text objects of the richest sheet (x y rot | text) for diagnosis
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-textdump") {
         DWFParse gp;
@@ -746,7 +765,9 @@ int main(int argc, char* argv[]) {
         }
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // DWF interactive viewer mode
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-view") {
         app.setStyle(QStyleFactory::create("Fusion"));
@@ -754,7 +775,9 @@ int main(int argc, char* argv[]) {
         win->show();
         return app.exec();
     }
+#endif
 
+#ifdef _WIN32
     // DWF rule engine test mode
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-rules") {
         QTextStream out(stdout);
@@ -795,7 +818,9 @@ int main(int argc, char* argv[]) {
         out.flush();
         return 0;
     }
+#endif
 
+#ifdef _WIN32
     // DWF report generation test mode
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-report") {
         QTextStream out(stdout);
@@ -841,6 +866,7 @@ int main(int argc, char* argv[]) {
         out.flush();
         return 0;
     }
+#endif
 
 #ifndef TORREADER_NO_PDFIUM
     // Hidden headless CLI mode for crash reproduction
@@ -2454,9 +2480,15 @@ int main(int argc, char* argv[]) {
                     if (!FPDFPageObj_GetStrokeWidth(obj, &s.sw)) s.sw = 0;
                     int dc = FPDFPageObj_GetDashCount(obj);
                     if (dc > 0) { s.dash.resize(dc); FPDFPageObj_GetDashArray(obj, s.dash.data(), dc); }
+#ifdef _WIN32
                     FPDF_BOOL strokeFlag = FALSE;
                     if (!FPDFPath_GetDrawMode(obj, &s.fillMode, &strokeFlag)) { s.fillMode = 0; strokeFlag = FALSE; }
                     s.hasStroke = (strokeFlag != FALSE);
+#else
+                    FPDF_BOOL strokeFlag = 0;
+                    if (!FPDFPath_GetDrawMode(obj, &s.fillMode, &strokeFlag)) { s.fillMode = 0; strokeFlag = 0; }
+                    s.hasStroke = (strokeFlag != 0);
+#endif
                     if (s.fillOk && s.hasStroke) ++nBoth;
                     else if (s.fillOk) ++nFillOnly;
                     else if (s.hasStroke) ++nStrokeOnly;
@@ -2649,6 +2681,7 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef TORREADER_NO_PDFIUM
+#ifdef _WIN32
     app.setStyle(QStyleFactory::create("Fusion"));
     QString startFile = (argc > 1) ? QString::fromLocal8Bit(argv[1]) : QString();
     if (startFile.isEmpty()) {
@@ -2659,6 +2692,7 @@ int main(int argc, char* argv[]) {
     win->setWindowTitle(QStringLiteral("TorReader DWF Viewer"));
     win->resize(1280, 800);
     win->show();
+#endif
 #endif
 
     return app.exec();
