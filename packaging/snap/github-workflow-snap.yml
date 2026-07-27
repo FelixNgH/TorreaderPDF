@@ -1,0 +1,62 @@
+name: Snap
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: snapcore/action-build@v1
+        id: snapcraft
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: torreader-snap
+          path: ${{ steps.snapcraft.outputs.snap }}
+
+      # Verify: install and check the app opens a window under Xvfb
+      - name: Verify snap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils
+          sudo snap install --dangerous "${{ steps.snapcraft.outputs.snap }}"
+          Xvfb :99 -screen 0 1280x800x24 &>/tmp/xvfb.log &
+          export DISPLAY=:99
+          for i in $(seq 1 15); do
+            xdpyinfo &>/dev/null && break || sleep 1
+          done
+          torreader &>/tmp/app.log &
+          APP_PID=$!
+          PASS=0
+          for i in $(seq 1 20); do
+            if ! kill -0 $APP_PID 2>/dev/null; then
+              echo '=== app exited early, last 20 log lines ==='
+              tail -20 /tmp/app.log
+              echo 'VERIFY: FAIL'
+              exit 1
+            fi
+            if xwininfo -root -tree 2>/dev/null | grep -qi 'TorReader'; then
+              PASS=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$PASS" -eq 0 ]; then
+            echo '=== timeout, last 20 log lines ==='
+            tail -20 /tmp/app.log
+            echo 'VERIFY: FAIL'
+            exit 1
+          fi
+          kill $APP_PID 2>/dev/null || true
+          echo 'VERIFY: PASS'
+
+      # To publish to Snap Store: snapcraft upload --release=stable <snap>
+      # Requires SNAPCRAFT_STORE_CREDENTIALS secret set in repo.

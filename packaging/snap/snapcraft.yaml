@@ -1,0 +1,126 @@
+name: torreader
+version: '2.2.4'
+base: core22
+grade: stable
+confinement: strict
+
+summary: Fast offline PDF reader, editor and merger
+description: |
+  TorReader PDF is a fast, offline, portable PDF reader and editor for large documents.
+  Open 200 MB files in 1–2 seconds, scroll continuously, and view crisp text at any zoom level.
+
+  Features:
+  • Merge PDFs with bookmark remapping — preserves bookmark page numbers
+  • Split by page count or file size, extract or insert pages from other files
+  • Free in-app text translation
+  • Annotations: freehand, highlight, line/arrow, text, note, rectangle
+  • Full-text search (Ctrl+F, result count, sidebar Search tab)
+  • Reorder / delete pages, dark mode
+  • 100% offline, local — no account, no ads, no watermark
+
+license: MIT
+website: https://torreader.cloud
+source-code: https://github.com/FelixNgH/TorreaderPDF
+issues: https://github.com/FelixNgH/TorreaderPDF/issues
+
+extensions:
+  - kde-neon-6
+
+apps:
+  torreader:
+    command: usr/bin/TorReader
+    common-id: cloud.torreader.TorReader
+    desktop: usr/share/applications/cloud.torreader.TorReader.desktop
+    plugs:
+      - home
+      - removable-media
+      - network
+      - opengl
+      - desktop
+      - desktop-legacy
+      - x11
+      - wayland
+      - cups
+      - unity7
+
+parts:
+  torreader:
+    plugin: cmake
+    source: .
+    cmake-parameters:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_PREFIX=/usr
+    build-packages:
+      - build-essential
+      - qt6-base-dev
+      - libqt6svg6-dev
+      - libgl1-mesa-dev
+      - liblcms2-dev
+      - zlib1g-dev
+      - libqpdf-dev
+      - libjpeg-dev
+      - libssl-dev
+      - curl
+      - python3-pip
+      - patchelf
+    override-build: |
+      set -eux
+
+      # rustup stable (apt cargo 1.66 can't read Cargo.lock v4)
+      export RUSTUP_HOME="${CRAFT_PART_BUILD}/.rustup"
+      export CARGO_HOME="${CRAFT_PART_BUILD}/.cargo"
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --no-modify-path
+      export PATH="${CARGO_HOME}/bin:${PATH}"
+
+      # CMake 3.30 (apt 3.22 too old; pin 3.30.x — 4.x breaks corrosion)
+      pip install "cmake==3.30.*"
+      export PATH="${CRAFT_PART_BUILD}/.local/bin:${PATH}"
+
+      # pdfium on library path for linker
+      export LD_LIBRARY_PATH="${CRAFT_PART_SRC}/third_party/pdfium/lib:${LD_LIBRARY_PATH}"
+
+      cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        "${CRAFT_PART_SRC}"
+      make -j"$(nproc)"
+
+      # ── Stage files ──────────────────────────────────────────────────────
+
+      # Binary
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/bin"
+      cp build/bin/TorReader "${CRAFT_PART_INSTALL}/usr/bin/"
+
+      # Set rpath so libpdfium.so and Qt libs are found at runtime
+      patchelf --set-rpath '$ORIGIN/../lib' \
+        "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
+
+      # libpdfium.so (bundled pre-built binary)
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/lib"
+      cp "${CRAFT_PART_SRC}/third_party/pdfium/lib/libpdfium.so" \
+        "${CRAFT_PART_INSTALL}/usr/lib/"
+
+      # Desktop file
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/share/applications"
+      cp "${CRAFT_PART_SRC}/packaging/linux/cloud.torreader.TorReader.desktop" \
+        "${CRAFT_PART_INSTALL}/usr/share/applications/"
+
+      # Fix Exec= and Icon= for snap layout
+      sed -i 's|^Exec=TorReader %f|Exec=torreader %f|' \
+        "${CRAFT_PART_INSTALL}/usr/share/applications/cloud.torreader.TorReader.desktop"
+      sed -i 's|^Icon=cloud.torreader.TorReader|Icon=${SNAP}/usr/share/icons/hicolor/256x256/apps/cloud.torreader.TorReader.png|' \
+        "${CRAFT_PART_INSTALL}/usr/share/applications/cloud.torreader.TorReader.desktop"
+
+      # Metainfo
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/share/metainfo"
+      cp "${CRAFT_PART_SRC}/packaging/linux/cloud.torreader.TorReader.metainfo.xml" \
+        "${CRAFT_PART_INSTALL}/usr/share/metainfo/"
+
+      # Icon
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/share/icons/hicolor/256x256/apps"
+      cp "${CRAFT_PART_SRC}/resources/Logo_rectangle.png" \
+        "${CRAFT_PART_INSTALL}/usr/share/icons/hicolor/256x256/apps/cloud.torreader.TorReader.png"
+
+      # Remove full build tree — only explicitly staged files go in the snap
+      rm -rf "${CRAFT_PART_BUILD}"
