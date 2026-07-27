@@ -83,9 +83,18 @@ parts:
       # pdfium on library path for linker
       export LD_LIBRARY_PATH="${CRAFT_PART_SRC}/third_party/pdfium/lib:${LD_LIBRARY_PATH}"
 
+      # QPDF: dpkg-query đường dẫn thật, không hard-code kiến trúc
+      QPDF_SO="$(dpkg -L libqpdf-dev | grep -E '/libqpdf\.so$' | head -1)"
+      QPDF_INC="$(dpkg -L libqpdf-dev | grep -E '/qpdf/QPDF\.hh$' | head -1)"
+      QPDF_INC="$(dirname "$(dirname "$QPDF_INC")")"
+      test -n "$QPDF_SO" && test -f "$QPDF_SO" || { echo "libqpdf.so not found"; exit 1; }
+      echo "QPDF: $QPDF_SO / $QPDF_INC"
+
       cmake \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr \
+        -DQPDF_LIB="$QPDF_SO" \
+        -DQPDF_INCLUDE="$QPDF_INC" \
         "${CRAFT_PART_SRC}"
       make -j"$(nproc)"
 
