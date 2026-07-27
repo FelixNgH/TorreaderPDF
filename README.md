@@ -68,7 +68,7 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 
 ## Features
 
-- **Fast PDF viewer, built for large drawing sets** — memory-mapped loading opens 200MB files in 1–2s; **300-page A1 CAD sets** scroll and page without freezing thanks to progressive interruptible rendering + a two-layer cache; continuous scroll is RAM-efficient (off-screen pages evicted), sharp at every zoom even with mixed page sizes (A4 + A0–A3 in one file)
+- **Fast PDF viewer, built for large drawing sets** — memory-mapped loading opens 900MB files in 1–2s; **300-page A1 CAD sets** scroll and page without freezing thanks to progressive interruptible rendering + a two-layer cache; continuous scroll is RAM-efficient (off-screen pages evicted), sharp at every zoom even with mixed page sizes (A4 + A0–A3 in one file)
 - **Merge PDF** — combine files while **keeping every bookmark**, remapped to the new page numbers (most tools drop them); unbookmarked pages get an auto "Page N" entry
 - **Split PDF** — split a document into parts by page count or size
 - **Extract pages** — pull any page or range out into a new PDF
