@@ -1,9 +1,13 @@
 # Snap package for TorReader PDF
 
+snapcraft **chỉ** đọc snapcraft.yaml từ `snap/snapcraft.yaml` hoặc thư mục gốc,
+**không** từ `packaging/snap/snapcraft.yaml`. Vì vậy file được đặt tại
+`snap/snapcraft.yaml`.
+
 ## Build locally (requires snapcraft)
 
 ```bash
-snapcraft -p packaging/snap
+snapcraft
 sudo snap install --dangerous torreader_*.snap
 torreader
 ```

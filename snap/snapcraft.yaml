@@ -7,7 +7,7 @@ confinement: strict
 summary: Fast offline PDF reader, editor and merger
 description: |
   TorReader PDF is a fast, offline, portable PDF reader and editor for large documents.
-  Open   900 MB files in 1–2 seconds, scroll continuously, and view crisp text at any zoom level.
+  Open 900 MB files in 1–2 seconds, scroll continuously, and view crisp text at any zoom level.
 
   Features:
   • Merge PDFs with bookmark remapping — preserves bookmark page numbers
@@ -23,11 +23,9 @@ website: https://torreader.cloud
 source-code: https://github.com/FelixNgH/TorreaderPDF
 issues: https://github.com/FelixNgH/TorreaderPDF/issues
 
-extensions:
-  - kde-neon-6
-
 apps:
   torreader:
+    extensions: [kde-neon-6]
     command: usr/bin/TorReader
     common-id: cloud.torreader.TorReader
     desktop: usr/share/applications/cloud.torreader.TorReader.desktop
@@ -63,6 +61,9 @@ parts:
       - curl
       - python3-pip
       - patchelf
+    stage-packages:
+      - libqpdf28
+      - liblcms2-2
     override-build: |
       set -eux
 
@@ -74,8 +75,10 @@ parts:
       export PATH="${CARGO_HOME}/bin:${PATH}"
 
       # CMake 3.30 (apt 3.22 too old; pin 3.30.x — 4.x breaks corrosion)
-      pip install "cmake==3.30.*"
-      export PATH="${CRAFT_PART_BUILD}/.local/bin:${PATH}"
+      pip install --target="${CRAFT_PART_BUILD}/cmake-tool" "cmake==3.30.*"
+      export PATH="${CRAFT_PART_BUILD}/cmake-tool/bin:${PATH}"
+      export PYTHONPATH="${CRAFT_PART_BUILD}/cmake-tool:${PYTHONPATH:-}"
+      cmake --version   # in ra để chắc chắn là 3.30.x, không phải 3.22
 
       # pdfium on library path for linker
       export LD_LIBRARY_PATH="${CRAFT_PART_SRC}/third_party/pdfium/lib:${LD_LIBRARY_PATH}"
@@ -90,7 +93,7 @@ parts:
 
       # Binary
       mkdir -p "${CRAFT_PART_INSTALL}/usr/bin"
-      cp build/bin/TorReader "${CRAFT_PART_INSTALL}/usr/bin/"
+      cp "${CRAFT_PART_BUILD}/bin/TorReader" "${CRAFT_PART_INSTALL}/usr/bin/"
 
       # Set rpath so libpdfium.so and Qt libs are found at runtime
       patchelf --set-rpath '$ORIGIN/../lib' \
@@ -122,5 +125,4 @@ parts:
       cp "${CRAFT_PART_SRC}/resources/Logo_rectangle.png" \
         "${CRAFT_PART_INSTALL}/usr/share/icons/hicolor/256x256/apps/cloud.torreader.TorReader.png"
 
-      # Remove full build tree — only explicitly staged files go in the snap
-      rm -rf "${CRAFT_PART_BUILD}"
+
