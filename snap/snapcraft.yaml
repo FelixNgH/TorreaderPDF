@@ -104,9 +104,11 @@ parts:
       mkdir -p "${CRAFT_PART_INSTALL}/usr/bin"
       cp "${CRAFT_PART_BUILD}/bin/TorReader" "${CRAFT_PART_INSTALL}/usr/bin/"
 
-      # Set rpath so libpdfium.so and Qt libs are found at runtime
-      patchelf --set-rpath '$ORIGIN/../lib' \
+      # Set rpath so libpdfium.so, Qt libs, and stage-packages are found
+      TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+      patchelf --set-rpath "\$ORIGIN/../lib:\$ORIGIN/../lib/${TRIPLET}" \
         "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
+      patchelf --print-rpath "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
 
       # libpdfium.so (bundled pre-built binary)
       mkdir -p "${CRAFT_PART_INSTALL}/usr/lib"
