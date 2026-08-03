@@ -64,7 +64,7 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
 Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 
 <details>
-<summary>What's new in 2.2.4</summary>
+<summary>In 2.3</summary>
 
 ![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
 
