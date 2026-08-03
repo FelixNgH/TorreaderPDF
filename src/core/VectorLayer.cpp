@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QElapsedTimer>
 #include <QDebug>
+#include <QVarLengthArray>
 #include <algorithm>
 #include <cmath>
 
@@ -23,6 +24,7 @@ void VectorLayer::clear() {
     m_ready = false;
     m_complete = false;
     m_page = -1;
+    m_rotation = 0;
     m_pageSize = {};
     m_verts.clear();
     m_colors.clear();
@@ -66,21 +68,31 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) return false;
 
+    // FPDF_GetPageWidth/Height DA ap /Rotate -> day la co HIEN THI, KHONG phai co hop crop.
     double pageW = FPDF_GetPageWidth(page);
     double pageH = FPDF_GetPageHeight(page);
-    m_pageSize = QSizeF(pageW, pageH);
+    const int rot = FPDFPage_GetRotation(page) & 3;   // 0..3
+    m_rotation = rot;
     m_page = pageIndex;
 
     float cbL = 0.f, cbB = 0.f, cbR = 0.f, cbT = 0.f;
     bool haveBox = FPDFPage_GetCropBox(page, &cbL, &cbB, &cbR, &cbT);
     if (!haveBox) haveBox = FPDFPage_GetMediaBox(page, &cbL, &cbB, &cbR, &cbT);
-    if (!haveBox || cbR <= cbL || cbT <= cbB) { cbL = 0.f; cbB = 0.f;
-                                               cbR = float(pageW); cbT = float(pageH); }
+    if (!haveBox || cbR <= cbL || cbT <= cbB) {
+        // Khong doc duoc hop: suy nguoc tu co hien thi (bo xoay ra)
+        cbL = 0.f; cbB = 0.f;
+        if (rot & 1) { cbR = float(pageH); cbT = float(pageW); }
+        else         { cbR = float(pageW); cbT = float(pageH); }
+    }
+    // m_pageSize = khong gian hinh hoc CHUA xoay (moi toa do phat ra deu nam trong hop nay)
+    m_pageSize = QSizeF(double(cbR) - double(cbL), double(cbT) - double(cbB));
     const double originX = double(cbL);
     const double topY    = double(cbT);
     qDebug().noquote() << "[vector] box page=" << pageIndex
                        << "crop=" << cbL << cbB << cbR << cbT
-                       << "pageWH=" << pageW << pageH;
+                       << "rot=" << rot
+                       << "layerWH=" << m_pageSize.width() << m_pageSize.height()
+                       << "dispWH=" << pageW << pageH;
 
     uint8_t vr = 0, vg = 0, vb = 0, va = 255;
     float   curWidth = 0.0f;
@@ -88,14 +100,63 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     float   dashRun = 0.0f;
     float   curDepth = 1.0f;
     float   curClip = 0.0f;
+    const QVector<QVector<QPointF>>* curClipTris = nullptr;
 
-    auto emitSeg = [&](float x0, float y0, float x1, float y1) {
+    // Cat doan [p0,p1] vao TAM GIAC t[0..2] (luon loi). Tra ve true + khoang tham so [a,b] con lai.
+    auto clipSegToTri = [](float x0, float y0, float x1, float y1,
+                           const QPointF* t, double& a, double& b) -> bool {
+        const double area2 = (t[1].x()-t[0].x())*(t[2].y()-t[0].y())
+                           - (t[1].y()-t[0].y())*(t[2].x()-t[0].x());
+        if (std::fabs(area2) < 1e-12) return false;
+        const double s = (area2 > 0) ? 1.0 : -1.0;
+        for (int e = 0; e < 3; ++e) {
+            const QPointF& A = t[e];
+            const QPointF& B = t[(e + 1) % 3];
+            const double ex = B.x() - A.x(), ey = B.y() - A.y();
+            const double f0 = s * (ex * (double(y0) - A.y()) - ey * (double(x0) - A.x()));
+            const double f1 = s * (ex * (double(y1) - A.y()) - ey * (double(x1) - A.x()));
+            const double df = f1 - f0;
+            if (std::fabs(df) < 1e-12) { if (f0 < 0.0) return false; continue; }
+            const double tt = -f0 / df;
+            if (df > 0.0) { if (tt > a) a = tt; }
+            else          { if (tt < b) b = tt; }
+            if (a > b) return false;
+        }
+        return b > a + 1e-9;
+    };
+
+    auto emitSegRaw = [&](float x0, float y0, float x1, float y1) {
         m_verts.append(x0); m_verts.append(y0);
         m_verts.append(x1); m_verts.append(y1);
         m_colors.append(vr); m_colors.append(vg); m_colors.append(vb); m_colors.append(va);
         m_widths.append(curWidth);
         m_depths.append(curDepth);
         m_clipIdx.append(curClip);
+    };
+
+    auto emitSeg = [&](float x0, float y0, float x1, float y1) {
+        if (!curClipTris || curClipTris->isEmpty()) { emitSegRaw(x0, y0, x1, y1); return; }
+        QVarLengthArray<QPair<double, double>, 16> segs;
+        segs.append(qMakePair(0.0, 1.0));
+        for (const QVector<QPointF>& tris : *curClipTris) {
+            QVarLengthArray<QPair<double, double>, 16> next;
+            for (const QPair<double, double>& sg : segs) {
+                for (int ti = 0; ti + 2 < tris.size(); ti += 3) {
+                    double a = 0.0, b = 1.0;
+                    if (!clipSegToTri(x0, y0, x1, y1, tris.constData() + ti, a, b)) continue;
+                    const double na = qMax(a, sg.first), nb = qMin(b, sg.second);
+                    if (nb > na + 1e-9) next.append(qMakePair(na, nb));
+                }
+            }
+            segs = next;
+            if (segs.isEmpty()) return;
+            if (segs.size() > 512) { emitSegRaw(x0, y0, x1, y1); return; }
+        }
+        const double dx = double(x1) - double(x0), dy = double(y1) - double(y0);
+        for (const QPair<double, double>& sg : segs) {
+            emitSegRaw(float(x0 + dx * sg.first),  float(y0 + dy * sg.first),
+                       float(x0 + dx * sg.second), float(y0 + dy * sg.second));
+        }
     };
 
     auto emitStroke = [&](float x0, float y0, float x1, float y1) {
@@ -156,54 +217,99 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             m_fillClipIdx.append(curClip);
         }
     };
-    auto triangulate = [&](const QVector<QPointF>& src,
-                           uint8_t r, uint8_t g, uint8_t bl, uint8_t al) {
-        QVector<QPointF> pts;
-        pts.reserve(src.size());
-        for (const QPointF& q : src) {
-            if (!pts.isEmpty()
-                && std::fabs(pts.last().x() - q.x()) < 1e-4
-                && std::fabs(pts.last().y() - q.y()) < 1e-4) continue;
-            pts.append(q);
-        }
-        if (pts.size() > 2
-            && std::fabs(pts.first().x() - pts.last().x()) < 1e-4
-            && std::fabs(pts.first().y() - pts.last().y()) < 1e-4) pts.removeLast();
-        if (pts.size() < 3) return;
-        if (pts.size() > 256) {
-            for (int i = 1; i + 1 < pts.size(); ++i) pushTri(pts[0], pts[i], pts[i + 1], r, g, bl, al);
-            return;
-        }
-        QVector<int> idx(pts.size());
-        for (int i = 0; i < pts.size(); ++i) idx[i] = i;
-        const bool ccw = polyArea2(pts) > 0;
-        int guard = 0;
-        while (idx.size() > 3 && guard++ < 4096) {
-            bool clipped = false;
-            for (int i = 0; i < idx.size(); ++i) {
-                const QPointF& a = pts[idx[(i + idx.size() - 1) % idx.size()]];
-                const QPointF& b = pts[idx[i]];
-                const QPointF& c = pts[idx[(i + 1) % idx.size()]];
-                const double cr = (b.x()-a.x())*(c.y()-a.y()) - (b.y()-a.y())*(c.x()-a.x());
-                if ((ccw && cr <= 0) || (!ccw && cr >= 0)) continue;
-                bool bad = false;
-                for (int j = 0; j < idx.size() && !bad; ++j) {
-                    if (j == i || j == (i + idx.size() - 1) % idx.size() || j == (i + 1) % idx.size()) continue;
-                    if (pointInTri(pts[idx[j]], a, b, c)) bad = true;
-                }
-                if (bad) continue;
-                pushTri(a, b, c, r, g, bl, al);
-                idx.remove(i);
-                clipped = true;
-                break;
+    // Phan ra vung clip thanh HINH THANG bang quet doc (scanline) theo luat EVEN-ODD, roi cat doi
+    // moi hinh thang thanh 2 tam giac. Phai lam vay moi dung khi duong clip co LO: ear-clip tung
+    // subpath roi HOP se lap day lo. PDFium khong co API doc luat winding cua clip; file CAD dung
+    // eofill (733/737 clip cua trang mau) nen chon even-odd — clip chi co 1 contour thi 2 luat nhu nhau.
+    auto buildTris = [](const QVector<QVector<QPointF>>& subs, bool evenOdd, QVector<QPointF>& out) {
+        struct Edge { double x0, y0, x1, y1; int dir; };
+        QVector<Edge> edges;
+        QVector<double> ys;
+        for (const QVector<QPointF>& sp : subs) {
+            const int n = sp.size();
+            if (n < 3) continue;
+            for (int i = 0; i < n; ++i) {
+                const QPointF& a = sp[i];
+                const QPointF& b = sp[(i + 1) % n];
+                if (std::fabs(a.y() - b.y()) < 1e-9) continue;
+                edges.append(Edge{a.x(), a.y(), b.x(), b.y(), (b.y() > a.y()) ? 1 : -1});
+                ys.append(a.y());
+                ys.append(b.y());
             }
-            if (!clipped) break;
         }
-        if (idx.size() == 3) { pushTri(pts[idx[0]], pts[idx[1]], pts[idx[2]], r, g, bl, al); }
-        else if (idx.size() > 3) {
-            for (int i = 1; i + 1 < idx.size(); ++i)
-                pushTri(pts[idx[0]], pts[idx[i]], pts[idx[i + 1]], r, g, bl, al);
+        if (edges.isEmpty()) return;
+        std::sort(ys.begin(), ys.end());
+        ys.erase(std::unique(ys.begin(), ys.end(),
+                             [](double p, double q){ return std::fabs(p - q) < 1e-9; }), ys.end());
+        struct Cross { double xa, xb; int dir; };
+        QVector<Cross> xs;
+        for (int bi = 0; bi + 1 < ys.size(); ++bi) {
+            const double ya = ys[bi], yb = ys[bi + 1];
+            if (yb - ya < 1e-9) continue;
+            xs.clear();
+            for (const Edge& e : edges) {
+                const double lo = qMin(e.y0, e.y1), hi = qMax(e.y0, e.y1);
+                if (lo > ya + 1e-9 || hi < yb - 1e-9) continue;
+                const double dy = e.y1 - e.y0;
+                if (std::fabs(dy) < 1e-12) continue;
+                const double t0 = (ya - e.y0) / dy;
+                const double t1 = (yb - e.y0) / dy;
+                xs.append(Cross{e.x0 + (e.x1 - e.x0) * t0,
+                                e.x0 + (e.x1 - e.x0) * t1, e.dir});
+            }
+            if (xs.size() < 2) continue;
+            std::sort(xs.begin(), xs.end(),
+                      [](const Cross& p, const Cross& q) {
+                          return (p.xa + p.xb) < (q.xa + q.xb);
+                      });
+            int wind = 0;
+            for (int k = 0; k + 1 < xs.size(); ++k) {
+                wind += evenOdd ? 1 : xs[k].dir;
+                const bool inside = evenOdd ? ((k + 1) & 1) != 0 : (wind != 0);
+                if (!inside) continue;
+                const double la = xs[k].xa,     lb = xs[k].xb;
+                const double ra = xs[k + 1].xa, rb = xs[k + 1].xb;
+                if (ra - la < 1e-9 && rb - lb < 1e-9) continue;
+                const QPointF p0(la, ya), p1(ra, ya), p2(rb, yb), p3(lb, yb);
+                out.append(p0); out.append(p1); out.append(p2);
+                out.append(p0); out.append(p2); out.append(p3);
+            }
         }
+    };
+
+    // Sutherland-Hodgman: cat da giac `poly` bang TAM GIAC (luon loi) t[0..2]. Chinh xac tuyet doi.
+    auto clipByTri = [](const QVector<QPointF>& poly, const QPointF* t) -> QVector<QPointF> {
+        QVector<QPointF> out = poly;
+        const double area2 = (t[1].x()-t[0].x())*(t[2].y()-t[0].y())
+                           - (t[1].y()-t[0].y())*(t[2].x()-t[0].x());
+        if (std::fabs(area2) < 1e-12) return QVector<QPointF>();
+        const double s = (area2 > 0) ? 1.0 : -1.0;
+        for (int e = 0; e < 3 && out.size() >= 3; ++e) {
+            const QPointF& a = t[e];
+            const QPointF& b = t[(e + 1) % 3];
+            auto side = [&](const QPointF& p) {
+                return s * ((b.x()-a.x())*(p.y()-a.y()) - (b.y()-a.y())*(p.x()-a.x()));
+            };
+            QVector<QPointF> in;
+            in.reserve(out.size() + 4);
+            for (int i = 0; i < out.size(); ++i) {
+                const QPointF& p = out[i];
+                const QPointF& q = out[(i + 1) % out.size()];
+                const double dp = side(p), dq = side(q);
+                const bool ip = (dp >= -1e-9), iq = (dq >= -1e-9);
+                if (ip) in.append(p);
+                if (ip != iq) {
+                    const double den = dp - dq;
+                    if (std::fabs(den) > 1e-12) {
+                        const double tt = dp / den;
+                        in.append(QPointF(p.x() + (q.x() - p.x()) * tt,
+                                          p.y() + (q.y() - p.y()) * tt));
+                    }
+                }
+            }
+            out = in;
+        }
+        return (out.size() >= 3) ? out : QVector<QPointF>();
     };
 
     int nObj = FPDFPage_CountObjects(page);
@@ -230,6 +336,9 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     m_clips.clear();
     m_clips.append(QRectF());
     QHash<const void*, float> clipCache;
+    QHash<const void*, QVector<QVector<QPointF>>> clipTriCache;
+    clipTriCache.reserve(1024);   // bot rehash -> bot rui ro con tro treo
+    int dbgClipPolyBuilt = 0, dbgFillClipped = 0, dbgFillClipBail = 0;
     int dbgClipPtr = 0, dbgClipNoGeom = 0, dbgClipTooBig = 0;
 
     for (int oi = 0; oi < nObj; ++oi) {
@@ -238,10 +347,13 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
         if (!obj) continue;
 
         curClip = 0.0f;
+        curClipTris = nullptr;
         if (FPDF_CLIPPATH cp = FPDFPageObj_GetClipPath(obj)) {
             auto it = clipCache.constFind((const void*)cp);
             if (it != clipCache.constEnd()) {
                 curClip = *it;
+                auto tit = clipTriCache.constFind((const void*)cp);
+                if (tit != clipTriCache.constEnd() && !tit->isEmpty()) curClipTris = &(*tit);
             } else {
                 ++dbgClipPtr;
                 double gl = -1e30, gb = -1e30, gr = 1e30, gt = 1e30;
@@ -289,6 +401,43 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                         }
                     } else if (cover >= 0.995) {
                         ++dbgClipTooBig;
+                    }
+                    // Tam giac clip: dung ke ca khi m_clips DA DAY (shader chi cat duoc 64 clip,
+                    // con cat hinh hoc o CPU thi khong bi gioi han do).
+                    if (cover < 0.995) {
+                        QVector<QVector<QPointF>> perPath;
+                        bool clipUsable = true;
+                        for (int pi = 0; pi < np && pi < 8 && clipUsable; ++pi) {
+                            const int ns = FPDFClipPath_CountPathSegments(cp, pi);
+                            if (ns <= 0) continue;
+                            QVector<QVector<QPointF>> subs;
+                            QVector<QPointF> sub;
+                            for (int si2 = 0; si2 < ns; ++si2) {
+                                FPDF_PATHSEGMENT s = FPDFClipPath_GetPathSegment(cp, pi, si2);
+                                if (!s) continue;
+                                const int st = FPDFPathSegment_GetType(s);
+                                if (st == FPDF_SEGMENT_BEZIERTO) { clipUsable = false; break; }
+                                float px = 0, py = 0;
+                                if (!FPDFPathSegment_GetPoint(s, &px, &py)) continue;
+                                const QPointF q(double(px) - originX, topY - double(py));
+                                if (st == FPDF_SEGMENT_MOVETO) {
+                                    if (sub.size() >= 3) subs.append(sub);
+                                    sub.clear();
+                                }
+                                sub.append(q);
+                            }
+                            if (!clipUsable) break;
+                            if (sub.size() >= 3) subs.append(sub);
+                            QVector<QPointF> tris;
+                            buildTris(subs, true, tris);
+                            if (tris.size() >= 3) perPath.append(tris);
+                        }
+                        if (clipUsable && !perPath.isEmpty()) {
+                            clipTriCache.insert((const void*)cp, perPath);
+                            auto nit = clipTriCache.constFind((const void*)cp);
+                            if (nit != clipTriCache.constEnd()) curClipTris = &(*nit);
+                            ++dbgClipPolyBuilt;
+                        }
                     }
                 }
                 clipCache.insert((const void*)cp, idx);
@@ -523,8 +672,43 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                                            << "nSub=" << subpaths.size();
                     }
                 }
-                for (const QVector<QPointF>& sp : subpaths) {
-                    triangulate(sp, fillR, fillG, fillB, fillA);
+                QVector<QPointF> fillTris;
+                buildTris(subpaths, (fillMode == FPDF_FILLMODE_ALTERNATE), fillTris);
+                if (!curClipTris || curClipTris->isEmpty()) {
+                    for (int ti = 0; ti + 2 < fillTris.size(); ti += 3)
+                        pushTri(fillTris[ti], fillTris[ti + 1], fillTris[ti + 2],
+                                fillR, fillG, fillB, fillA);
+                } else {
+                    for (int ti = 0; ti + 2 < fillTris.size(); ti += 3) {
+                        const double fl = qMin(fillTris[ti].x(), qMin(fillTris[ti+1].x(), fillTris[ti+2].x()));
+                        const double fr = qMax(fillTris[ti].x(), qMax(fillTris[ti+1].x(), fillTris[ti+2].x()));
+                        const double ft = qMin(fillTris[ti].y(), qMin(fillTris[ti+1].y(), fillTris[ti+2].y()));
+                        const double fb = qMax(fillTris[ti].y(), qMax(fillTris[ti+1].y(), fillTris[ti+2].y()));
+                        QVector<QVector<QPointF>> polys;
+                        polys.append(QVector<QPointF>{fillTris[ti], fillTris[ti + 1], fillTris[ti + 2]});
+                        for (const QVector<QPointF>& ctris : *curClipTris) {
+                            QVector<QVector<QPointF>> next;
+                            for (const QVector<QPointF>& p : polys) {
+                                for (int cj = 0; cj + 2 < ctris.size(); cj += 3) {
+                                    const QPointF* t = ctris.constData() + cj;
+                                    const double cl = qMin(t[0].x(), qMin(t[1].x(), t[2].x()));
+                                    const double cr2 = qMax(t[0].x(), qMax(t[1].x(), t[2].x()));
+                                    const double ct = qMin(t[0].y(), qMin(t[1].y(), t[2].y()));
+                                    const double cb = qMax(t[0].y(), qMax(t[1].y(), t[2].y()));
+                                    if (cr2 < fl || cl > fr || cb < ft || ct > fb) continue;
+                                    QVector<QPointF> r = clipByTri(p, t);
+                                    if (r.size() >= 3) next.append(r);
+                                }
+                            }
+                            polys = next;
+                            if (polys.isEmpty()) break;
+                            if (polys.size() > 256) { ++dbgFillClipBail; break; }
+                        }
+                        if (!polys.isEmpty()) ++dbgFillClipped;
+                        for (const QVector<QPointF>& p : polys)
+                            for (int k = 1; k + 1 < p.size(); ++k)
+                                pushTri(p[0], p[k], p[k + 1], fillR, fillG, fillB, fillA);
+                    }
                 }
             } else {
                 ++dbgColFail;
@@ -578,6 +762,9 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                          << "clipPtr=" << dbgClipPtr
                          << "clipNoGeom=" << dbgClipNoGeom
                           << "clipTooBig=" << dbgClipTooBig
+                          << "clipPoly=" << dbgClipPolyBuilt
+                          << "fillClipped=" << dbgFillClipped
+                          << "fillClipBail=" << dbgFillClipBail
                           << "complete=" << (complete ? 1 : 0)
                          << "completeReason=" << completeReason
                        << "ms=" << t.elapsed();
@@ -594,11 +781,15 @@ int VectorLayer::rebuildNoteTiles(FPDF_DOCUMENT doc, FPDF_PAGE page) {
 
     double pageW = FPDF_GetPageWidth(page);
     double pageH = FPDF_GetPageHeight(page);
+    const int rotN = FPDFPage_GetRotation(page) & 3;
     float cbL = 0.f, cbB = 0.f, cbR = 0.f, cbT = 0.f;
     bool haveBox = FPDFPage_GetCropBox(page, &cbL, &cbB, &cbR, &cbT);
     if (!haveBox) haveBox = FPDFPage_GetMediaBox(page, &cbL, &cbB, &cbR, &cbT);
-    if (!haveBox || cbR <= cbL || cbT <= cbB) { cbL = 0.f; cbB = 0.f;
-                                               cbR = float(pageW); cbT = float(pageH); }
+    if (!haveBox || cbR <= cbL || cbT <= cbB) {
+        cbL = 0.f; cbB = 0.f;
+        if (rotN & 1) { cbR = float(pageH); cbT = float(pageW); }
+        else          { cbR = float(pageW); cbT = float(pageH); }
+    }
     const double originX = double(cbL);
     const double topY    = double(cbT);
 

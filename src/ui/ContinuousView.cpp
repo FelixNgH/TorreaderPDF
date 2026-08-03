@@ -800,11 +800,20 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
         if (vit != m_vecLayers.constEnd() && *vit && (*vit)->isReady() && (*vit)->isComplete()) {
             const QSizeF vpSize = (*vit)->pageSizePt();
             if (vpSize.width() > 0 && vpSize.height() > 0) {
+                const int rot = (*vit)->rotation() & 3;
+                const double sx = (rot & 1) ? (cw / vpSize.height()) : (cw / vpSize.width());
+                const double sy = (rot & 1) ? (ch / vpSize.width())  : (ch / vpSize.height());
                 QMatrix4x4 mvp;
                 mvp.ortho(0.f, (float)vpW, (float)vpH, 0.f, -1.f, 1.f);
                 mvp.translate((float)vx, (float)vy, 0.f);
-                mvp.scale((float)(cw / vpSize.width()), (float)(ch / vpSize.height()), 1.f);
-                const float pxPerPt = (float)(cw / vpSize.width());
+                switch (rot) {
+                    case 1: mvp.translate((float)cw, 0.f, 0.f);       mvp.rotate(90.f,  0.f,0.f,1.f); break;
+                    case 2: mvp.translate((float)cw, (float)ch, 0.f); mvp.rotate(180.f, 0.f,0.f,1.f); break;
+                    case 3: mvp.translate(0.f, (float)ch, 0.f);       mvp.rotate(270.f, 0.f,0.f,1.f); break;
+                    default: break;
+                }
+                mvp.scale((float)sx, (float)sy, 1.f);
+                const float pxPerPt = (float)sx;
                 p.beginNativePainting();
                 if (!m_vgrInit) { m_vgr.initialize(); m_vgrInit = true; }
                 {

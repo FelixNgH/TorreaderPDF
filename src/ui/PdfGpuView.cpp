@@ -7,6 +7,7 @@
 #include <QDebug>
 #include <QFontDatabase>
 #include <cmath>
+#include <QVector4D>
 
 // ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
 // accumulation during pan; farthest-from-viewport tiles evicted when exceeded.
@@ -395,18 +396,29 @@ QMatrix4x4 PdfGpuView::computeTransform() const {
 }
 
 QMatrix4x4 PdfGpuView::vectorTransform() const {
-    // Dinh vector o DON VI DIEM PDF, Y-down. Doi thang sang pixel widget.
+    // Dinh vector o DON VI DIEM PDF CHUA XOAY, Y-down. Doi sang pixel widget, co ap /Rotate.
     const QSizeF vp = m_vecLayer ? m_vecLayer->pageSizePt() : QSizeF();
     if (vp.width() <= 0 || vp.height() <= 0) return QMatrix4x4();
 
-    const double pw   = m_pageSizePt.width()  * m_zoom;   // be ngang trang tren man, px
+    const double pw   = m_pageSizePt.width()  * m_zoom;   // be ngang trang tren man, px (DA xoay)
     const double ph   = m_pageSizePt.height() * m_zoom;
     const QPointF orig = pageOrigin();                    // DA gom m_panOffset
+    const int rot = m_vecLayer->rotation() & 3;
+
+    // Voi rot le, be ngang tren man ung voi CHIEU CAO hop chua xoay va nguoc lai.
+    const double sx = (rot & 1) ? (pw / vp.height()) : (pw / vp.width());
+    const double sy = (rot & 1) ? (ph / vp.width())  : (ph / vp.height());
 
     QMatrix4x4 m;
     m.ortho(0.f, (float)width(), (float)height(), 0.f, -1.f, 1.f);
     m.translate((float)orig.x(), (float)orig.y(), 0.f);
-    m.scale((float)(pw / vp.width()), (float)(ph / vp.height()), 1.f);
+    switch (rot) {
+        case 1: m.translate((float)pw, 0.f, 0.f);        m.rotate(90.f,  0.f, 0.f, 1.f); break;
+        case 2: m.translate((float)pw, (float)ph, 0.f);  m.rotate(180.f, 0.f, 0.f, 1.f); break;
+        case 3: m.translate(0.f, (float)ph, 0.f);        m.rotate(270.f, 0.f, 0.f, 1.f); break;
+        default: break;
+    }
+    m.scale((float)sx, (float)sy, 1.f);
     return m;
 }
 
@@ -1821,8 +1833,9 @@ void PdfGpuView::drawVectorOverlay() {
         m_vecProg->setUniformValue(m_vecMvpLoc, mvp);
         uploadClips(m_vecProg);
         const QSizeF vp = m_vecLayer->pageSizePt();
-        const float pxPerPt = (vp.width() > 0.0)
-            ? float(m_pageSizePt.width() * m_zoom / vp.width()) : float(m_zoom);
+        const double vpRef = (m_vecLayer->rotation() & 1) ? vp.height() : vp.width();
+        const float pxPerPt = (vpRef > 0.0)
+            ? float(m_pageSizePt.width() * m_zoom / vpRef) : float(m_zoom);
         glUniform2f(m_vecViewportLoc, float(width()), float(height()));
         glUniform1f(m_vecPxPerPtLoc, pxPerPt);
 
@@ -1846,8 +1859,14 @@ void PdfGpuView::drawVectorOverlay() {
             for (GLuint t : texs) if (t) glDeleteTextures(1, &t);
             texs.fill(0, tiles.size());
         }
-        const QRectF visPt = QRectF(widgetToPdf(QPointF(0, 0)),
-                                    widgetToPdf(QPointF(width(), height()))).normalized();
+        // tt.rectPt nam o khong gian CHUA xoay cua VectorLayer. Nghich dao mvp de lay
+        // vung nhin DUNG khong gian do (mvp da gom ca phep /Rotate).
+        QMatrix4x4 invMvp = mvp.inverted();
+        auto projectNdc = [&](float cx, float cy) -> QPointF {
+            QVector4D v = invMvp * QVector4D(cx, cy, 0, 1);
+            return (v.w() != 0.f) ? QPointF(v.x() / v.w(), v.y() / v.w()) : QPointF();
+        };
+        const QRectF visPt = QRectF(projectNdc(-1.f, 1.f), projectNdc(1.f, -1.f)).normalized();
         for (int i = 0; i < tiles.size(); ++i) {
             const TextTile& tt = tiles[i];
             if (!visPt.intersects(tt.rectPt)) continue;
