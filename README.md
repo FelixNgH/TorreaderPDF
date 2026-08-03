@@ -66,6 +66,7 @@ Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 <details>
 <summary>What's new in 2.2.4</summary>
 
+![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
 
 - **Sharp zoom in Continuous scroll** — the visible area is re-rendered at true
   resolution, so zoomed-in text stays crisp in scroll mode too, not just single-page.
@@ -79,8 +80,6 @@ Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 </details>
 
 ![TorReader PDF demo](docs/screenshots/demo.gif)
-
-![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
 
 <details>
 <summary>More screenshots (viewer, dark mode, markup, digital signature, merge)</summary>
