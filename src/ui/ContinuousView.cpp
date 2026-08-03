@@ -2,6 +2,7 @@
 #include "../core/PdfDocument.h"
 #include "../core/PdfRenderer.h"
 #include "../annotations/AnnotationManager.h"
+#include "../core/VectorGpuRenderer.h"
 
 #include <QPainter>
 #include <QScrollBar>
@@ -13,7 +14,17 @@
 #include <QDebug>
 #include <QFont>
 #include <QFontMetrics>
+#include <QOpenGLWidget>
+#include <QOpenGLContext>
+#include <QMatrix4x4>
+#include <QVector4D>
+#include <QtConcurrent>
+#include <QFutureWatcher>
+#include <cmath>
 #include <algorithm>
+#include <QOpenGLFunctions>
+
+extern QMutex s_pdfiumMutex;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
@@ -72,7 +83,11 @@ ContinuousView::ContinuousView(QWidget* parent)
             }
         }
         qDebug() << "[perf] cont settle timeout — rendering primary page=" << m_primaryPage;
-        m_renderer->requestPageForContinuous(m_primaryPage, m_zoom);
+        if (vectorWillRender(m_primaryPage)) {
+            qDebug() << "[cont] skip raster request (vector lo) page=" << m_primaryPage;
+        } else {
+            m_renderer->requestPageForContinuous(m_primaryPage, m_zoom);
+        }
         m_primaryRequested = true;
     });
 
@@ -112,9 +127,21 @@ ContinuousView::ContinuousView(QWidget* parent)
         qDebug() << "[perf] cont sharp request page=" << pg << "scale=" << m_zoom << "region=" << regionPx;
         emit regionNeeded(pg, m_zoom, regionPx);
     });
+
+    setViewport(new QOpenGLWidget(this));
 }
 
-ContinuousView::~ContinuousView() = default;
+ContinuousView::~ContinuousView()
+{
+    if (m_vgrInit) {
+        auto* glw = qobject_cast<QOpenGLWidget*>(viewport());
+        if (glw) {
+            glw->makeCurrent();
+            m_vgr.release();
+            glw->doneCurrent();
+        }
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -204,12 +231,23 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
 
     m_sharpPage = -1;
     m_sharpPixmap = {};
+    if (m_vgrInit) {
+        auto* glw = qobject_cast<QOpenGLWidget*>(viewport());
+        if (glw) {
+            glw->makeCurrent();
+            m_vgr.release();
+            glw->doneCurrent();
+        }
+        m_vgrInit = false;
+    }
     m_doc      = doc;
     m_renderer = renderer;
     m_pageImages.clear();
     m_pageImageZoom.clear();
     m_pageAnnotVisuals.clear();
     m_continuousRequested.clear();
+    m_vecLayers.clear();
+    m_vecBuilding.clear();
     m_lastEmittedPage = -1;
 
     if (!m_doc || !m_doc->isOpen()) {
@@ -512,6 +550,11 @@ void ContinuousView::requestVisiblePages()
                 }
             }
         }
+        if (vectorWillRender(primary)) {
+            qDebug() << "[cont] skip raster request (vector lo) page=" << primary;
+            requestNeighborPages();
+            goto evict;
+        }
         if (m_renderer->requestFromCacheOnlyForContinuous(primary, m_zoom)) {
             // Cache hit → image arrives synchronously via continuousPageReady
             // handler, which calls requestNeighborPages for us.
@@ -570,7 +613,10 @@ void ContinuousView::requestNeighborPages()
     int pages[] = {m_primaryPage - 1, m_primaryPage + 1};
     for (int i : pages) {
         if (i < 0 || i >= m_pageCount) continue;
-        // Accept any existing image (all are full-quality = good enough for any zoom)
+        if (vectorWillRender(i)) {
+            qDebug() << "[cont] skip raster request (vector lo) page=" << i;
+            continue;
+        }
         if (m_pageImages.contains(i))
             continue;
         if (m_renderer->requestFromCacheOnlyForContinuous(i, m_zoom))
@@ -579,6 +625,54 @@ void ContinuousView::requestNeighborPages()
             qDebug() << "[perf] cont neighbor request page=" << i << "zoom=" << m_zoom;
             m_renderer->requestPageForContinuous(i, m_zoom);
             m_continuousRequested.insert(i);
+        }
+    }
+}
+
+bool ContinuousView::vectorWillRender(int pg) const
+{
+    if (m_vecBuilding.contains(pg)) return true;
+    auto it = m_vecLayers.constFind(pg);
+    if (it != m_vecLayers.constEnd() && *it && (*it)->isReady() && (*it)->isComplete())
+        return true;
+    return false;
+}
+
+void ContinuousView::ensureVectorLayers()
+{
+    if (!m_doc || m_pageCount == 0) return;
+    int center = pageAtCenter();
+    int lo = qMax(0, center - 1);
+    int hi = qMin(m_pageCount - 1, center + 1);
+    for (int pg = lo; pg <= hi; ++pg) {
+        if (m_vecLayers.contains(pg) || m_vecBuilding.contains(pg)) continue;
+        m_vecBuilding.insert(pg);
+        auto layer = std::make_shared<VectorLayer>();
+        auto* w = new QFutureWatcher<bool>(this);
+        connect(w, &QFutureWatcher<bool>::finished, this, [this, w, pg, layer] {
+            w->deleteLater();
+            m_vecBuilding.remove(pg);
+            if (w->result()) m_vecLayers.insert(pg, layer);
+            qDebug().noquote() << "[cont] vecLayer" << (w->result() ? "READY" : "SKIP")
+                               << "page=" << pg << "cached=" << m_vecLayers.size();
+            if (w->result() && !m_pageAnnotVisuals.contains(pg))
+                emit needAnnotVisuals(pg);
+            viewport()->update();
+        });
+        FPDF_DOCUMENT d = m_doc->raw();
+        w->setFuture(QtConcurrent::run([layer, d, pg] {
+            QMutexLocker lk(&s_pdfiumMutex);
+            return layer->build(d, pg);
+        }));
+    }
+    for (auto it = m_vecLayers.begin(); it != m_vecLayers.end(); ) {
+        if (qAbs(it.key() - center) > 1) {
+            qDebug().noquote() << "[cont] vecLayer EVICT page=" << it.key()
+                               << "dist=" << qAbs(it.key() - center) << ">1"
+                               << "remaining=" << m_vecLayers.size() - 1;
+            it = m_vecLayers.erase(it);
+        } else {
+            ++it;
         }
     }
 }
@@ -628,6 +722,7 @@ void ContinuousView::scrollContentsBy(int /*dx*/, int /*dy*/)
 {
     viewport()->update();
     requestVisiblePages();
+    ensureVectorLayers();
     m_scrollTimer->start();
     m_sharpTimer->start();
 }
@@ -637,6 +732,7 @@ void ContinuousView::resizeEvent(QResizeEvent* event)
     QAbstractScrollArea::resizeEvent(event);
     updateScrollBars();
     requestVisiblePages();
+    ensureVectorLayers();
     m_sharpTimer->start();
 }
 
@@ -644,6 +740,13 @@ void ContinuousView::resizeEvent(QResizeEvent* event)
 
 void ContinuousView::paintEvent(QPaintEvent* /*event*/)
 {
+    { static bool logged = false;
+      if (!logged) {
+          qDebug() << "[cont] viewport=" << (qobject_cast<QOpenGLWidget*>(viewport()) ? "QOpenGLWidget" : "plain");
+          logged = true;
+      }
+    }
+
     QElapsedTimer paintTimer;
     paintTimer.start();
 
@@ -691,17 +794,103 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
         // White page background
         p.fillRect(vx, vy, cw, ch, Qt::white);
 
-        // Page content
-        if (m_pageImages.contains(i)) {
-            const QPixmap& px = m_pageImages[i];
-            p.drawPixmap(QRect(vx, vy, cw, ch), px, px.rect());
-            if (i == m_sharpPage && qAbs(m_sharpScale - m_zoom) < 1e-9 && !m_sharpPixmap.isNull()) {
-                p.drawPixmap(QPoint(vx + m_sharpRegion.x(), vy + m_sharpRegion.y()), m_sharpPixmap);
+        // Vector overlay
+        bool drewVector = false;
+        auto vit = m_vecLayers.constFind(i);
+        if (vit != m_vecLayers.constEnd() && *vit && (*vit)->isReady() && (*vit)->isComplete()) {
+            const QSizeF vpSize = (*vit)->pageSizePt();
+            if (vpSize.width() > 0 && vpSize.height() > 0) {
+                QMatrix4x4 mvp;
+                mvp.ortho(0.f, (float)vpW, (float)vpH, 0.f, -1.f, 1.f);
+                mvp.translate((float)vx, (float)vy, 0.f);
+                mvp.scale((float)(cw / vpSize.width()), (float)(ch / vpSize.height()), 1.f);
+                const float pxPerPt = (float)(cw / vpSize.width());
+                p.beginNativePainting();
+                if (!m_vgrInit) { m_vgr.initialize(); m_vgrInit = true; }
+                {
+                    QVector4D c0 = mvp * QVector4D(0, 0, 0, 1);
+                    QVector4D c1 = mvp * QVector4D((float)vpW, (float)vpH, 0, 1);
+                    static int s_i = -1; static float s_vx = -1, s_vy = -1;
+                    static int s_cw = -1, s_ch = -1;
+                    static int s_vpW = -1, s_vpH = -1;
+                    static float s_c0x = 0, s_c0y = 0, s_c1x = 0, s_c1y = 0;
+                    if (i != s_i || vx != s_vx || vy != s_vy || cw != s_cw || ch != s_ch
+                        || vpW != s_vpW || vpH != s_vpH
+                        || qAbs(c0.x() - s_c0x) > 0.01f || qAbs(c0.y() - s_c0y) > 0.01f
+                        || qAbs(c1.x() - s_c1x) > 0.01f || qAbs(c1.y() - s_c1y) > 0.01f) {
+                        qDebug().noquote() << "[cont] page=" << i << "vx=" << vx << "vy=" << vy
+                                           << "cw=" << cw << "ch=" << ch
+                                           << "vpW=" << vpW << "vpH=" << vpH
+                                           << "ndc0=(" << c0.x() << "," << c0.y() << ")"
+                                           << "ndc1=(" << c1.x() << "," << c1.y() << ")";
+                        s_i = i; s_vx = vx; s_vy = vy; s_cw = cw; s_ch = ch;
+                        s_vpW = vpW; s_vpH = vpH;
+                        s_c0x = c0.x(); s_c0y = c0.y(); s_c1x = c1.x(); s_c1y = c1.y();
+                    }
+                }
+                {
+                    QOpenGLFunctions* gl = QOpenGLContext::currentContext()->functions();
+                    const qreal dpr = devicePixelRatioF();
+                    const int sx = int(std::floor(vx * dpr));
+                    const int sy = int(std::floor((vpH - (vy + ch)) * dpr));
+                    const int sw = int(std::ceil(cw * dpr));
+                    const int sh = int(std::ceil(ch * dpr));
+                    GLint prevBox[4] = {0,0,0,0};
+                    gl->glGetIntegerv(GL_SCISSOR_BOX, prevBox);
+                    GLboolean prevOn = gl->glIsEnabled(GL_SCISSOR_TEST);
+                    gl->glEnable(GL_SCISSOR_TEST);
+                    gl->glScissor(sx, sy, qMax(0, sw), qMax(0, sh));
+
+                    m_vgr.draw(*(*vit), mvp, QSize(vpW, vpH), pxPerPt);
+
+                    if (prevOn)
+                        gl->glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
+                    else
+                        gl->glDisable(GL_SCISSOR_TEST);
+                }
+                p.endNativePainting();
+                drewVector = true;
+                if (m_pageImages.contains(i)) {
+                    m_pageImages.remove(i);
+                    m_pageImageZoom.remove(i);
+                    m_continuousRequested.remove(i);
+                    qDebug() << "[cont] drop raster (da co vector) page=" << i;
+                }
             }
-        } else {
-            // Placeholder while render is pending — white background only,
-            // no text, so the transition from blank → blurry → sharp is smooth.
-            p.fillRect(vx, vy, cw, ch, m_darkMode ? QColor(45, 45, 45) : Qt::white);
+        }
+
+        // Page content — skip raster + sharp region when vector layer is present
+        if (!drewVector) {
+            if (m_pageImages.contains(i)) {
+                const QPixmap& px = m_pageImages[i];
+                p.drawPixmap(QRect(vx, vy, cw, ch), px, px.rect());
+                if (i == m_sharpPage && qAbs(m_sharpScale - m_zoom) < 1e-9 && !m_sharpPixmap.isNull()) {
+                    p.drawPixmap(QPoint(vx + m_sharpRegion.x(), vy + m_sharpRegion.y()), m_sharpPixmap);
+                }
+            } else {
+                // Placeholder while render is pending — white background only,
+                // no text, so the transition from blank → blurry → sharp is smooth.
+                p.fillRect(vx, vy, cw, ch, m_darkMode ? QColor(45, 45, 45) : Qt::white);
+            }
+        }
+    }
+
+    {
+        static int lastNv = -1, lastNr = -1;
+        int nv = 0, nr = 0;
+        for (int i = 0; i < m_pageCount; ++i) {
+            int cx = pageLeftX(i), cy = pageTopY(i), cw2 = pageW(i), ch2 = pageH(i);
+            if (cy + ch2 <= scrollY || cy >= scrollY + vpH) continue;
+            if (cx + cw2 <= scrollX || cx >= scrollX + vpW) continue;
+            auto vit2 = m_vecLayers.constFind(i);
+            if (vit2 != m_vecLayers.constEnd() && *vit2 && (*vit2)->isReady() && (*vit2)->isComplete())
+                ++nv;
+            else if (m_pageImages.contains(i))
+                ++nr;
+        }
+        if (nv != lastNv || nr != lastNr) {
+            qDebug() << "[cont] paint vectorPages=" << nv << "rasterPages=" << nr;
+            lastNv = nv; lastNr = nr;
         }
     }
 

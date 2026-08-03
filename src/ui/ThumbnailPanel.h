@@ -19,6 +19,7 @@
 
 class SearchPanel;
 class QPushButton;
+class QComboBox;
 
 class ThumbnailPanel : public QWidget {
     Q_OBJECT
@@ -47,6 +48,17 @@ public:
     void activateSearch();
     void setSearchProgress(int pagesScanned, int totalPages);
 
+    // Debug counters for --thumbepoch-test harness.
+    int  debugEarlyReturnCount() const { return m_dbgEarlyReturn; }
+    int  debugAcceptedCount() const { return m_dbgAccepted; }
+    int  debugDroppedCount()  const { return m_dbgDropped; }
+    int  debugPendingCount()  const { return m_dbgPending; }
+    int  debugRejectedCount() const { return m_dbgRejected; }
+    void debugResetCounters() { m_dbgAccepted = 0; m_dbgDropped = 0; m_dbgPending = 0; m_dbgRejected = 0; m_dbgEarlyReturn = 0; }
+
+public slots:
+    void onPageReady(int pageIndex, const QImage& image, quint64 epoch);
+
 signals:
     void pageClicked(int pageIndex);
     void pageContextMenu(int pageIndex, QPoint globalPos);
@@ -58,13 +70,12 @@ signals:
     void bookmarksReordered(QList<int> newOrder);
     void annotToolSelected(int toolId);
     void commentActivated(int pageIndex, int annotIndex);
-    void annotStyleChanged(QColor color, double width, bool fill, int fillOpacityPct);
+    void commentTextEdited(int page, int indexInPage, const QString& text);
+    void annotStyleChanged(QColor color, double width, bool fill, int fillOpacityPct, double fontSize);
     void requestComments();
 
-private slots:
-    void onPageReady(int pageIndex, const QImage& image);
-
 private:
+    bool eventFilter(QObject* o, QEvent* e) override;
     void requestVisibleThumbnails();
     void resizeEvent(QResizeEvent* event) override;
     void buildBookmarks();
@@ -72,6 +83,7 @@ private:
     void buildProperties();
     void syncBookmarkToPage(int pageIndex);
     void flushPendingThumbs();
+    void updateSizeComboForTool(int toolId);
 
     // Tab navigation: 2×2 button grid + stacked content widget
     QStackedWidget* m_stack          = nullptr;
@@ -100,6 +112,15 @@ private:
     bool         m_annFill  = false;
     int          m_annFillOpacity = 50;
     QPushButton* m_colorBtn = nullptr;
+    QComboBox*   m_sizeCombo   = nullptr;
+    double       m_annFontSize = 24.0;
+    bool         m_sizeIsFont  = false;
     QHash<int, QPushButton*> m_toolButtons;
-    QHash<int, QImage> m_pendingThumbs;
+    QHash<int, QPair<quint64, QImage>> m_pendingThumbs;
+    quint64 m_acceptEpoch = 0;
+    int m_dbgAccepted = 0;
+    int m_dbgDropped  = 0;
+    int m_dbgPending  = 0;
+    int m_dbgRejected     = 0;
+    int m_dbgEarlyReturn  = 0;
 };

@@ -21,6 +21,7 @@
 
 #include "annotations/AnnotationTypes.h"
 #include "annotations/AnnotationManager.h"
+#include "core/VectorLayer.h"
 
 // GPU-accelerated PDF page viewer with viewport tiling.
 // Renders the page as a low-res full-page background texture plus a grid of
@@ -35,6 +36,7 @@ public:
         int     pageIndex;
         QRectF  pdfRect;
         QString snippet;
+        QString uid;
     };
 
     struct PendingMarkup {
@@ -57,6 +59,7 @@ public:
     void showPartial(int page, double scale, QImage img);
 
     void setZoom(double scale);
+    void centerPage();
     void setViewMode(ViewMode mode);
     void setDarkMode(bool dark);
     void beginLoading();
@@ -71,8 +74,15 @@ public:
     void setAnnotVisuals(const QList<AnnotVisual>& visuals);
     void clearAnnotVisuals();
     void addPendingMarkup(AnnotTool tool, const AnnotStyle& style, QPointF a, QPointF b, const QVector<QPointF>& freehand = {});
+    void clearPendingMarkups();
     void setSelectedAnnot(const QRectF& rectPdf);
     void clearSelectedAnnot();
+    void setDragTarget(const QString& uid, const QString& ghostText,
+                       float fontSizePt, const QColor& ghostColor);
+    void clearDragTarget();
+    void setVectorLayer(std::shared_ptr<VectorLayer> layer);
+    void setDragNote(const QRectF& rPt);
+    void clearDragState();
 
     // Insert or update a tile in the current view.
     void setTile(int page, double scale, int col, int row, const QImage& img);
@@ -81,9 +91,12 @@ public:
     void setRegion(int page, double scale, QRect regionPx, const QImage& img);
     void invalidateSharp();
     void invalidateTiles();
+    void invalidateTileTextures();
 
     // Show a blurred placeholder (thumbnail) while the full render loads.
     void setPlaceholder(const QImage& img);
+
+    QSize currentPageImageSize() const;
 
     double   zoom()        const { return m_zoom; }
     int      currentPage() const { return m_pageIndex; }
@@ -125,6 +138,7 @@ protected:
 private:
     void uploadTexture(const QImage& img);
     QMatrix4x4 computeTransform() const;
+    QMatrix4x4 vectorTransform() const;
     QPointF pageOrigin() const;
 
     // GL resources
@@ -135,6 +149,30 @@ private:
     int     m_uTransform  = -1;
     int     m_uHasTex     = -1;
     int     m_uBgColor    = -1;
+
+    // Vector overlay GL resources
+    std::shared_ptr<VectorLayer> m_vecLayer;
+    GLuint  m_vecVao = 0, m_vecVboPos = 0, m_vecVboCol = 0, m_vecVboQuad = 0, m_vecVboWidth = 0, m_vecVboDepth = 0, m_vecVboClip = 0;
+    int     m_vecUploadedPage = -1;
+    QOpenGLShaderProgram* m_vecProg = nullptr;
+    int     m_vecMvpLoc = -1;
+    int     m_vecViewportLoc = -1;
+    int     m_vecPxPerPtLoc = -1;
+    QOpenGLShaderProgram* m_fillProg = nullptr;
+    int     m_fillMvpLoc = -1;
+    GLuint  m_fillVao = 0, m_fillVboPos = 0, m_fillVboCol = 0, m_fillVboDepth = 0, m_fillVboClip = 0;
+    QOpenGLShaderProgram* m_tileProg = nullptr;
+    int m_tileMvpLoc = -1, m_tileRectLoc = -1, m_tileDepthLoc = -1, m_tileTexLoc = -1;
+    int m_tileIsAlphaLoc = -1, m_tileColorLoc = -1;
+    QVector<GLuint> m_tileTexText;
+    QVector<GLuint> m_tileTexImg;
+    quint32 m_tileTexGen = 0xFFFFFFFFu;
+    GLuint m_tileVao = 0;
+    bool    shouldUseVectorOverlay() const;
+    void    drawVectorOverlay();
+    mutable bool m_vecLastOverlayState = false; // ponytail: tracks last shouldUseVectorOverlay result for logging
+    bool    m_vecDrawLogged = false;             // ponytail: log first successful vector draw only
+    double  m_lastTileLogZoom = -1;
 
     // Pending upload
     QImage  m_pendingImage;
@@ -185,7 +223,10 @@ private:
     bool    m_draggingAnnot = false;
     QPointF m_dragStart;
     QRectF  m_dragOrigRect;
-
+    QPointF m_dragPixelDelta;
+    QString m_dragUid;
+    QRectF  m_dragNoteRect;
+    QPointF m_dragNoteOffsetPt;
     // Freehand drawing
     bool    m_drawingFreehand = false;
     QVector<QPointF> m_freehandPoints;
@@ -216,4 +257,5 @@ private:
     QRect   m_sharpRegion;
     QImage  m_sharpImage;
     void requestTiles();
+    void scheduleTiles();
 };

@@ -8,7 +8,10 @@
 #include <QRect>
 #include <QTimer>
 #include <QVector>
-    #include <QElapsedTimer>
+#include <QElapsedTimer>
+#include <memory>
+#include "core/VectorLayer.h"
+#include "core/VectorGpuRenderer.h"
 
 class PdfDocument;
 class PdfRenderer;
@@ -55,6 +58,7 @@ signals:
     // Emitted 180 ms after the last scroll/zoom/resize to request a sharp-region
     // render of the visible viewport at full zoom (high zoom only).
     void regionNeeded(int pageIndex, double scale, QRect regionPx);
+    void needAnnotVisuals(int page);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -174,5 +178,13 @@ private:
     // ── Selection state ──────────────────────────────────────────────────────
     QRectF      m_selRect;
     bool        m_hasSel = false;
+
+    QHash<int, std::shared_ptr<VectorLayer>> m_vecLayers;
+    QSet<int>                                m_vecBuilding;
+    void ensureVectorLayers();
+    bool vectorWillRender(int pg) const;
+
+    VectorGpuRenderer m_vgr;
+    bool m_vgrInit = false;
 
 };

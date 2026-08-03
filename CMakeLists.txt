@@ -1,24 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.2.4 LANGUAGES CXX)
-
-# ── FormibPDF — Rust engine (Phase 2) ────────────────────────────────────────
-include(FetchContent)
-FetchContent_Declare(
-    Corrosion
-    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG        v0.5
-)
-FetchContent_MakeAvailable(Corrosion)
-
-set(CARGO_TARGET_DIR "C:/tmp/formibpdf-target" CACHE STRING "Cargo target dir (short path to avoid MSVC PDB limit)")
-corrosion_import_crate(
-    MANIFEST_PATH "${CMAKE_SOURCE_DIR}/src/formibpdf/Cargo.toml"
-    PROFILE release
-)
-# Override cargo target dir to avoid long-path PDB bug on Windows
-set_target_properties(formibpdf-static PROPERTIES
-    CARGO_ENV "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
-)
+project(TorReader VERSION 2.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -267,6 +248,8 @@ set(SOURCES
     $<$<NOT:$<BOOL:${TORREADER_NO_PDFIUM}>>:
     src/core/PdfDocument.cpp
     src/core/PdfRenderer.cpp
+    src/core/VectorLayer.cpp
+    src/core/VectorGpuRenderer.cpp
     src/core/TileCacheFile.cpp
     src/core/ThumbnailRenderPool.cpp
     src/core/PdfEditor.cpp
@@ -329,6 +312,8 @@ set(HEADERS
     $<$<NOT:$<BOOL:${TORREADER_NO_PDFIUM}>>:
     src/core/PdfDocument.h
     src/core/PdfRenderer.h
+    src/core/VectorLayer.h
+    src/core/VectorGpuRenderer.h
     src/core/TileCacheFile.h
     src/core/PdfEditor.h
     src/core/PdfSigner.h
@@ -392,7 +377,7 @@ target_compile_definitions(TorReader PRIVATE
 )
 
 target_include_directories(TorReader PRIVATE
-    src src/formibpdf src/rules
+    src src/rules
     ${DWF_INCLUDE_DIR}
     ${PDFIUM_DIR}/include
 )
@@ -403,7 +388,6 @@ if(NOT WIN32)
 endif()
 
 target_link_libraries(TorReader PRIVATE
-    formibpdf-static
     yaml-cpp
     Qt6::Core
     Qt6::Widgets

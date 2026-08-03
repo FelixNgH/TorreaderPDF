@@ -76,6 +76,10 @@ public:
     bool insertPdf(const QString& targetFile, int insertBefore,
                    const QString& sourceFile, const QString& outputPath);
 
+    // Khử trùng lặp stream trong file PDF tại `path` (ghi đè tại chỗ).
+    // Trả false + giữ NGUYÊN file gốc nếu có bất kỳ trục trặc nào.
+    bool dedupStreams(const QString& path);
+
     QString lastError() const { return m_lastError; }
 
 signals:

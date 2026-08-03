@@ -24,6 +24,9 @@
 #include <QShortcut>
 #include <QClipboard>
 #include <QApplication>
+#include <QLineEdit>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <algorithm>
 #include <functional>
 #include <vector>
@@ -282,7 +285,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
             b->setFixedHeight(24);
             const int id = td.id;
             m_toolButtons.insert(id, b);
-            connect(b, &QPushButton::clicked, this, [this, id]{ setActiveToolButton(id); emit annotToolSelected(id); });
+            connect(b, &QPushButton::clicked, this, [this, id]{ setActiveToolButton(id); updateSizeComboForTool(id); emit annotToolSelected(id); });
             tgl->addWidget(b, r, c);
             if (++c == 2) { c = 0; ++r; }
         }
@@ -292,25 +295,31 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         auto* pgl = new QGridLayout(propWrap);
         pgl->setContentsMargins(0, 2, 0, 2);
         pgl->setSpacing(3);
-        auto* widthCombo = new QComboBox;
-        widthCombo->addItems({ "1 px", "2 px", "3 px", "4 px", "5 px", "6 px",
-                               "8 px", "10 px", "12 px", "16 px", "20 px", "24 px" });
-        widthCombo->setCurrentIndex(1);
+        m_sizeCombo = new QComboBox;
+        m_sizeCombo->addItems({ "1 px", "2 px", "3 px", "4 px", "5 px", "6 px",
+                                "8 px", "10 px", "12 px", "16 px", "20 px", "24 px" });
+        m_sizeCombo->setCurrentIndex(1);
         m_colorBtn = new QPushButton;
         m_colorBtn->setStyleSheet("background:red; color:white;");
         auto* fillChk = new QCheckBox("Fill");
         auto* fillOpacityCombo = new QComboBox;
         fillOpacityCombo->addItems({"25%","50%","75%","100%"});
         fillOpacityCombo->setCurrentIndex(1);
-        pgl->addWidget(widthCombo, 0, 0);
+        pgl->addWidget(m_sizeCombo, 0, 0);
         pgl->addWidget(m_colorBtn, 0, 1);
         pgl->addWidget(fillChk,    0, 2);
         pgl->addWidget(fillOpacityCombo, 0, 3);
         cpLay->addWidget(propWrap);
-        auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill, m_annFillOpacity); };
-        connect(widthCombo, &QComboBox::currentIndexChanged, this, [this, emitStyle](int i){
-            const double w[] = { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0 };
-            m_annWidth = w[qBound(0, i, 11)];
+        auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill, m_annFillOpacity, m_annFontSize); };
+        connect(m_sizeCombo, &QComboBox::currentIndexChanged, this, [this, emitStyle](int i){
+            if (i < 0) return;
+            if (m_sizeIsFont) {
+                const int pts[] = { 8, 12, 16, 24, 32, 48, 64, 96, 144, 200 };
+                m_annFontSize = pts[qBound(0, i, 9)];
+            } else {
+                const double w[] = { 1,2,3,4,5,6,8,10,12,16,20,24 };
+                m_annWidth = w[qBound(0, i, 11)];
+            }
             emitStyle();
         });
         connect(m_colorBtn, &QPushButton::clicked, this, [this, emitStyle]{
@@ -336,6 +345,12 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         sep->setFrameShape(QFrame::HLine);
         sep->setFrameShadow(QFrame::Sunken);
         cpLay->addWidget(sep);
+        auto* m_commentsHint = new QLabel(QStringLiteral("Editing comments \u2014 single-page view only"));
+        QFont hintFont = m_commentsHint->font();
+        hintFont.setPointSizeF(hintFont.pointSizeF() - 1);
+        m_commentsHint->setFont(hintFont);
+        m_commentsHint->setStyleSheet("color:#888;");
+        cpLay->addWidget(m_commentsHint);
         m_commentsList = new QListWidget;
         connect(m_commentsList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it){
             if (it) emit commentActivated(it->data(Qt::UserRole).toInt(), it->data(Qt::UserRole + 1).toInt());
@@ -403,6 +418,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
             newOrder.append(m_contentTree->topLevelItem(i)->data(0, Qt::UserRole).toInt());
         emit pagesReordered(newOrder);
     };
+    updateSizeComboForTool(0);
 }
 
 ThumbnailPanel::~ThumbnailPanel() {}
@@ -442,13 +458,22 @@ void ThumbnailPanel::requestVisibleThumbnails() {
 // ── setDocument ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
                                   ThumbnailRenderPool* pool, bool forceRebuild) {
-    // forceRebuild: sau khi sửa file (insert/delete/reorder…) doc được mở lại
-    // TRÊN CÙNG con trỏ — phải dựng lại thumbnail + bookmark, không được early-return.
-    // pool so sánh riêng — cho phép initWatcher cập nhật pool mà không clear thumbnail.
-    if (!forceRebuild && doc == m_doc && renderer == m_renderer
-        && pool == m_thumbPool && m_list->count() > 0)
-        return;
+    // Epoch must always track the current pool, even when we don't rebuild the list.
+    // If we skip the epoch update on early-return, thumbnails rendered after a
+    // pool-reopen (epoch++) will all be gated out by the stale m_acceptEpoch.
+    m_acceptEpoch = pool ? pool->epoch() : 0;
 
+    if (!forceRebuild && doc == m_doc && renderer == m_renderer
+        && pool == m_thumbPool && m_list->count() > 0) {
+        ++m_dbgEarlyReturn;
+        return;
+    }
+
+    if (!m_pendingThumbs.isEmpty()) {
+        qDebug() << "[perf] thumb DROP stale pending n=" << m_pendingThumbs.size()
+                 << "(document changed)";
+        m_pendingThumbs.clear();
+    }
     m_doc = doc;
     if (m_thumbPool) disconnect(m_thumbPoolConn);
     m_renderer  = renderer;
@@ -596,6 +621,8 @@ void ThumbnailPanel::clearThumbnails() {
     m_currentPage = -1;
     m_annotMgr   = nullptr;
     m_annotPages = 0;
+    setCommentsLoading(false);
+    setComments({});
 }
 
 // ── Search helpers (kept as no-ops; panel hidden) ─────────────────────────────
@@ -624,11 +651,45 @@ void ThumbnailPanel::setActiveToolButton(int id) {
     }
 }
 
+// ── updateSizeComboForTool ─────────────────────────────────────────────────────
+void ThumbnailPanel::updateSizeComboForTool(int toolId) {
+    const bool wantFont = (toolId == 7);
+    if (wantFont == m_sizeIsFont && m_sizeCombo->count() > 0) return;
+    m_sizeIsFont = wantFont;
+    QSignalBlocker block(m_sizeCombo);
+    m_sizeCombo->clear();
+    if (wantFont) {
+        const int pts[] = { 8, 12, 16, 24, 32, 48, 64, 96, 144, 200 };
+        int sel = 3;
+        for (int i = 0; i < 10; ++i) {
+            m_sizeCombo->addItem(QString("%1 pt").arg(pts[i]));
+            if (qFuzzyCompare(m_annFontSize, double(pts[i]))) sel = i;
+        }
+        m_sizeCombo->setCurrentIndex(sel);
+        m_annFontSize = pts[sel];
+    } else {
+        const int px[] = { 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24 };
+        int sel = 1;
+        for (int i = 0; i < 12; ++i) {
+            m_sizeCombo->addItem(QString("%1 px").arg(px[i]));
+            if (qFuzzyCompare(m_annWidth, double(px[i]))) sel = i;
+        }
+        m_sizeCombo->setCurrentIndex(sel);
+        m_annWidth = px[sel];
+    }
+}
+
 // ── setDarkMode ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::setDarkMode(bool dark) { Q_UNUSED(dark) }
 
 // ── onPageReady ───────────────────────────────────────────────────────────────
-void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image) {
+void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epoch) {
+    if (m_acceptEpoch != 0 && epoch != m_acceptEpoch) {
+        qDebug() << "[perf] thumb DROP stale page=" << pageIndex
+                 << "epoch=" << epoch << "accept=" << m_acceptEpoch;
+        ++m_dbgDropped;
+        return;
+    }
     qDebug() << "[perf] thumb recv page=" << pageIndex
              << "imgW=" << image.width()
              << "listCount=" << (m_list ? m_list->count() : -1)
@@ -639,33 +700,46 @@ void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image) {
         qDebug() << "[perf] thumb DROPPED-EARLY page=" << pageIndex
                  << "reason=listNotReady listCount=" << (m_list ? m_list->count() : -1)
                  << "hasDoc=" << (m_doc != nullptr);
-        if (pageIndex >= 0)
-            m_pendingThumbs[pageIndex] = image;
+        if (pageIndex >= 0) {
+            ++m_dbgPending;
+            m_pendingThumbs[pageIndex] = {epoch, image};
+        }
         return;
     }
     double pw = m_doc->pageSize(pageIndex).width();
     if (pw > 0.0 && image.width() > pw * 0.5) {
         qDebug() << "[perf] thumb REJECTED page=" << pageIndex
                  << "imgW=" << image.width() << "pageW=" << pw;
+        ++m_dbgRejected;
         return;
     }
-    if (auto* item = m_list->item(pageIndex))
+    if (auto* item = m_list->item(pageIndex)) {
         item->setIcon(QIcon(QPixmap::fromImage(image)));
+        ++m_dbgAccepted;
+    }
 }
 
 void ThumbnailPanel::flushPendingThumbs() {
     if (m_pendingThumbs.isEmpty()) return;
     int n = m_list ? m_list->count() : 0;
+    int staleDropped = 0;
     for (auto it = m_pendingThumbs.begin(); it != m_pendingThumbs.end();) {
+        if (it.value().first != m_acceptEpoch) {
+            ++staleDropped;
+            it = m_pendingThumbs.erase(it);
+            continue;
+        }
         int pg = it.key();
         if (pg >= 0 && pg < n) {
             if (auto* item = m_list->item(pg))
-                item->setIcon(QIcon(QPixmap::fromImage(it.value())));
+                item->setIcon(QIcon(QPixmap::fromImage(it.value().second)));
             it = m_pendingThumbs.erase(it);
         } else {
             ++it;
         }
     }
+    if (staleDropped)
+        qDebug() << "[perf] thumb DROP stale pending n=" << staleDropped << "(gen mismatch during flush)";
     if (!m_pendingThumbs.isEmpty())
         qDebug() << "[perf] thumb" << m_pendingThumbs.size()
                  << "pending thumb(s) still waiting for list to grow";
@@ -931,11 +1005,50 @@ void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
     qDebug().noquote() << "[comments] setComments n=" << comments.size();
     m_commentsList->clear();
     for (const AnnotInfo& a : comments) {
-        QString label = QString("p.%1  %2").arg(a.pageIndex + 1).arg(a.type);
-        if (!a.text.isEmpty()) label += "  — " + a.text.left(60);
-        auto* item = new QListWidgetItem(label, m_commentsList);
+        auto* item = new QListWidgetItem(m_commentsList);
         item->setData(Qt::UserRole, a.pageIndex);
         item->setData(Qt::UserRole + 1, a.indexInPage);
+
+        auto* row = new QWidget(m_commentsList);
+        row->setAttribute(Qt::WA_TranslucentBackground);
+        row->setStyleSheet("background: transparent;");
+        auto* lay = new QHBoxLayout(row);
+        lay->setContentsMargins(6, 1, 6, 1);
+        lay->setSpacing(4);
+
+        auto* lbl = new QLabel(QString("p.%1  %2  —").arg(a.pageIndex + 1).arg(a.type), row);
+        lbl->setAttribute(Qt::WA_TransparentForMouseEvents);
+        lbl->setStyleSheet("background: transparent;");
+        lay->addWidget(lbl, 0);
+
+        auto* edit = new QLineEdit(a.text, row);
+        edit->setPlaceholderText(QStringLiteral("Add a comment\u2026"));
+        edit->setClearButtonEnabled(true);
+        edit->setFixedHeight(20);
+        QFont ef = edit->font();
+        ef.setPointSizeF(ef.pointSizeF() - 0.5);
+        edit->setFont(ef);
+        edit->setProperty("trPage", a.pageIndex);
+        edit->setProperty("trIdx", a.indexInPage);
+        edit->setProperty("trOrig", a.text);
+        edit->installEventFilter(this);
+        lay->addWidget(edit, 1);
+
+        const int pg = a.pageIndex, ix = a.indexInPage;
+        connect(edit, &QLineEdit::editingFinished, this, [this, pg, ix] {
+            auto* senderEdit = qobject_cast<QLineEdit*>(sender());
+            if (!senderEdit) return;
+            QString orig = senderEdit->property("trOrig").toString();
+            QString txt = senderEdit->text();
+            if (txt == orig) return;
+            QTimer::singleShot(0, this, [this, pg, ix, txt] {
+                emit commentTextEdited(pg, ix, txt);
+            });
+        });
+
+        m_commentsList->addItem(item);
+        item->setSizeHint(QSize(0, 26));
+        m_commentsList->setItemWidget(item, row);
     }
     if (m_commentsList->count() == 0)
         m_commentsList->addItem(new QListWidgetItem(QStringLiteral("(no comments yet)")));
@@ -980,3 +1093,26 @@ void ThumbnailPanel::selectCommentFor(int pageIndex, int annotIndex) {
     m_commentsList->clearSelection();
     qDebug().noquote() << "[comments] sync PDF→list page=" << pageIndex << "idx=" << annotIndex << "found=0";
 }
+
+bool ThumbnailPanel::eventFilter(QObject* o, QEvent* e) {
+    if (e->type() == QEvent::FocusIn) {
+        if (auto* le = qobject_cast<QLineEdit*>(o)) {
+            int pg = le->property("trPage").toInt();
+            int ix = le->property("trIdx").toInt();
+            if (m_commentsList) {
+                for (int i = 0; i < m_commentsList->count(); ++i) {
+                    auto* it = m_commentsList->item(i);
+                    if (it && it->data(Qt::UserRole).toInt() == pg &&
+                        it->data(Qt::UserRole + 1).toInt() == ix) {
+                        if (m_commentsList->currentItem() != it)
+                            m_commentsList->setCurrentItem(it);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return QWidget::eventFilter(o, e);
+}
+
+#include "ThumbnailPanel.moc"

@@ -1,10 +1,15 @@
 #pragma once
 #include <QObject>
 #include <QString>
+#include <QByteArray>
 #include <QList>
 #include <QRectF>
 #include <QColor>
 #include <QVector>
+#include <QImage>
+#include <QHash>
+#include <QSet>
+#include <atomic>
 #include <fpdfview.h>
 #include <fpdf_annot.h>
 
@@ -63,6 +68,7 @@ class AnnotationManager : public QObject {
     Q_OBJECT
 public:
     explicit AnnotationManager(QObject* parent = nullptr);
+    ~AnnotationManager() override;
 
     void setDocument(FPDF_DOCUMENT doc, const QString& filePath);
 
@@ -76,7 +82,12 @@ public:
     void loadAllStreaming(int pageCount, int startPage = 0);
 
     // Read annotations as overlay visuals for one page.
-    QList<AnnotVisual> loadPageVisuals(int page, bool* outOverlayCapable);
+    QList<AnnotVisual> loadPageVisuals(int page, bool* outOverlayCapable,
+                                       bool* hasForeign = nullptr);
+
+    // Build one AnnotVisual from an already-open annot. Returns false if not overlay-drawable.
+    // Caller must hold s_pdfiumMutex and have `page` open.
+    bool buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int pageIndex, AnnotVisual& out);
 
     // Create a sticky-note annotation (FPDF_ANNOT_TEXT) at a point on the page.
     // Saves the document to disk.
@@ -86,7 +97,7 @@ public:
     // Create a free-text annotation (FPDF_ANNOT_FREETEXT) over a rect on the page.
     // Saves the document to disk.
     bool createInlineNote(int pageIndex, QRectF rectPdf,
-                          const QString& text, const QString& author,
+                          const QString& textIn, const QString& author,
                           bool withBackground = true,
                           QColor textColor = Qt::black,
                           float fontSize = 11.0f);
@@ -100,8 +111,25 @@ public:
     bool setAnnotStyle(int pageIndex, int index, QColor color, float width, bool fill, int fillAlpha = 255);
     bool rebuildTextNote(int pageIndex, int index, QColor newColor, float newFontSize);
     int findAnnotIndexByUid(int pageIndex, const QString& uid);
+    int findAnnotIndexByAnyUid(int pageIndex, const QString& uid);
+    QString ensureExternalUid(int pageIndex, int index);
+    bool setAnnotUid(int pageIndex, int index, const QString& uid);
+    bool setAnnotContents(int pageIndex, int index, const QString& text);
     QString generateUid();
-    bool moveNote(int pageIndex, int index, double dxDisp, double dyDisp);
+    bool retextNote(int pageIndex, int index, const QString& newText);
+
+    // Di chuyen annot BAT KY loai nao: chi tinh tien, KHONG dung lai gi.
+    // dxU/dyU la delta trong he PDF CHUA xoay (goi ben tu doi theo /Rotate).
+    // Note cua ta (co TRID): dich luon page object cua no.
+    // Annot ngoai / hinh khoi: chi dich /Rect, /AP giu nguyen.
+    // INK (Freehand): snapshot + remove + add (vi PDFium khong cho sua InkList tai cho).
+    bool moveAnnot(int pageIndex, int index, double dxU, double dyU);
+
+    // Annot cua TorReader co TRUID (moi) hoac TRID (note cu). Khong co ca hai = cua phan mem khac.
+    bool isOwnAnnot(int pageIndex, int index);
+
+    // Dem so annot tren mot trang (nhanh hon loadPage vi khong parse tung cai).
+    int annotCount(int pageIndex);
 
     AnnotSnapshot snapshotAnnot(int pageIndex, int index);
     bool addSnapshot(int pageIndex, const AnnotSnapshot& s);
@@ -114,23 +142,83 @@ public:
     bool createSignatureDraft(int pageIndex, QRectF rectPt, const QString& text);
     QRectF findSignatureDraftRect(int pageIndex, int* outIndex);
 
+    quint32 pageRevision(int page) const { return m_pageRev.value(page, 0); }
+    void    bumpPageRevision(int page);
+
+    void stopScan()  { m_stopScan.store(true); }
+    void resetScan() { m_stopScan.store(false); }
+
     // Generate content for a single page (called just before save from deferred set).
+    static int setOwnNoteObjectsActive(FPDF_PAGE page, bool active);
+
     void generateContentForPage(int page);
+
+    void flushPendingGenerate(int page);
+    void flushAllPendingGenerate();
 
     bool saveDocument();
     QString lastError() const { return m_lastError; }
     QString lastCreatedUid() const { return m_lastCreatedUid; }
 
+    // Kept for --foreignbench headless benchmark (main.cpp). Not used by GUI.
+    QImage buildForeignAnnotLayer(int pageIndex, int wPx, int hPx);
+
 signals:
     void annotationAdded(int pageIndex, AnnotInfo info);
     void pageAnnotsLoaded(int pageIndex, QList<AnnotInfo> annots);
     void scanProgress(int pagesScanned, int totalPages);
+    void pageContentChanged(int page);
 
 private:
+
+    FPDF_FONT     m_unicodeFont = nullptr;
+    QByteArray    m_unicodeFontData;
+    FPDF_FONT unicodeFont();
+
+    // ⚠️ _locked: caller must hold s_pdfiumMutex and have `page` open.
+    // No lock, no LoadPage/ClosePage, no GenerateContent, no emit.
+    int  removeNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId);
+    int  translateNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId,
+                                         double dx, double dy);
+    bool objectHasNoteId(FPDF_PAGEOBJECT obj, unsigned int noteId);
+    bool removeAnnot_locked(FPDF_PAGE page, int index, bool* outNeedsGen);
+    bool createInlineNote_locked(FPDF_PAGE page, int pageIndex, QRectF rectPdf,
+                                 const QString& textIn, const QString& author,
+                                 bool withBackground, QColor textColor, float fontSize,
+                                 AnnotInfo* outInfo);
+    bool createPopupNote_locked(FPDF_PAGE page, int pageIndex, QPointF pointDisp,
+                                const QString& text, const QString& author,
+                                AnnotInfo* outInfo);
+
+    // GIA DINH: ben goi DA giu s_pdfiumMutex. Khong duoc tu khoa.
+    void flushGenerate_locked(int pageIndex);
+    // GIA DINH: ben goi DA giu s_pdfiumMutex.
+    void releaseSharedPage_locked();
+    void invalidateNoteObjCache_locked(int pageIndex);
+
+    std::atomic<bool> m_stopScan{false};
+    QHash<int, quint32> m_pageRev;
+    QSet<int> m_pendingGenerate;
+    QSet<int> m_pendingGen;                  // trang co page object doi, chua sinh noi dung
+    QHash<QPair<int,quint32>, QVector<int>> m_noteObjIdxCache;
 
     FPDF_DOCUMENT m_doc     = nullptr;
     QString       m_path;
     QString       m_lastError;
     unsigned int  m_nextNoteId = 1;
     QString m_lastCreatedUid;
+
+    FPDF_PAGE m_pinPage = nullptr;
+    int       m_pinIndex = -1;
+    FPDF_PAGE m_scratchPage = nullptr;
+    int       m_scratchIndex = -1;
+public:
+    bool isSharedPage(int pageIndex) const {
+        return (m_pinPage && m_pinIndex == pageIndex) || (m_scratchPage && m_scratchIndex == pageIndex);
+    }
+    FPDF_PAGE acquireSharedPage(int pageIndex);
+    void pinPage(int pageIndex);
+    void pinPage_locked(int pageIndex);
+    // TU giu khoa. Chi goi tu noi KHONG giu khoa.
+    void      releaseSharedPage();
 };

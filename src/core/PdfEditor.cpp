@@ -15,13 +15,25 @@
 #include <QFile>
 #include <QSaveFile>
 #include <QFileInfo>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QMutexLocker>
 #include <QSet>
+#include <QHash>
+#include <QPair>
+#include <QStringList>
 #include <QRegularExpression>
 #include <numeric>
 #include <map>
 #include <functional>
+
+static inline void trHashAdd(QCryptographicHash& h, const char* d, qsizetype n) {
+#if QT_VERSION >= QT_VERSION_CHECK(6,3,0)
+    h.addData(QByteArrayView(d, n));
+#else
+    h.addData(d, static_cast<int>(n));
+#endif
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PDFium helpers
@@ -382,8 +394,10 @@ bool PdfEditor::merge(const QStringList& inputFiles, const QString& outputPath) 
 
     bool ok = saveDoc(output, outputPath);
     FPDF_CloseDocument(output);
-    if (ok)
+    if (ok) {
         writeOutlineTree(outputPath, buildPagedOutline(mergedTree, totalPages));
+        dedupStreams(outputPath);
+    }
     return ok;
 }
 
@@ -413,6 +427,7 @@ bool PdfEditor::extractPages(const QString& inputFile, int firstPage, int lastPa
     bool ok = saveDoc(output, outputPath);
     FPDF_CloseDocument(output);
     ld.close();
+    if (ok) dedupStreams(outputPath);
     return ok;
 }
 
@@ -529,6 +544,7 @@ int PdfEditor::extractAllPages(const QString& inputFile, const QStringList& base
         QString outPath = dir.filePath(unique + ".pdf");
         if (!saveDoc(out, outPath)) { FPDF_CloseDocument(out); ld.close(); return -1; }
         FPDF_CloseDocument(out);
+        dedupStreams(outPath);
         emit progress((i + 1) * 100 / total);
     }
 
@@ -832,4 +848,172 @@ bool PdfEditor::insertPdf(const QString& targetFile, int insertBefore,
         writeOutlineTree(outputPath, buildPagedOutline(combined, tgtCount + srcCount));
     }
     return ok;
+}
+
+namespace {
+
+QByteArray trContentHash(QPDFObjectHandle obj, int depth,
+                         QSet<QString>& visiting,
+                         QHash<QString, QByteArray>& memo);
+
+QByteArray trNodeSig(QPDFObjectHandle node, int depth,
+                     QSet<QString>& visiting,
+                     QHash<QString, QByteArray>& memo) {
+    if (depth <= 0) return QByteArrayLiteral("<DEPTH>");
+    if (node.isIndirect())
+        return trContentHash(node, depth - 1, visiting, memo);
+    if (node.isDictionary()) {
+        QByteArray s = "<<";
+        QStringList keys;
+        for (const std::string& k : node.getKeys()) keys << QString::fromStdString(k);
+        keys.sort();
+        for (const QString& k : keys) {
+            if (k == QLatin1String("/Length")) continue;
+            s += k.toUtf8() + trNodeSig(node.getKey(k.toStdString()), depth, visiting, memo);
+        }
+        return s + ">>";
+    }
+    if (node.isArray()) {
+        QByteArray s = "[";
+        const int n = node.getArrayNItems();
+        for (int i = 0; i < n; ++i) s += trNodeSig(node.getArrayItem(i), depth, visiting, memo);
+        return s + "]";
+    }
+    return QByteArray::fromStdString(node.unparse());
+}
+
+QByteArray trContentHash(QPDFObjectHandle obj, int depth,
+                         QSet<QString>& visiting,
+                         QHash<QString, QByteArray>& memo) {
+    if (depth <= 0) return QByteArrayLiteral("<DEPTH>");
+    const QPDFObjGen og = obj.getObjGen();
+    const QString key = QString("%1_%2_%3").arg(og.getObj()).arg(og.getGen()).arg(depth);
+    const QString vk = QString("%1_%2").arg(og.getObj()).arg(og.getGen());
+    auto m = memo.find(key);
+    if (m != memo.end()) return m.value();
+    if (visiting.contains(vk)) return QByteArrayLiteral("<CYCLE>");
+    visiting.insert(vk);
+
+    QCryptographicHash h(QCryptographicHash::Sha256);
+    if (obj.isStream()) {
+        decltype(obj.getRawStreamData()) buf;
+        try { buf = obj.getRawStreamData(); } catch (const std::exception&) { buf = nullptr; }
+        if (buf.get()) trHashAdd(h, reinterpret_cast<const char*>(buf->getBuffer()),
+                           static_cast<qsizetype>(buf->getSize()));
+        h.addData(QByteArrayLiteral("|S|"));
+        h.addData(trNodeSig(obj.getDict(), depth, visiting, memo));
+    } else {
+        h.addData(trNodeSig(obj, depth, visiting, memo));
+    }
+    const QByteArray res = h.result();
+    visiting.remove(vk);
+    memo.insert(key, res);
+    return res;
+}
+
+} // namespace
+
+// ── dedupStreams ──────────────────────────────────────────────────────────────
+bool PdfEditor::dedupStreams(const QString& path) {
+    const QString tmpPath = path + ".deduptmp";
+    try {
+        {
+            QPDF pdf;
+            pdf.processFile(path.toUtf8().constData());
+
+            int totalMerged = 0;
+            int pass;
+            for (pass = 1; pass <= 10; ++pass) {
+                QMap<QByteArray, QPDFObjectHandle> canonical;
+                QMap<QPDFObjGen, QPDFObjectHandle> replaceMap;
+                QHash<QString, QByteArray> memo;
+                QSet<QString> visiting;
+
+                for (QPDFObjectHandle& oh : pdf.getAllObjects()) {
+                    if (!oh.isStream()) continue;
+
+                    visiting.clear();
+                    const QByteArray key = trContentHash(oh, 8, visiting, memo);
+
+                    auto it = canonical.find(key);
+                    if (it == canonical.end()) canonical.insert(key, oh);
+                    else                        replaceMap.insert(oh.getObjGen(), it.value());
+                }
+
+                int changedThisPass = 0;
+
+                std::function<int(QPDFObjectHandle)> fixup = [&](QPDFObjectHandle node) -> int {
+                    int changed = 0;
+                    if (node.isDictionary()) {
+                        for (const std::string& k : node.getKeys()) {
+                            QPDFObjectHandle v = node.getKey(k);
+                            if (v.isIndirect()) {
+                                auto r = replaceMap.find(v.getObjGen());
+                                if (r != replaceMap.end()) { node.replaceKey(k, r.value()); ++changed; }
+                            } else if (v.isDictionary() || v.isArray()) {
+                                changed += fixup(v);
+                            }
+                        }
+                    } else if (node.isArray()) {
+                        const int n = node.getArrayNItems();
+                        for (int i = 0; i < n; ++i) {
+                            QPDFObjectHandle v = node.getArrayItem(i);
+                            if (v.isIndirect()) {
+                                auto r = replaceMap.find(v.getObjGen());
+                                if (r != replaceMap.end()) { node.setArrayItem(i, r.value()); ++changed; }
+                            } else if (v.isDictionary() || v.isArray()) {
+                                changed += fixup(v);
+                            }
+                        }
+                    }
+                    return changed;
+                };
+
+                for (QPDFObjectHandle& oh : pdf.getAllObjects()) {
+                    changedThisPass += fixup(oh);
+                    if (oh.isStream()) changedThisPass += fixup(oh.getDict());
+                }
+                changedThisPass += fixup(pdf.getTrailer());
+                changedThisPass += fixup(pdf.getRoot());
+
+                qDebug() << "[dedup] pass" << pass << ":" << replaceMap.size()
+                         << "nhom trung," << changedThisPass << "tham chieu da thay";
+                if (changedThisPass == 0) break;
+                totalMerged += changedThisPass;
+            }
+
+            if (pass > 10)
+                qWarning() << "[dedup] dat tran 10 luot, con sot stream trung lap (van ghi file):" << path;
+
+            if (totalMerged == 0) {
+                qDebug() << "[dedup] khong co stream trung lap:" << path;
+                return true;
+            }
+
+            QPDFWriter writer(pdf, tmpPath.toUtf8().constData());
+            writer.setObjectStreamMode(qpdf_o_generate);
+            writer.setStreamDataMode(qpdf_s_compress);
+            writer.setCompressStreams(true);
+            writer.write();
+
+            qDebug() << "[dedup] tong cong" << totalMerged << "stream gop duoc ->" << path;
+        }
+    } catch (const std::exception& e) {
+        QFile::remove(tmpPath);
+        qWarning() << "[dedup] that bai, giu nguyen file goc:" << path << e.what();
+        return false;
+    }
+
+    if (!QFileInfo::exists(tmpPath) || QFileInfo(tmpPath).size() == 0) {
+        QFile::remove(tmpPath);
+        qWarning() << "[dedup] file tam rong, giu nguyen file goc:" << path;
+        return false;
+    }
+    QFile::remove(path);
+    if (!QFile::rename(tmpPath, path)) {
+        QFile::remove(tmpPath);
+        qWarning() << "[dedup] khong doi ten duoc, file goc co the da mat:" << path;
+        return false;
+    }
+    return true;
 }

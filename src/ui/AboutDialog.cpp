@@ -58,10 +58,6 @@ Software OpenGL renderer (opengl32sw.dll) — fallback GPU.<br><br>
 Copyright &copy; 2008-2015 Jesse Beder.<br>
 YAML configuration file parsing.<br><br>
 
-<b>Rust preview engine (formibpdf)</b> — MIT / Apache-2.0<br>
-Built on the crates rayon, flate2, fontdue, image, and lcms2, each under the MIT or Apache-2.0 license.<br>
-Low-resolution thumbnail / preview rendering.<br><br>
-
 <p style='color:#6B7280; font-size:11px;'>
 All third-party libraries are used in compliance with their respective licenses.
 Qt is used under the LGPL v3 via dynamic linking, so the Qt libraries can be replaced

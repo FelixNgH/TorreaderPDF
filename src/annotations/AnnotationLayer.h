@@ -3,6 +3,7 @@
 #include <QPointF>
 #include <QVector>
 #include "annotations/AnnotationTypes.h"
+#include "annotations/AnnotationManager.h"
 #include <fpdfview.h>
 #include <fpdf_annot.h>
 
@@ -20,6 +21,7 @@ public:
 
 signals:
     void annotationAdded(int pageIndex);
+    void annotVisualAdded(int page, const AnnotVisual& av);
 
 private:
     FPDF_DOCUMENT m_doc = nullptr;

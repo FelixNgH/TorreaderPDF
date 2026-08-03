@@ -58,7 +58,6 @@ parts:
       - libqpdf-dev
       - libjpeg-dev
       - libssl-dev
-      - curl
       - python3-pip
       - patchelf
     stage-packages:
@@ -67,14 +66,7 @@ parts:
     override-build: |
       set -eux
 
-      # rustup stable (apt cargo 1.66 can't read Cargo.lock v4)
-      export RUSTUP_HOME="${CRAFT_PART_BUILD}/.rustup"
-      export CARGO_HOME="${CRAFT_PART_BUILD}/.cargo"
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --no-modify-path
-      export PATH="${CARGO_HOME}/bin:${PATH}"
-
-      # CMake 3.30 (apt 3.22 too old; pin 3.30.x — 4.x breaks corrosion)
+      # CMake 3.30 (apt 3.22 too old; pin 3.30.x)
       pip install --target="${CRAFT_PART_BUILD}/cmake-tool" "cmake==3.30.*"
       export PATH="${CRAFT_PART_BUILD}/cmake-tool/bin:${PATH}"
       export PYTHONPATH="${CRAFT_PART_BUILD}/cmake-tool:${PYTHONPATH:-}"

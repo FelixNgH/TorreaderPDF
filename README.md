@@ -27,17 +27,45 @@ off-screen pages so RAM stays flat no matter how many pages you flip through.
 
 | Platform | Install |
 |----------|---------|
-| **Windows** (x64) | [`TorReaderPDF-2.2.4-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Windows** (x64) | [`TorReaderPDF-2.3.0-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
 | **Ubuntu / Debian** (APT repo) | `sudo mkdir -p /etc/apt/keyrings`<br>`sudo curl -fsSL https://torreader.cloud/apt/torreader-archive-keyring.gpg -o /etc/apt/keyrings/torreader.gpg`<br>`echo "deb [signed-by=/etc/apt/keyrings/torreader.gpg] https://torreader.cloud/apt stable main" \| sudo tee /etc/apt/sources.list.d/torreader.list`<br>`sudo apt update && sudo apt install torreader`<br>→ auto-updates via `apt upgrade` |
-| **Ubuntu / Debian** (standalone .deb) | Download `.deb` from [Releases](https://github.com/FelixNgH/TorreaderPDF/releases) & run:<br>`sudo apt install ./torreader_2.2.4_amd64.deb` |
+| **Ubuntu / Debian** (standalone .deb) | Download `.deb` from [Releases](https://github.com/FelixNgH/TorreaderPDF/releases) & run:<br>`sudo apt install ./torreader_2.3.0_amd64.deb` |
 | **Arch Linux** | `yay -S torreader-bin` *(pending publication on AUR)* |
-| **Any distro** (AppImage) | [`TorReaderPDF-2.2.4-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (glibc 2.35+, Ubuntu 22.04+; requires system OpenGL) |
+| **Any distro** (AppImage) | [`TorReaderPDF-2.3.0-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (glibc 2.35+, Ubuntu 22.04+; requires system OpenGL) |
 
 The app ships a freedesktop-compatible `.desktop` file and AppStream metadata, so it appears in your application menu and "Open with" for PDF files.
 
 See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderPDF/releases)**.
 
-### ✨ What's new in 2.2.4
+### ✨ What's new in 2.3
+
+- **Instant sharpness on heavy CAD drawings.** The page's vector geometry is uploaded
+  to the GPU and drawn directly, so zooming and panning are sharp immediately instead
+  of waiting for a re-render. On a 2.18-million-path drawing, a viewport re-render
+  costs ~2 seconds and does not get cheaper at lower resolution — the GPU draws it at
+  once.
+- **GPU rendering in Continuous scroll too** — the same `VectorGpuRenderer` layer
+  is shared with the single-page view, so scrolling through heavy pages no longer
+  re-rasterises them. Markups in Continuous are display-only (with popups); to
+  select or edit markup, switch to single-page view.
+- **True line weights and dashes.** Stroke widths, dash patterns, fills and clipping
+  are respected, so drawings keep their line hierarchy instead of coming out as
+  uniform hairlines.
+- **Text stays exact.** Text is rendered with the document's own embedded fonts, so
+  accented scripts — including Vietnamese — are correct at any zoom.
+- **A comment on every markup.** Line, arrow, rectangle, ellipse, cloud, freehand and
+  highlight all carry popup text now. Type it inline in the Comments list
+  (`p.4  Arrow  —  …`), see it as a popup when you select the markup, with full
+  undo/redo.
+- **Fit Page** centres the page; **Translate** region select moved to `Alt`+drag
+  (`Ctrl`+drag was colliding with zoom); larger undo/redo buttons; **Share app** button
+  with a copyable download link.
+
+Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
+
+<details>
+<summary>What's new in 2.2.4</summary>
+
 
 - **Sharp zoom in Continuous scroll** — the visible area is re-rendered at true
   resolution, so zoomed-in text stays crisp in scroll mode too, not just single-page.
@@ -47,6 +75,8 @@ See all versions on the **[Releases page](https://github.com/FelixNgH/TorreaderP
   the sidebar listing every hit with context.
 - Markup is now painted as an overlay instead of going through the page raster, so
   adding, deleting or moving it is instant even on heavy CAD drawings.
+
+</details>
 
 ![TorReader PDF demo](docs/screenshots/demo.gif)
 
@@ -116,7 +146,6 @@ covers those jobs in a single lightweight, portable app.
 ### Requirements (both platforms)
 - CMake ≥ 3.25
 - Qt 6 (Core, Widgets, Gui, Concurrent, PrintSupport, OpenGL, OpenGLWidgets, Network)
-- [Rust](https://rustup.rs/) + Cargo (builds the `formibpdf` preview-rendering helper)
 - QPDF ≥ 11 (dev headers)
 - **PDFium** prebuilt binaries — download from
   [bblanchon/pdfium-binaries releases](https://github.com/bblanchon/pdfium-binaries/releases)
@@ -153,7 +182,7 @@ simply disabled at configure time (see the CMake status message).
 - **Rendering & structural editing**: [PDFium](https://pdfium.googlesource.com/pdfium/) (BSD 3-Clause) — merge, split, insert, extract, reorder, rotate all go through `FPDF_ImportPagesByIndex` and friends.
 - **Bookmark/outline writing + compression**: [QPDF](https://github.com/qpdf/qpdf) (Apache-2.0) — object-stream compression on save, lossless.
 - **UI**: Qt 6 Widgets + OpenGL (`PdfGpuView` single-page view, `ContinuousView` scroll strip).
-- **Preview helper**: a small Rust engine (`src/formibpdf`) renders low-resolution thumbnails/previews (scale ≤ 0.16) in parallel; the main view always uses PDFium for full-resolution, correctly laid-out rendering.
+- **Thumbnails & previews**: rendered by PDFium through a shared render pool; the main view always uses PDFium for full-resolution, correctly laid-out rendering.
 - All `FPDF_*` calls are serialized behind a global mutex — PDFium is not thread-safe.
 
 See `THIRD_PARTY_NOTICES.md` for the full list of dependencies and their licenses.

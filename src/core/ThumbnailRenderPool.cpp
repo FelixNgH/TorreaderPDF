@@ -28,8 +28,8 @@ extern QMutex s_pdfiumMutex;
 
 // ── ThumbnailWorker ───────────────────────────────────────────────────────────
 
-ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cache, QObject* parent)
-    : QThread(parent), m_doc(doc), m_slot(slot), m_cache(cache) {}
+ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cache, quint64 epoch, QObject* parent)
+    : QThread(parent), m_doc(doc), m_slot(slot), m_cache(cache), m_epoch(epoch) {}
 
 void ThumbnailWorker::enqueue(int pageIndex, int priority) {
     QMutexLocker lock(&m_mutex);
@@ -66,7 +66,7 @@ void ThumbnailWorker::run() {
             if (!cached.isNull()) {
                 qDebug() << "[perf] thumb cache hit page=" << req.pageIndex;
                 qDebug() << "[perf] thumb WORKER emit page=" << req.pageIndex << "worker=" << (void*)this << "thread=" << QThread::currentThreadId();
-                emit thumbnailReady(req.pageIndex, cached);
+                emit thumbnailReady(req.pageIndex, cached, m_epoch);
                 continue;
             }
         }
@@ -83,15 +83,26 @@ void ThumbnailWorker::run() {
 
         // Step 1: Start (lock mutex for this slice only)
         {
-            if (req.priority >= 2) {
+            // Yield to main renderer for ALL priorities: thumbnail delayed a few hundred ms
+            // is invisible to user, but main page stuck 15s is very visible.
+            // Anti-starvation: after kThumbYieldMaxTries, take lock by force so thumbnails still appear.
+            constexpr int kThumbYieldMaxTries = 25; // ~25 x (5ms try + 20ms sleep) ~ 600ms
+            if (req.yieldTries < kThumbYieldMaxTries) {
                 if (!s_pdfiumMutex.tryLock(5)) {
                     QMutexLocker lock(&m_mutex);
+                    req.yieldTries++;
+                    if (req.yieldTries % 10 == 0)
+                        qDebug() << "[perf] thumb YIELD page=" << req.pageIndex
+                                 << "tries=" << req.yieldTries;
                     m_queued.insert(req.pageIndex);
                     m_queue.push(req);
                     QThread::msleep(20);
                     continue;
                 }
                 s_pdfiumMutex.unlock();
+            } else {
+                qDebug() << "[perf] thumb FORCE lock page=" << req.pageIndex
+                         << "(het luot nhuong)";
             }
 
             QMutexLocker thumbLock(&s_pdfiumMutex);
@@ -113,7 +124,7 @@ void ThumbnailWorker::run() {
                 if (m_cache && m_cache->isOpen())
                     m_cache->writePage(req.pageIndex, CacheZoom::Thumb, embImg);
                 qDebug() << "[perf] thumb WORKER emit page=" << req.pageIndex << "worker=" << (void*)this << "thread=" << QThread::currentThreadId();
-                emit thumbnailReady(req.pageIndex, embImg);
+                emit thumbnailReady(req.pageIndex, embImg, m_epoch);
                 FPDF_ClosePage(fpdfPage);
                 continue;
             }
@@ -177,7 +188,7 @@ void ThumbnailWorker::run() {
             if (m_cache && m_cache->isOpen())
                 m_cache->writePage(req.pageIndex, CacheZoom::Thumb, image);
             qDebug() << "[perf] thumb WORKER emit page=" << req.pageIndex << "worker=" << (void*)this << "thread=" << QThread::currentThreadId();
-            emit thumbnailReady(req.pageIndex, image);
+            emit thumbnailReady(req.pageIndex, image, m_epoch);
         } else if (renderStatus == FPDF_RENDER_FAILED) {
             qDebug() << "[perf] thumb FAILED page=" << req.pageIndex;
         }
@@ -215,18 +226,18 @@ bool ThumbnailRenderPool::open(const QString& pdfPath) {
             m_cache.open(pdfPath, hash, static_cast<uint64_t>(fi.size()), pgCount);
     }
 
-    QMutexLocker thumbLock(&s_pdfiumMutex);
+    ++m_epoch;
     for (int i = 0; i < kDocs; ++i) {
         FPDF_DOCUMENT doc = FPDF_LoadDocument(pathBytes.constData(), nullptr);
         if (!doc) { qDebug() << "[perf] thumb pool FAILED to open — FPDF_LoadDocument failed"; close(); return false; }
 
         if (i == 0) m_pageCount = FPDF_GetPageCount(doc);
 
-        auto* w = new ThumbnailWorker(doc, i, &m_cache, this);
+        auto* w = new ThumbnailWorker(doc, i, &m_cache, m_epoch, nullptr);
         auto c = connect(w, &ThumbnailWorker::thumbnailReady, this,
-                         [this](int pg, QImage img) {
+                         [this](int pg, QImage img, quint64 ep) {
                              qDebug() << "[perf] thumb POOL relay page=" << pg;
-                             emit thumbnailReady(pg, img);
+                             emit thumbnailReady(pg, img, ep);
                          });
         if (!c)
             qDebug() << "[perf] thumb POOL RELAY CONNECT FAILED worker=" << (void*)w;

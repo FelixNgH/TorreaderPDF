@@ -1,9 +1,11 @@
 #include "PdfGpuView.h"
+#include <QOpenGLExtraFunctions>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QDebug>
+#include <QFontDatabase>
 #include <cmath>
 
 // ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
@@ -47,6 +49,30 @@ void main() {
 }
 )";
 
+// ── Ghost baseline & font helpers (§3.5) ────────────────────────────────────
+QPointF trGhostBaseline(const QRectF& dispRect) {
+    return QPointF(dispRect.left() + 4.0, dispRect.bottom() - 2.0);
+}
+qreal trGhostPixelSize(float fontSizePt, double zoom) {
+    return static_cast<qreal>(fontSizePt) * zoom;
+}
+static QFont trNoteFont(const QString& fallbackFamily) {
+    static bool loaded = false;
+    static QString dejaVuFamily;
+    if (!loaded) {
+        loaded = true;
+        int id = QFontDatabase::addApplicationFont(":/fonts/DejaVuSans.ttf");
+        if (id >= 0) {
+            QStringList families = QFontDatabase::applicationFontFamilies(id);
+            if (!families.isEmpty()) dejaVuFamily = families.first();
+        }
+        if (dejaVuFamily.isEmpty()) {
+            qWarning() << "[ghost] DejaVuSans not found, using system font";
+        }
+    }
+    return QFont(dejaVuFamily.isEmpty() ? fallbackFamily : dejaVuFamily);
+}
+
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
 PdfGpuView::PdfGpuView(QWidget* parent)
@@ -76,6 +102,28 @@ PdfGpuView::~PdfGpuView() {
         delete m_program; m_program = nullptr;
         m_vao.destroy();
         m_vbo.destroy();
+        // Vector overlay cleanup
+        if (m_vecProg) { delete m_vecProg; m_vecProg = nullptr; }
+        if (m_fillProg) { delete m_fillProg; m_fillProg = nullptr; }
+        if (m_tileProg) { delete m_tileProg; m_tileProg = nullptr; }
+        QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+        if (glx && m_vecVao) { glx->glDeleteVertexArrays(1, &m_vecVao); m_vecVao = 0; }
+        if (m_vecVboPos) { glDeleteBuffers(1, &m_vecVboPos); m_vecVboPos = 0; }
+        if (m_vecVboCol) { glDeleteBuffers(1, &m_vecVboCol); m_vecVboCol = 0; }
+        if (m_vecVboQuad) { glDeleteBuffers(1, &m_vecVboQuad); m_vecVboQuad = 0; }
+        if (m_vecVboWidth) { glDeleteBuffers(1, &m_vecVboWidth); m_vecVboWidth = 0; }
+        if (m_vecVboDepth) { glDeleteBuffers(1, &m_vecVboDepth); m_vecVboDepth = 0; }
+        if (m_vecVboClip) { glDeleteBuffers(1, &m_vecVboClip); m_vecVboClip = 0; }
+        if (glx && m_fillVao) { glx->glDeleteVertexArrays(1, &m_fillVao); m_fillVao = 0; }
+        if (m_fillVboPos) { glDeleteBuffers(1, &m_fillVboPos); m_fillVboPos = 0; }
+        if (m_fillVboCol) { glDeleteBuffers(1, &m_fillVboCol); m_fillVboCol = 0; }
+        if (m_fillVboDepth) { glDeleteBuffers(1, &m_fillVboDepth); m_fillVboDepth = 0; }
+        if (m_fillVboClip) { glDeleteBuffers(1, &m_fillVboClip); m_fillVboClip = 0; }
+        if (glx && m_tileVao) { glx->glDeleteVertexArrays(1, &m_tileVao); m_tileVao = 0; }
+        for (GLuint t : m_tileTexText) if (t) glDeleteTextures(1, &t);
+        for (GLuint t : m_tileTexImg) if (t) glDeleteTextures(1, &t);
+        m_tileTexText.clear();
+        m_tileTexImg.clear();
         doneCurrent();
     }
 }
@@ -103,6 +151,162 @@ void PdfGpuView::initializeGL() {
     m_vbo.create();
     m_vbo.setUsagePattern(QOpenGLBuffer::StaticDraw);
 
+    // Vector overlay shader
+    static const char* vecVsrc = R"(
+        #version 330 core
+        layout(location = 0) in vec2 aCorner;
+        layout(location = 1) in vec2 aP0;
+        layout(location = 2) in vec2 aP1;
+        layout(location = 3) in vec4 aColor;
+        layout(location = 4) in float aWidthPt;
+        layout(location = 5) in float aDepth;
+        layout(location = 6) in float aClipIdx;
+        uniform mat4  uMvp;
+        uniform vec2  uViewport;
+        uniform float uPxPerPt;
+        uniform vec4  uClips[64];
+        out vec4 vColor;
+        flat out vec4 vClip;
+        out vec2 vPagePos;
+        void main() {
+            vec4 c0 = uMvp * vec4(aP0, 0.0, 1.0);
+            vec4 c1 = uMvp * vec4(aP1, 0.0, 1.0);
+            vec2 s0 = (c0.xy / c0.w * 0.5 + 0.5) * uViewport;
+            vec2 s1 = (c1.xy / c1.w * 0.5 + 0.5) * uViewport;
+            vec2 d  = s1 - s0;
+            float L = length(d);
+            d = (L > 1e-6) ? d / L : vec2(1.0, 0.0);
+            vec2 n  = vec2(-d.y, d.x);
+            float wRaw = aWidthPt * uPxPerPt;
+            float cov  = 1.0;
+            if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, 0.15);
+            float wpx  = max(wRaw, 1.0);
+            vec2 p = mix(s0, s1, aCorner.x) + n * (aCorner.y - 0.5) * wpx;
+            gl_Position = vec4((p / uViewport) * 2.0 - 1.0, aDepth * 2.0 - 1.0, 1.0);
+            vColor = vec4(aColor.rgb, aColor.a * cov);
+            vClip = uClips[int(aClipIdx)];
+            vPagePos = mix(aP0, aP1, aCorner.x);
+        }
+    )";
+    static const char* vecFsrc = R"(
+        #version 330 core
+        in vec4 vColor;
+        flat in vec4 vClip;
+        in vec2 vPagePos;
+        out vec4 fragColor;
+        void main() {
+            if (vClip.z > 0.0 && (vPagePos.x < vClip.x || vPagePos.x > vClip.x + vClip.z ||
+                                  vPagePos.y < vClip.y || vPagePos.y > vClip.y + vClip.w)) discard;
+            fragColor = vColor;
+        }
+    )";
+    m_vecProg = new QOpenGLShaderProgram(this);
+    m_vecProg->addShaderFromSourceCode(QOpenGLShader::Vertex, vecVsrc);
+    m_vecProg->addShaderFromSourceCode(QOpenGLShader::Fragment, vecFsrc);
+    if (!m_vecProg->link()) {
+        qDebug() << "[GpuView] vector shader link failed:" << m_vecProg->log();
+        delete m_vecProg; m_vecProg = nullptr;
+    } else {
+        m_vecMvpLoc = m_vecProg->uniformLocation("uMvp");
+        m_vecViewportLoc = m_vecProg->uniformLocation("uViewport");
+        m_vecPxPerPtLoc = m_vecProg->uniformLocation("uPxPerPt");
+    }
+
+    static const char* fillVsrc = R"(
+        #version 330 core
+        layout(location = 0) in vec2 aPos;
+        layout(location = 1) in vec4 aColor;
+        layout(location = 2) in float aDepth;
+        layout(location = 3) in float aClipIdx;
+        uniform mat4 uMvp;
+        uniform vec4 uClips[64];
+        out vec4 vColor;
+        flat out vec4 vClip;
+        out vec2 vPagePos;
+        void main() {
+            vec4 pos = uMvp * vec4(aPos, 0.0, 1.0);
+            gl_Position = vec4(pos.xy, (aDepth * 2.0 - 1.0) * pos.w, pos.w);
+            vColor = aColor;
+            vClip = uClips[int(aClipIdx)];
+            vPagePos = aPos;
+        }
+    )";
+    static const char* fillFsrc = R"(
+        #version 330 core
+        in vec4 vColor;
+        flat in vec4 vClip;
+        in vec2 vPagePos;
+        out vec4 fragColor;
+        void main() {
+            if (vClip.z > 0.0 && (vPagePos.x < vClip.x || vPagePos.x > vClip.x + vClip.z ||
+                                  vPagePos.y < vClip.y || vPagePos.y > vClip.y + vClip.w)) discard;
+            fragColor = vColor;
+        }
+    )";
+    m_fillProg = new QOpenGLShaderProgram(this);
+    m_fillProg->addShaderFromSourceCode(QOpenGLShader::Vertex, fillVsrc);
+    m_fillProg->addShaderFromSourceCode(QOpenGLShader::Fragment, fillFsrc);
+    if (!m_fillProg->link()) {
+        qDebug() << "[GpuView] fill shader link failed:" << m_fillProg->log();
+        delete m_fillProg; m_fillProg = nullptr;
+    } else {
+        m_fillMvpLoc = m_fillProg->uniformLocation("uMvp");
+    }
+
+    static const char* tileVsrc = R"(
+        #version 330 core
+        layout(location = 0) in vec2 aCorner;
+        uniform mat4  uMvp;
+        uniform vec4  uRect;
+        uniform float uDepth;
+        uniform vec4  uClips[64];
+        uniform float uClipIdx;
+        out vec2 vUV;
+        flat out vec4 vClip;
+        out vec2 vPagePos;
+        void main() {
+            vec2 p = uRect.xy + aCorner * uRect.zw;
+            vec4 pos = uMvp * vec4(p, 0.0, 1.0);
+            gl_Position = vec4(pos.xy, (uDepth * 2.0 - 1.0) * pos.w, pos.w);
+            vUV = aCorner;
+            vClip = uClips[int(uClipIdx)];
+            vPagePos = p;
+        }
+    )";
+    static const char* tileFsrc = R"(
+        #version 330 core
+        uniform sampler2D uTex;
+        uniform int  uIsAlpha;
+        uniform vec4 uColor;
+        in vec2 vUV;
+        flat in vec4 vClip;
+        in vec2 vPagePos;
+        out vec4 fragColor;
+        void main() {
+            if (vClip.z > 0.0 && (vPagePos.x < vClip.x || vPagePos.x > vClip.x + vClip.z ||
+                                  vPagePos.y < vClip.y || vPagePos.y > vClip.y + vClip.w)) discard;
+            vec4 c;
+            if (uIsAlpha == 1) c = vec4(uColor.rgb, texture(uTex, vUV).r);
+            else               c = texture(uTex, vUV);
+            if (c.a < 0.02) discard;
+            fragColor = c;
+        }
+    )";
+    m_tileProg = new QOpenGLShaderProgram(this);
+    m_tileProg->addShaderFromSourceCode(QOpenGLShader::Vertex, tileVsrc);
+    m_tileProg->addShaderFromSourceCode(QOpenGLShader::Fragment, tileFsrc);
+    if (!m_tileProg->link()) {
+        qDebug() << "[GpuView] tile shader link failed:" << m_tileProg->log();
+        delete m_tileProg; m_tileProg = nullptr;
+    } else {
+        m_tileMvpLoc = m_tileProg->uniformLocation("uMvp");
+        m_tileRectLoc = m_tileProg->uniformLocation("uRect");
+        m_tileDepthLoc = m_tileProg->uniformLocation("uDepth");
+        m_tileTexLoc = m_tileProg->uniformLocation("uTex");
+        m_tileIsAlphaLoc = m_tileProg->uniformLocation("uIsAlpha");
+        m_tileColorLoc = m_tileProg->uniformLocation("uColor");
+    }
+
     {
         QOpenGLVertexArrayObject::Binder binder(&m_vao);
         m_vbo.bind();
@@ -116,6 +320,19 @@ void PdfGpuView::initializeGL() {
                               reinterpret_cast<void*>(2 * sizeof(float)));
         m_vbo.release();
     }
+
+    static const float tileQuad[] = { 0,0, 0,1, 1,0, 1,1 };
+    QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+    if (!glx) return;
+    glx->glGenVertexArrays(1, &m_tileVao);
+    glx->glBindVertexArray(m_tileVao);
+    GLuint tileVbo;
+    glGenBuffers(1, &tileVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, tileVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(tileQuad), tileQuad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+    glx->glBindVertexArray(0);
 }
 
 void PdfGpuView::resizeGL(int, int) {
@@ -177,10 +394,31 @@ QMatrix4x4 PdfGpuView::computeTransform() const {
     return m;
 }
 
+QMatrix4x4 PdfGpuView::vectorTransform() const {
+    // Dinh vector o DON VI DIEM PDF, Y-down. Doi thang sang pixel widget.
+    const QSizeF vp = m_vecLayer ? m_vecLayer->pageSizePt() : QSizeF();
+    if (vp.width() <= 0 || vp.height() <= 0) return QMatrix4x4();
+
+    const double pw   = m_pageSizePt.width()  * m_zoom;   // be ngang trang tren man, px
+    const double ph   = m_pageSizePt.height() * m_zoom;
+    const QPointF orig = pageOrigin();                    // DA gom m_panOffset
+
+    QMatrix4x4 m;
+    m.ortho(0.f, (float)width(), (float)height(), 0.f, -1.f, 1.f);
+    m.translate((float)orig.x(), (float)orig.y(), 0.f);
+    m.scale((float)(pw / vp.width()), (float)(ph / vp.height()), 1.f);
+    return m;
+}
+
 // ── Paint ─────────────────────────────────────────────────────────────────────
 
 void PdfGpuView::paintGL() {
-    QElapsedTimer _pf; _pf.start();
+    const bool pureVector =
+           m_vecLayer && m_vecLayer->isReady()
+        && m_vecLayer->pageIndex() == m_pageIndex
+        && m_vecLayer->isComplete()
+        && shouldUseVectorOverlay();
+
     // Upload pending texture (must happen inside GL context)
     if (m_textureDirty && !m_pendingImage.isNull()) {
         uploadTexture(m_pendingImage);
@@ -194,11 +432,7 @@ void PdfGpuView::paintGL() {
     glClear(GL_COLOR_BUFFER_BIT);
 
     // Draw page texture
-    if (m_hasImage && !m_texture)
-        qDebug() << "[GpuView] WARN: hasImage=true but texture=0, page" << m_pageIndex;
-    if (m_hasImage && m_pageSizePt.isEmpty())
-        qDebug() << "[GpuView] WARN: hasImage=true but pageSizePt is EMPTY (page index" << m_pageIndex << ") — chính path không set kích thước trang";
-    if (m_hasImage && m_texture && !m_pageSizePt.isEmpty()) {
+    if (m_hasImage && m_texture && !m_pageSizePt.isEmpty() && !pureVector) {
         // Drop shadow via filled quad slightly offset (draw under page)
         // (Drawn via QPainter below to keep GL code minimal)
 
@@ -222,15 +456,7 @@ void PdfGpuView::paintGL() {
             (m_sigPickMode && m_sigActive) ||
             (m_loading && !m_hasImage) ||
             (m_hasImage && !m_pageSizePt.isEmpty());
-        if (!_needQP) {
-            qint64 _pms = _pf.elapsed();
-            if (_pms >= 16)
-                qDebug() << "[perf] paint ms=" << _pms << "zoom=" << m_zoom
-                         << "tiles=" << m_tiles.size()
-                         << "annots=" << m_annotOverlays.size()
-                         << "panning=" << m_panning;
-            return;
-        }
+        if (!_needQP) return;
     }
 
     QPainter p(this);
@@ -250,17 +476,28 @@ void PdfGpuView::paintGL() {
         double ph = m_pageSizePt.height() * m_zoom;
         QPointF orig = pageOrigin();
         const double sh = 4.0;
+        if (pureVector) {
+            p.fillRect(QRectF(orig.x(), orig.y(), pw, ph), Qt::white);
+        }
         p.fillRect(QRectF(orig.x() + pw, orig.y() + sh, sh, ph), QColor(0, 0, 0, 80));
         p.fillRect(QRectF(orig.x() + sh, orig.y() + ph, pw, sh), QColor(0, 0, 0, 80));
 
         // ── Draw sharp-region overlay (viewport re-rendered at true zoom) ──
-        if (m_sharpPage == m_pageIndex && qAbs(m_sharpScale - m_zoom) < 1e-6 && !m_sharpImage.isNull()) {
+        if (m_sharpPage == m_pageIndex && qAbs(m_sharpScale - m_zoom) < 1e-6 && !m_sharpImage.isNull() && !pureVector) {
             p.save();
             p.setRenderHint(QPainter::Antialiasing, false);
             p.setRenderHint(QPainter::SmoothPixmapTransform, false);
             p.drawImage(QPoint(qRound(orig.x() + m_sharpRegion.x()),
                                qRound(orig.y() + m_sharpRegion.y())), m_sharpImage);
             p.restore();
+        }
+
+        // ── Vector overlay (sharp strokes on top of raster + sharp-region) ──
+        if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->pageIndex() == m_pageIndex
+            && shouldUseVectorOverlay()) {
+            p.beginNativePainting();
+            drawVectorOverlay();
+            p.endNativePainting();
         }
 
         // Highlights (display coords: Y-down, rotation applied)
@@ -299,8 +536,11 @@ void PdfGpuView::paintGL() {
         if (!m_annotOverlays.isEmpty()) {
             double pageH = m_pageSizePt.height();
             p.save();
+            int cntVis = 0, cntSticky = 0, cntDrawn = 0;
             for (const auto& ov : m_annotOverlays) {
                 if (ov.pageIndex != m_pageIndex) continue;
+                const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && ov.uid == m_dragUid;
+                if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
                 QRectF nr = ov.pdfRect.normalized();
                 double cx = orig.x() + (nr.x() + nr.width()  / 2) * m_zoom;
                 double cy = orig.y() + (pageH - nr.y() - nr.height() / 2) * m_zoom;
@@ -315,6 +555,14 @@ void PdfGpuView::paintGL() {
                     p.setPen(QColor(50, 50, 50));
                     QFont sf = p.font(); sf.setPointSize(8); sf.setBold(false); p.setFont(sf);
                     p.drawText(QRectF(cx - 60, cy + 16, 120, 20), Qt::AlignCenter, ov.snippet);
+                }
+                if (isDragged) p.restore();
+            }
+            {
+                static int sV = -1, sS = -1, sD = -1;
+                if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
+                    sV = cntVis; sS = cntSticky; sD = cntDrawn;
+                    qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
                 }
             }
             p.restore();
@@ -407,10 +655,14 @@ void PdfGpuView::paintGL() {
             p.save();
             p.setRenderHint(QPainter::Antialiasing, true);
             QPointF orig = pageOrigin();
+            int cntVis = 0, cntSticky = 0, cntDrawn = 0;
             for (const AnnotVisual& av : m_annotVisuals) {
                 if (av.page != m_pageIndex) continue;
-                // FreeText/Note are page objects in the renderer — overlay skips them to avoid double-draw
-                if (!av.paintByOverlay) continue;
+                ++cntVis;
+                if (av.subtype == FPDF_ANNOT_TEXT) ++cntSticky;
+                if (!av.paintByOverlay) continue;   // FreeText/Note do lop nen ve (dung font nhung)
+                const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && av.uid == m_dragUid;
+                if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
                 QPointF dOrig = orig + QPointF(av.rect.x() * m_zoom, av.rect.y() * m_zoom);
                 QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
                 QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
@@ -475,18 +727,15 @@ void PdfGpuView::paintGL() {
                         p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
                         break;
                     }
-                    case FPDF_ANNOT_TEXT: {
-                        // Sticky note icon badge
-                        QRectF badge(dRect.center().x() - 14, dRect.center().y() - 14, 28, 28);
-                        p.setBrush(QColor(245, 158, 11, 220));
-                        p.setPen(QColor(180, 100, 0, 200));
-                        p.drawRoundedRect(badge, 6, 6);
-                        p.setPen(Qt::white);
-                        QFont fnt = p.font(); fnt.setPointSize(10); fnt.setBold(true); p.setFont(fnt);
-                        p.drawText(badge, Qt::AlignCenter, "N");
-                        break;
-                    }
                     default: break;
+                }
+                if (isDragged) p.restore();
+            }
+            {
+                static int sV = -1, sS = -1, sD = -1;
+                if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
+                    sV = cntVis; sS = cntSticky; sD = cntDrawn;
+                    qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
                 }
             }
             p.restore();
@@ -494,7 +743,7 @@ void PdfGpuView::paintGL() {
 
     }
 
-    // Text selection overlay (Ctrl+drag)
+    // Text selection overlay (Alt+drag)
     if (m_selecting) {
         QRectF sel = QRectF(m_selStart, m_selEnd).normalized();
         p.setRenderHint(QPainter::Antialiasing, false);
@@ -543,7 +792,8 @@ void PdfGpuView::paintGL() {
 
     // Show loading indicator on ANY state: even when a partial image exists,
     // keep the "Loading…" overlay so the user knows rendering is in progress.
-    if (m_loading) {
+    // ponytail: skip "Loading…" when pure vector mode is active (no raster image expected)
+    if (m_loading && !pureVector) {
         if (!m_hasImage) {
             if (!m_placeholder.isNull() && !m_pageSizePt.isEmpty()) {
                 // Draw thumbnail placeholder scaled to page rect
@@ -553,14 +803,12 @@ void PdfGpuView::paintGL() {
                 QRectF pageRect(orig.x(), orig.y(), pw, ph);
                 p.fillRect(pageRect, Qt::white);
                 p.drawImage(pageRect, m_placeholder);
-                qDebug() << "[perf] placeholder shown page=" << m_pageIndex << "source=thumb";
             } else if (!m_pageSizePt.isEmpty()) {
                 // No thumbnail — draw blank page rect
                 double pw = m_pageSizePt.width() * m_zoom;
                 double ph = m_pageSizePt.height() * m_zoom;
                 QPointF orig = pageOrigin();
                 p.fillRect(QRectF(orig.x(), orig.y(), pw, ph), Qt::white);
-                qDebug() << "[perf] placeholder shown page=" << m_pageIndex << "source=blank";
             } else if (m_pageSizePt.isEmpty()) {
                 p.fillRect(rect(), QColor(0, 0, 0, 80));
             }
@@ -570,12 +818,6 @@ void PdfGpuView::paintGL() {
         p.drawText(rect(), Qt::AlignCenter, "Loading…");
     }
 
-    qint64 _pms = _pf.elapsed();
-    if (_pms >= 16)
-        qDebug() << "[perf] paint ms=" << _pms << "zoom=" << m_zoom
-                 << "tiles=" << m_tiles.size()
-                 << "annots=" << m_annotOverlays.size()
-                 << "panning=" << m_panning;
 }
 
 // ── Page management ───────────────────────────────────────────────────────────
@@ -652,7 +894,7 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
         m_tilePage = -1;
         m_tileScale = 0.0;
         m_sharpPage = -1; m_sharpImage = {};
-        m_tileTimer->start();
+        scheduleTiles();
     }
     update();
 }
@@ -675,6 +917,10 @@ void PdfGpuView::updatePageImage(const QImage& pageImage) {
 void PdfGpuView::setPlaceholder(const QImage& img) {
     m_placeholder = img;
     update();
+}
+
+QSize PdfGpuView::currentPageImageSize() const {
+    return m_lastImage.size();
 }
 
 void PdfGpuView::showPartial(int page, double scale, QImage img) {
@@ -763,12 +1009,25 @@ void PdfGpuView::setZoom(double scale) {
     m_tilePage = -1;
     m_tileScale = 0.0;
     m_sharpPage = -1; m_sharpImage = {};
-    m_tileTimer->start();
+    scheduleTiles();
+    update();
+}
+
+void PdfGpuView::centerPage() {
+    m_panOffset = QPointF();
+    invalidateSharp();
     update();
 }
 
 void PdfGpuView::requestTiles() {
     if (!m_hasImage || m_pageSizePt.isEmpty()) return;
+    if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->pageIndex() == m_pageIndex
+        && m_vecLayer->isComplete() && shouldUseVectorOverlay()) {
+        m_sharpPage = -1; m_sharpImage = {};
+        return;
+    }
+    // Vector overlay is additive (draws strokes on top of raster) — let
+    // region render run normally so images/fills stay sharp underneath.
     // Only pay for a sharp-region render when the base full-page image
     // (capped at 4000px long edge, = PdfRenderer::kFullRenderMaxPx) is being
     // upscaled. Below that the base is already sharp, so a region render is
@@ -795,10 +1054,24 @@ void PdfGpuView::requestTiles() {
     int rw = qMin((int)pw, (int)(visRight - visLeft));
     int rh = qMin((int)ph, (int)(visBottom - visTop));
 
+    constexpr int kSnap = 256;
+    int sx = (rx / kSnap) * kSnap;
+    int sy = (ry / kSnap) * kSnap;
+    int ex = ((rx + rw + kSnap - 1) / kSnap) * kSnap;
+    int ey = ((ry + rh + kSnap - 1) / kSnap) * kSnap;
+    ex = qMin(ex, (int)pw);
+    ey = qMin(ey, (int)ph);
+    rx = sx; ry = sy; rw = ex - sx; rh = ey - sy;
+    if (rw <= 0 || rh <= 0) return;
+
     QRect viewportPx(rx, ry, rw, rh);
     m_tilePage  = m_pageIndex;
     m_tileScale = m_zoom;
     emit tilesNeeded(m_pageIndex, m_zoom, viewportPx);
+}
+
+void PdfGpuView::scheduleTiles() {
+    m_tileTimer->start(shouldUseVectorOverlay() ? 1500 : 120);
 }
 
 void PdfGpuView::setTile(int page, double scale, int col, int row, const QImage& img) {
@@ -845,14 +1118,28 @@ void PdfGpuView::invalidateSharp() {
     m_sharpPage  = -1;
     m_sharpImage = {};
     update();
-    m_tileTimer->start();
+    scheduleTiles();
 }
 
 void PdfGpuView::invalidateTiles() {
     m_tiles.clear();
     m_tilePage = -1;
     m_tileScale = 0.0;
-    m_tileTimer->start();
+    scheduleTiles();
+    update();
+}
+
+void PdfGpuView::invalidateTileTextures() {
+    makeCurrent();
+    for (auto& tex : m_tileTexText) {
+        if (tex != 0) glDeleteTextures(1, &tex);
+    }
+    m_tileTexText.clear();
+    for (auto& tex : m_tileTexImg) {
+        if (tex != 0) glDeleteTextures(1, &tex);
+    }
+    m_tileTexImg.clear();
+    doneCurrent();
     update();
 }
 
@@ -865,6 +1152,11 @@ void PdfGpuView::addPendingMarkup(AnnotTool tool, const AnnotStyle& style,
     pm.fill = style.fillColor;
     pm.a = a; pm.b = b; pm.freehand = freehand;
     m_pendingMarkups.append(pm);
+    update();
+}
+
+void PdfGpuView::clearPendingMarkups() {
+    m_pendingMarkups.clear();
     update();
 }
 
@@ -894,6 +1186,7 @@ void PdfGpuView::beginSignaturePick() {
 }
 
 void PdfGpuView::setSelectedAnnot(const QRectF& rectPdf) {
+    m_dragPixelDelta = QPointF();
     m_selRect = rectPdf;
     m_hasSel = true;
     update();
@@ -901,6 +1194,33 @@ void PdfGpuView::setSelectedAnnot(const QRectF& rectPdf) {
 
 void PdfGpuView::clearSelectedAnnot() {
     m_hasSel = false;
+    clearDragTarget();
+    update();
+}
+
+void PdfGpuView::setDragTarget(const QString& uid, const QString& ghostText,
+                               float fontSizePt, const QColor& ghostColor) {
+    m_dragUid     = uid;
+    Q_UNUSED(ghostText)
+    Q_UNUSED(fontSizePt)
+    Q_UNUSED(ghostColor)
+}
+
+void PdfGpuView::clearDragTarget() {
+    m_dragUid.clear();
+}
+
+void PdfGpuView::setDragNote(const QRectF& rPt) {
+    m_dragNoteRect = rPt;
+    m_dragNoteOffsetPt = QPointF();
+    update();
+}
+
+void PdfGpuView::clearDragState() {
+    m_dragPixelDelta = QPointF();
+    m_dragNoteRect = QRectF();
+    m_dragNoteOffsetPt = QPointF();
+    m_dragUid.clear();
     update();
 }
 
@@ -990,7 +1310,7 @@ void PdfGpuView::wheelEvent(QWheelEvent* e) {
         m_tilePage = -1;
         m_tileScale = 0.0;
         m_sharpPage = -1; m_sharpImage = {};
-        m_tileTimer->start();
+        scheduleTiles();
         update();
         m_zoomTimer->start();
     } else {
@@ -1056,6 +1376,9 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
                     m_draggingAnnot = true;
                     m_dragStart = e->position();
                     m_dragOrigRect = m_selRect;
+                    m_dragPixelDelta = QPointF(0, 0);
+                    m_dragNoteRect = m_dragOrigRect;
+                    m_dragNoteOffsetPt = QPointF();
                     return;
                 }
             }
@@ -1084,8 +1407,8 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
             return;
         }
     }
-    // Ctrl+Left drag = text selection for translation
-    if ((e->modifiers() & Qt::ControlModifier) && e->button() == Qt::LeftButton) {
+    // Alt+Left drag = text selection for translation
+    if ((e->modifiers() & Qt::AltModifier) && e->button() == Qt::LeftButton) {
         m_selecting = true;
         m_selStart  = e->position();
         m_selEnd    = e->position();
@@ -1109,6 +1432,8 @@ void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
     if (m_draggingAnnot) {
         QPointF d = (e->position() - m_dragStart) / m_zoom;
         m_selRect = m_dragOrigRect.translated(d);
+        m_dragPixelDelta = e->position() - m_dragStart;
+        m_dragNoteOffsetPt = d;
         update();
         return;
     }
@@ -1176,6 +1501,11 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
     }
     if (m_draggingAnnot) {
         m_draggingAnnot = false;
+        m_dragPixelDelta = QPointF();
+        m_dragNoteRect = QRectF();
+        m_dragNoteOffsetPt = QPointF();
+        m_dragUid.clear();
+        update();
         double dx = (e->position().x() - m_dragStart.x()) / m_zoom;
         double dy = -(e->position().y() - m_dragStart.y()) / m_zoom;
         if (qAbs(dx) > 1.0 || qAbs(dy) > 1.0)
@@ -1262,4 +1592,320 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
     }
     setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
     update();
+}
+
+// ── Vector overlay ──────────────────────────────────────────────────────────
+
+void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> layer) {
+    qDebug().noquote() << "[vector] setVectorLayer page=" << m_pageIndex
+                       << "ready=" << (layer && layer->isReady());
+    m_vecLayer = layer;
+    m_vecUploadedPage = -1;
+    if (!layer && m_vecVao) {
+        makeCurrent();
+        QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+        if (glx) glx->glDeleteVertexArrays(1, &m_vecVao);
+        if (m_vecVboPos) glDeleteBuffers(1, &m_vecVboPos);
+        if (m_vecVboCol) glDeleteBuffers(1, &m_vecVboCol);
+        if (m_vecVboQuad) glDeleteBuffers(1, &m_vecVboQuad);
+        if (m_vecVboWidth) glDeleteBuffers(1, &m_vecVboWidth);
+        if (m_vecVboDepth) glDeleteBuffers(1, &m_vecVboDepth);
+        if (m_vecVboClip) glDeleteBuffers(1, &m_vecVboClip);
+        m_vecVao = 0; m_vecVboPos = 0; m_vecVboCol = 0; m_vecVboQuad = 0; m_vecVboWidth = 0; m_vecVboDepth = 0; m_vecVboClip = 0;
+        if (glx && m_fillVao) glx->glDeleteVertexArrays(1, &m_fillVao);
+        if (m_fillVboPos) glDeleteBuffers(1, &m_fillVboPos);
+        if (m_fillVboCol) glDeleteBuffers(1, &m_fillVboCol);
+        if (m_fillVboDepth) glDeleteBuffers(1, &m_fillVboDepth);
+        if (m_fillVboClip) glDeleteBuffers(1, &m_fillVboClip);
+        m_fillVao = 0; m_fillVboPos = 0; m_fillVboCol = 0; m_fillVboDepth = 0; m_fillVboClip = 0;
+        for (GLuint t : m_tileTexText) if (t) glDeleteTextures(1, &t);
+        for (GLuint t : m_tileTexImg) if (t) glDeleteTextures(1, &t);
+        m_tileTexText.clear();
+        m_tileTexImg.clear();
+        doneCurrent();
+    }
+    update();
+}
+
+bool PdfGpuView::shouldUseVectorOverlay() const {
+    const double onScreenW = m_pageSizePt.width() * m_zoom;
+    bool result = m_vecLayer && m_vecLayer->isReady()
+        && m_vecLayer->isComplete()
+        && m_vecLayer->pageIndex() == m_pageIndex;
+    if (result != m_vecLastOverlayState) {
+        m_vecLastOverlayState = result;
+        qDebug().noquote() << "[vector] overlay" << (result ? "ON" : "OFF")
+                           << "zoom=" << m_zoom
+                           << "page=" << m_pageIndex
+                           << "onScreenW=" << onScreenW
+                           << "texW=" << m_texW;
+    }
+    return result;
+}
+
+void PdfGpuView::drawVectorOverlay() {
+    if (!m_vecLayer || !m_vecLayer->isReady()) return;
+    if (m_vecLayer->widths().isEmpty() && m_vecLayer->fillVerts().isEmpty()) return;
+
+    QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+    if (!glx) return;
+
+    // Upload VBOs once per page
+    if (m_vecUploadedPage != m_vecLayer->pageIndex()) {
+        if (m_vecVao) { glx->glDeleteVertexArrays(1, &m_vecVao); m_vecVao = 0; }
+        if (m_vecVboPos) { glDeleteBuffers(1, &m_vecVboPos); m_vecVboPos = 0; }
+        if (m_vecVboCol) { glDeleteBuffers(1, &m_vecVboCol); m_vecVboCol = 0; }
+        if (m_vecVboQuad) { glDeleteBuffers(1, &m_vecVboQuad); m_vecVboQuad = 0; }
+        if (m_vecVboWidth) { glDeleteBuffers(1, &m_vecVboWidth); m_vecVboWidth = 0; }
+        if (m_vecVboDepth) { glDeleteBuffers(1, &m_vecVboDepth); m_vecVboDepth = 0; }
+        if (m_vecVboClip) { glDeleteBuffers(1, &m_vecVboClip); m_vecVboClip = 0; }
+        if (m_fillVao) { glx->glDeleteVertexArrays(1, &m_fillVao); m_fillVao = 0; }
+        if (m_fillVboPos) { glDeleteBuffers(1, &m_fillVboPos); m_fillVboPos = 0; }
+        if (m_fillVboCol) { glDeleteBuffers(1, &m_fillVboCol); m_fillVboCol = 0; }
+        if (m_fillVboDepth) { glDeleteBuffers(1, &m_fillVboDepth); m_fillVboDepth = 0; }
+        if (m_fillVboClip) { glDeleteBuffers(1, &m_fillVboClip); m_fillVboClip = 0; }
+
+        // -- Fill VBOs --
+        if (!m_vecLayer->fillVerts().isEmpty()) {
+            glx->glGenVertexArrays(1, &m_fillVao);
+            glx->glBindVertexArray(m_fillVao);
+
+            glGenBuffers(1, &m_fillVboPos);
+            glBindBuffer(GL_ARRAY_BUFFER, m_fillVboPos);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->fillVerts().size() * sizeof(float),
+                         m_vecLayer->fillVerts().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+
+            glGenBuffers(1, &m_fillVboCol);
+            glBindBuffer(GL_ARRAY_BUFFER, m_fillVboCol);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->fillColors().size() * sizeof(uint8_t),
+                         m_vecLayer->fillColors().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, 4 * sizeof(uint8_t), nullptr);
+
+            glGenBuffers(1, &m_fillVboDepth);
+            glBindBuffer(GL_ARRAY_BUFFER, m_fillVboDepth);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->fillDepths().size() * sizeof(float),
+                         m_vecLayer->fillDepths().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), nullptr);
+
+            if (!m_vecLayer->fillClipIdx().isEmpty()) {
+                glGenBuffers(1, &m_fillVboClip);
+                glBindBuffer(GL_ARRAY_BUFFER, m_fillVboClip);
+                glBufferData(GL_ARRAY_BUFFER, m_vecLayer->fillClipIdx().size() * sizeof(float),
+                             m_vecLayer->fillClipIdx().constData(), GL_STATIC_DRAW);
+                glEnableVertexAttribArray(3);
+                glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(float), nullptr);
+            }
+
+            glx->glBindVertexArray(0);
+        }
+
+        // -- Stroke VBOs --
+        if (!m_vecLayer->widths().isEmpty()) {
+            glx->glGenVertexArrays(1, &m_vecVao);
+            glx->glBindVertexArray(m_vecVao);
+
+            static const float quadVerts[8] = { 0,0, 0,1, 1,0, 1,1 };
+            glGenBuffers(1, &m_vecVboQuad);
+            glBindBuffer(GL_ARRAY_BUFFER, m_vecVboQuad);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+            glx->glVertexAttribDivisor(0, 0);
+
+            glGenBuffers(1, &m_vecVboPos);
+            glBindBuffer(GL_ARRAY_BUFFER, m_vecVboPos);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->verts().size() * sizeof(float),
+                         m_vecLayer->verts().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+            glx->glVertexAttribDivisor(1, 1);
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                                  reinterpret_cast<void*>(2 * sizeof(float)));
+            glx->glVertexAttribDivisor(2, 1);
+
+            glGenBuffers(1, &m_vecVboCol);
+            glBindBuffer(GL_ARRAY_BUFFER, m_vecVboCol);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->colors().size() * sizeof(uint8_t),
+                         m_vecLayer->colors().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, 4 * sizeof(uint8_t), nullptr);
+            glx->glVertexAttribDivisor(3, 1);
+
+            glGenBuffers(1, &m_vecVboWidth);
+            glBindBuffer(GL_ARRAY_BUFFER, m_vecVboWidth);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->widths().size() * sizeof(float),
+                         m_vecLayer->widths().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(float), nullptr);
+            glx->glVertexAttribDivisor(4, 1);
+
+            glGenBuffers(1, &m_vecVboDepth);
+            glBindBuffer(GL_ARRAY_BUFFER, m_vecVboDepth);
+            glBufferData(GL_ARRAY_BUFFER, m_vecLayer->depths().size() * sizeof(float),
+                         m_vecLayer->depths().constData(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(5);
+            glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(float), nullptr);
+            glx->glVertexAttribDivisor(5, 1);
+
+            if (!m_vecLayer->clipIdx().isEmpty()) {
+                glGenBuffers(1, &m_vecVboClip);
+                glBindBuffer(GL_ARRAY_BUFFER, m_vecVboClip);
+                glBufferData(GL_ARRAY_BUFFER, m_vecLayer->clipIdx().size() * sizeof(float),
+                             m_vecLayer->clipIdx().constData(), GL_STATIC_DRAW);
+                glEnableVertexAttribArray(6);
+                glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(float), nullptr);
+                glx->glVertexAttribDivisor(6, 1);
+            }
+
+            glx->glBindVertexArray(0);
+        }
+
+        m_vecUploadedPage = m_vecLayer->pageIndex();
+    }
+
+    GLboolean blendWasOn = glIsEnabled(GL_BLEND);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    const QPointF pgOrig = pageOrigin();
+    const double  pgW = m_pageSizePt.width()  * m_zoom;
+    const double  pgH = m_pageSizePt.height() * m_zoom;
+    const qreal   dpr = devicePixelRatioF();
+    const int sx = int(std::floor(pgOrig.x() * dpr));
+    const int sy = int(std::floor((height() - (pgOrig.y() + pgH)) * dpr));
+    const int sw = int(std::ceil(pgW * dpr));
+    const int sh = int(std::ceil(pgH * dpr));
+    GLint prevScissor[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
+    const GLboolean prevScissorOn = glIsEnabled(GL_SCISSOR_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sx, sy, qMax(0, sw), qMax(0, sh));
+
+    QMatrix4x4 mvp = vectorTransform();
+
+    auto uploadClips = [&](QOpenGLShaderProgram* prog) {
+        if (!prog) return;
+        const QVector<QRectF>& cl = m_vecLayer->clips();
+        for (int i = 0; i < 64; ++i) {
+            const QRectF r = (i < cl.size()) ? cl[i] : QRectF();
+            prog->setUniformValue(QString("uClips[%1]").arg(i).toUtf8().constData(),
+                                  QVector4D(float(r.x()), float(r.y()), float(r.width()), float(r.height())));
+        }
+    };
+
+    // -- Draw fills BEFORE strokes --
+    if (m_fillProg && m_fillVao && !m_vecLayer->fillVerts().isEmpty()) {
+        m_fillProg->bind();
+        m_fillProg->setUniformValue(m_fillMvpLoc, mvp);
+        uploadClips(m_fillProg);
+        glx->glBindVertexArray(m_fillVao);
+        glDrawArrays(GL_TRIANGLES, 0, m_vecLayer->fillVerts().size() / 2);
+        glx->glBindVertexArray(0);
+        m_fillProg->release();
+    }
+
+    // -- Draw strokes --
+    if (m_vecProg && m_vecVao && !m_vecLayer->widths().isEmpty()) {
+        m_vecProg->bind();
+        m_vecProg->setUniformValue(m_vecMvpLoc, mvp);
+        uploadClips(m_vecProg);
+        const QSizeF vp = m_vecLayer->pageSizePt();
+        const float pxPerPt = (vp.width() > 0.0)
+            ? float(m_pageSizePt.width() * m_zoom / vp.width()) : float(m_zoom);
+        glUniform2f(m_vecViewportLoc, float(width()), float(height()));
+        glUniform1f(m_vecPxPerPtLoc, pxPerPt);
+
+        glx->glBindVertexArray(m_vecVao);
+        glx->glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, m_vecLayer->widths().size());
+        glx->glBindVertexArray(0);
+
+        if (!m_vecDrawLogged) {
+            m_vecDrawLogged = true;
+            qDebug().noquote() << "[vector] draw OK page=" << m_vecLayer->pageIndex()
+                               << "segs=" << m_vecLayer->widths().size();
+        }
+
+        m_vecProg->release();
+    }
+
+    auto drawTiles = [&](const QVector<TextTile>& tiles, QVector<GLuint>& texs) {
+        if (tiles.isEmpty()) return;
+        const quint32 gen = m_vecLayer->tilesGeneration();
+        if (texs.size() != tiles.size() || m_tileTexGen != gen) {
+            for (GLuint t : texs) if (t) glDeleteTextures(1, &t);
+            texs.fill(0, tiles.size());
+        }
+        const QRectF visPt = QRectF(widgetToPdf(QPointF(0, 0)),
+                                    widgetToPdf(QPointF(width(), height()))).normalized();
+        for (int i = 0; i < tiles.size(); ++i) {
+            const TextTile& tt = tiles[i];
+            if (!visPt.intersects(tt.rectPt)) continue;
+            QRectF drawRect = tt.rectPt;
+            if (m_draggingAnnot && !m_dragNoteRect.isNull() && tt.isNote && m_dragNoteRect.intersects(tt.rectPt)) {
+                drawRect.translate(m_dragNoteOffsetPt);
+            }
+            if (texs[i] == 0) {
+                glGenTextures(1, &texs[i]);
+                glBindTexture(GL_TEXTURE_2D, texs[i]);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                if (tt.isAlpha) {
+                    const QImage& src = tt.img;
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, src.bytesPerLine());
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, src.width(), src.height(), 0,
+                                 GL_RED, GL_UNSIGNED_BYTE, src.constBits());
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                } else {
+                    QImage src = tt.img.convertToFormat(QImage::Format_RGBA8888);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, src.width(), src.height(), 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, src.constBits());
+                }
+                glGenerateMipmap(GL_TEXTURE_2D);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, texs[i]);
+            m_tileProg->setUniformValue(m_tileTexLoc, 0);
+            glUniform1i(m_tileIsAlphaLoc, tt.isAlpha ? 1 : 0);
+            glUniform4f(m_tileColorLoc, qRed(tt.color)/255.0f, qGreen(tt.color)/255.0f,
+                        qBlue(tt.color)/255.0f, 1.0f);
+            glUniform4f(m_tileRectLoc, float(drawRect.x()), float(drawRect.y()),
+                        float(drawRect.width()), float(drawRect.height()));
+            glUniform1f(m_tileDepthLoc, tt.depth);
+            glUniform1f(m_tileProg->uniformLocation("uClipIdx"), tt.clipIdx);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    };
+    if (m_tileProg && m_tileVao) {
+        m_tileProg->bind();
+        glUniformMatrix4fv(m_tileMvpLoc, 1, GL_FALSE, mvp.constData());
+        uploadClips(m_tileProg);
+        glx->glBindVertexArray(m_tileVao);
+        drawTiles(m_vecLayer->imageTiles(), m_tileTexImg);
+        drawTiles(m_vecLayer->textTiles(),  m_tileTexText);
+        m_tileTexGen = m_vecLayer->tilesGeneration();
+        glx->glBindVertexArray(0);
+        m_tileProg->release();
+    }
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+
+    if (prevScissorOn) glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
+    else               glDisable(GL_SCISSOR_TEST);
+
+    if (!blendWasOn) glDisable(GL_BLEND);
 }

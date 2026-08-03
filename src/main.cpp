@@ -4,6 +4,7 @@
 #include <QThread>
 #include <QFontDatabase>
 #include <QFile>
+#include <QFileInfo>
 #include <QTextStream>
 #include <QDateTime>
 #include <QMutex>
@@ -11,11 +12,14 @@
 #include <QLibrary>
 #include <QVector>
 #include <QHash>
+#include <QSet>
+#include <QCryptographicHash>
 #include <QStringList>
 #include <algorithm>
 #include <functional>
 #ifndef TORREADER_NO_PDFIUM
 #include "ui/MainWindow.h"
+#include "ui/ThumbnailPanel.h"
 #include "core/PdfEditor.h"
 #include "core/PdfDocument.h"
 #include "core/PdfRenderer.h"
@@ -29,9 +33,11 @@
 #include "core/TileCacheFile.h"
 #include <fpdfview.h>
 #include <fpdf_edit.h>
+#include <fpdf_save.h>
 #include <fpdf_annot.h>
 #include <fpdf_progressive.h>
 #include <fpdf_text.h>
+#include <fpdf_formfill.h>
 extern QMutex s_pdfiumMutex;
 #endif
 #ifdef _WIN32
@@ -66,6 +72,20 @@ extern QMutex s_pdfiumMutex;
 #include <QInputDialog>
 #include <QTimer>
 #include <QToolBar>
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
+#include <QOpenGLFramebufferObject>
+#include <QOpenGLShaderProgram>
+#include <QOpenGLBuffer>
+#include <QOpenGLExtraFunctions>
+
+static inline void trHashAdd(QCryptographicHash& h, const char* d, qsizetype n) {
+#if QT_VERSION >= QT_VERSION_CHECK(6,3,0)
+    h.addData(QByteArrayView(d, n));
+#else
+    h.addData(d, static_cast<int>(n));
+#endif
+}
 
 static QFile   g_logFile;
 static QMutex  g_logMutex;
@@ -83,6 +103,18 @@ static void logHandler(QtMsgType type, const QMessageLogContext&, const QString&
        << " [" << level << "] " << msg << "\n";
     g_logFile.flush();
 }
+
+#ifndef TORREADER_NO_PDFIUM
+struct TRFileWriter {
+    FPDF_FILEWRITE base;
+    QFile* file;
+    static int WriteBlock(FPDF_FILEWRITE* self, const void* data, unsigned long size) {
+        auto* fw = reinterpret_cast<TRFileWriter*>(self);
+        return fw->file->write(reinterpret_cast<const char*>(data),
+                               static_cast<qint64>(size)) == static_cast<qint64>(size) ? 1 : 0;
+    }
+};
+#endif
 
 int main(int argc, char* argv[]) {
     QByteArray logEnv = qgetenv("TORREADER_LOG");
@@ -1763,7 +1795,7 @@ int main(int argc, char* argv[]) {
         {
             AnnotationManager mgr;
             mgr.setDocument(doc, tempPdf);
-            mgr.moveNote(0, moveIndex, 100.0, 0.0);
+            mgr.moveAnnot(0, moveIndex, 100.0, 0.0);
         }
         {
             AnnotationManager mgr;
@@ -1796,6 +1828,494 @@ int main(int argc, char* argv[]) {
                 << " fontSize=" << fs << " ok=" << (rok ? "1" : "0") << "\n";
         }
         out.flush();
+
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --vnfont-test [temp_dir]
+    // Verifies Vietnamese Unicode text renders correctly through embedded DejaVuSans font.
+    // Creates a blank page internally; no input file needed.
+    if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--vnfont-test")) {
+        QTextStream out(stdout);
+        QString outDir = (argc >= 3) ? QString::fromLocal8Bit(argv[2]) : QStringLiteral(".");
+        PdfDocument::libAddRef();
+
+        constexpr double pageW = 612.0, pageH = 792.0;
+        QString testPath = outDir + QStringLiteral("/vnfont_test.pdf");
+
+        FPDF_DOCUMENT doc = FPDF_CreateNewDocument();
+        if (!doc) { out << "VNFONT: FAIL create doc\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE np = FPDFPage_New(doc, 0, pageW, pageH);
+            if (!np) { out << "VNFONT: FAIL create page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            FPDFPage_GenerateContent(np);
+            FPDF_ClosePage(np);
+        }
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc, testPath);
+
+        QString original = QStringLiteral("Hatch Gạch ệ ữ ẩ ỡ Đ đ ọ");
+        {
+            mgr.createInlineNote(0, QRectF(50, 100, 400, 30), original, "tester", false, QColor(255,0,0), 12.0f);
+        }
+
+        // Save to PDF
+        {
+            QFile f(testPath);
+            if (!f.open(QIODevice::WriteOnly)) {
+                out << "VNFONT: FAIL cannot open output\n"; out.flush();
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            TRFileWriter fw;
+            fw.file = &f;
+            fw.base.version = 1;
+            fw.base.WriteBlock = TRFileWriter::WriteBlock;
+            QMutexLocker lock(&s_pdfiumMutex);
+            if (!FPDF_SaveAsCopy(doc, &fw.base, 0)) {
+                out << "VNFONT: FAIL save\n"; out.flush();
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+        }
+
+        // Re-open and extract text via FPDFText
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_DOCUMENT doc2 = FPDF_LoadDocument(testPath.toUtf8().constData(), nullptr);
+            if (!doc2) {
+                out << "VNFONT: FAIL reopen doc\n"; out.flush();
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            FPDF_PAGE page2 = FPDF_LoadPage(doc2, 0);
+            if (!page2) {
+                out << "VNFONT: FAIL reopen page\n"; out.flush();
+                FPDF_CloseDocument(doc2);
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page2);
+            if (!textPage) {
+                out << "VNFONT: FAIL FPDFText_LoadPage\n"; out.flush();
+                FPDF_ClosePage(page2); FPDF_CloseDocument(doc2);
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            int len = FPDFText_CountChars(textPage);
+            QString extracted;
+            for (int i = 0; i < len; ++i) {
+                unsigned int cp = FPDFText_GetUnicode(textPage, i);
+                extracted += QChar(static_cast<char32_t>(cp));
+            }
+
+            if (extracted == original) {
+                out << "VNFONT: PASS\n";
+            } else {
+                out << "VNFONT: FAIL\n";
+                out << "  expected: \"" << original << "\"\n";
+                out << "  got:      \"" << extracted << "\"\n";
+                int minLen = qMin(original.length(), extracted.length());
+                for (int i = 0; i < minLen; ++i) {
+                    if (original[i] != extracted[i])
+                        out << "  diff at pos " << i << ": expected U+" << QString::number(original[i].unicode(), 16)
+                            << " got U+" << QString::number(extracted[i].unicode(), 16) << "\n";
+                }
+                if (original.length() != extracted.length()) {
+                    for (int i = minLen; i < original.length(); ++i)
+                        out << "  extra expected char at pos " << i << ": U+" << QString::number(original[i].unicode(), 16) << "\n";
+                    for (int i = minLen; i < extracted.length(); ++i)
+                        out << "  extra got char at pos " << i << ": U+" << QString::number(extracted[i].unicode(), 16) << "\n";
+                }
+                FPDFText_ClosePage(textPage);
+                FPDF_ClosePage(page2); FPDF_CloseDocument(doc2);
+                FPDF_CloseDocument(doc); PdfDocument::libRelease();
+                return 1;
+            }
+            FPDFText_ClosePage(textPage);
+            FPDF_ClosePage(page2);
+            FPDF_CloseDocument(doc2);
+        }
+
+        // Assertion 3: NFC normalization — input NFD should produce NFC output
+        {
+            QString decomposed = original.normalized(QString::NormalizationForm_D);
+            if (decomposed == original) {
+                out << "VNFONT: FAIL nfd-setup\n";
+                out.flush();
+                FPDF_CloseDocument(doc);
+                PdfDocument::libRelease();
+                return 1;
+            }
+
+            QString nfcPath = outDir + QStringLiteral("/vnfont_nfc.pdf");
+            FPDF_DOCUMENT nfcDoc = FPDF_CreateNewDocument();
+            if (!nfcDoc) {
+                out << "VNFONT: FAIL nfc create doc\n";
+                out.flush();
+                FPDF_CloseDocument(doc);
+                PdfDocument::libRelease();
+                return 1;
+            }
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE nfcPage = FPDFPage_New(nfcDoc, 0, pageW, pageH);
+                if (!nfcPage) {
+                    out << "VNFONT: FAIL nfc create page\n";
+                    out.flush();
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                FPDFPage_GenerateContent(nfcPage);
+                FPDF_ClosePage(nfcPage);
+            }
+
+            {
+                AnnotationManager nfcMgr;
+                nfcMgr.setDocument(nfcDoc, nfcPath);
+                nfcMgr.createInlineNote(0, QRectF(50, 100, 400, 30), decomposed, "tester", false, QColor(255,0,0), 12.0f);
+            }
+
+            // Save
+            {
+                QFile f(nfcPath);
+                if (!f.open(QIODevice::WriteOnly)) {
+                    out << "VNFONT: FAIL nfc cannot open output\n";
+                    out.flush();
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                TRFileWriter fw;
+                fw.file = &f;
+                fw.base.version = 1;
+                fw.base.WriteBlock = TRFileWriter::WriteBlock;
+                QMutexLocker lock(&s_pdfiumMutex);
+                if (!FPDF_SaveAsCopy(nfcDoc, &fw.base, 0)) {
+                    out << "VNFONT: FAIL nfc save\n";
+                    out.flush();
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+            }
+
+            // Reopen and extract text via FPDFText
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_DOCUMENT nfcDoc2 = FPDF_LoadDocument(nfcPath.toUtf8().constData(), nullptr);
+                if (!nfcDoc2) {
+                    out << "VNFONT: FAIL nfc reopen doc\n";
+                    out.flush();
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                FPDF_PAGE nfcPage2 = FPDF_LoadPage(nfcDoc2, 0);
+                if (!nfcPage2) {
+                    out << "VNFONT: FAIL nfc reopen page\n";
+                    out.flush();
+                    FPDF_CloseDocument(nfcDoc2);
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                FPDF_TEXTPAGE nfcTextPage = FPDFText_LoadPage(nfcPage2);
+                if (!nfcTextPage) {
+                    out << "VNFONT: FAIL nfc FPDFText_LoadPage\n";
+                    out.flush();
+                    FPDF_ClosePage(nfcPage2);
+                    FPDF_CloseDocument(nfcDoc2);
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                int nfcLen = FPDFText_CountChars(nfcTextPage);
+                QString nfcExtracted;
+                for (int i = 0; i < nfcLen; ++i) {
+                    unsigned int cp = FPDFText_GetUnicode(nfcTextPage, i);
+                    nfcExtracted += QChar(static_cast<char32_t>(cp));
+                }
+
+                if (nfcExtracted == original) {
+                    out << "VNFONT: PASS nfc\n";
+                } else {
+                    out << "VNFONT: FAIL nfc\n";
+                    out << "  expected: \"" << original << "\"\n";
+                    out << "  got:      \"" << nfcExtracted << "\"\n";
+                    int minLen = qMin(original.length(), nfcExtracted.length());
+                    for (int i = 0; i < minLen; ++i) {
+                        if (original[i] != nfcExtracted[i])
+                            out << "  diff at pos " << i << ": expected U+" << QString::number(original[i].unicode(), 16)
+                                << " got U+" << QString::number(nfcExtracted[i].unicode(), 16) << "\n";
+                    }
+                    if (original.length() != nfcExtracted.length()) {
+                        for (int i = minLen; i < original.length(); ++i)
+                            out << "  extra expected char at pos " << i << ": U+" << QString::number(original[i].unicode(), 16) << "\n";
+                        for (int i = minLen; i < nfcExtracted.length(); ++i)
+                            out << "  extra got char at pos " << i << ": U+" << QString::number(nfcExtracted[i].unicode(), 16) << "\n";
+                    }
+                    FPDFText_ClosePage(nfcTextPage);
+                    FPDF_ClosePage(nfcPage2);
+                    FPDF_CloseDocument(nfcDoc2);
+                    FPDF_CloseDocument(nfcDoc);
+                    FPDF_CloseDocument(doc);
+                    PdfDocument::libRelease();
+                    return 1;
+                }
+                FPDFText_ClosePage(nfcTextPage);
+                FPDF_ClosePage(nfcPage2);
+                FPDF_CloseDocument(nfcDoc2);
+            }
+
+            FPDF_CloseDocument(nfcDoc);
+        }
+
+        // Assertion 4: edit note preserves page object, orientation, HIDDEN flag, TRID, and text
+        {
+            QString editPath = outDir + QStringLiteral("/vnfont_edit.pdf");
+            FPDF_DOCUMENT editDoc = FPDF_CreateNewDocument();
+            if (!editDoc) {
+                out << "VNFONT: FAIL edit create doc\n"; out.flush();
+                FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE editPage = FPDFPage_New(editDoc, 0, pageW, pageH);
+                if (!editPage) {
+                    out << "VNFONT: FAIL edit create page\n"; out.flush();
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                FPDFPage_SetRotation(editPage, 1);
+                FPDFPage_GenerateContent(editPage);
+                FPDF_ClosePage(editPage);
+            }
+
+            {
+                AnnotationManager editMgr;
+                editMgr.setDocument(editDoc, editPath);
+                editMgr.createInlineNote(0, QRectF(50, 100, 400, 30), QStringLiteral("Trước khi sửa"), "tester", false, QColor(255,0,0), 12.0f);
+            }
+
+            FS_MATRIX beforeMat{};
+            bool foundBefore = false;
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE ep = FPDF_LoadPage(editDoc, 0);
+                if (ep) {
+                    int nObj = FPDFPage_CountObjects(ep);
+                    for (int i = 0; i < nObj && !foundBefore; ++i) {
+                        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(ep, i);
+                        if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT) continue;
+                        int nMarks = FPDFPageObj_CountMarks(obj);
+                        for (int m = 0; m < nMarks; ++m) {
+                            FPDF_PAGEOBJECTMARK mark = FPDFPageObj_GetMark(obj, static_cast<unsigned long>(m));
+                            if (!mark) continue;
+                            unsigned long nameLen = 0;
+                            if (!FPDFPageObjMark_GetName(mark, nullptr, 0, &nameLen)) continue;
+                            std::vector<unsigned short> nameBuf(nameLen / 2 + 1, 0);
+                            if (!FPDFPageObjMark_GetName(mark, reinterpret_cast<FPDF_WCHAR*>(nameBuf.data()), nameLen, &nameLen)) continue;
+                            QString markName = QString::fromUtf16(reinterpret_cast<const char16_t*>(nameBuf.data()));
+                            if (markName == QLatin1String("TRNote")) {
+                                FPDFPageObj_GetMatrix(obj, &beforeMat);
+                                foundBefore = true;
+                                break;
+                            }
+                        }
+                    }
+                    FPDF_ClosePage(ep);
+                }
+            }
+            if (!foundBefore) {
+                out << "VNFONT: FAIL edit no-textobj-before\n"; out.flush();
+                FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+
+            {
+                AnnotationManager editMgr;
+                editMgr.setDocument(editDoc, editPath);
+                if (!editMgr.retextNote(0, 0, QStringLiteral("Sau khi sửa nội dung"))) {
+                    out << "VNFONT: FAIL edit retext-returned-false\n"; out.flush();
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+            }
+
+            // a+b+c+d: check textobj exists, matrix unchanged, HIDDEN, TRID
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE ep2 = FPDF_LoadPage(editDoc, 0);
+                if (!ep2) {
+                    out << "VNFONT: FAIL edit load-page-after\n"; out.flush();
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+
+                bool textObjFound = false;
+                FS_MATRIX afterMat{};
+                int nObj2 = FPDFPage_CountObjects(ep2);
+                for (int i = 0; i < nObj2 && !textObjFound; ++i) {
+                    FPDF_PAGEOBJECT obj = FPDFPage_GetObject(ep2, i);
+                    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT) continue;
+                    int nMarks = FPDFPageObj_CountMarks(obj);
+                    for (int m = 0; m < nMarks; ++m) {
+                        FPDF_PAGEOBJECTMARK mark = FPDFPageObj_GetMark(obj, static_cast<unsigned long>(m));
+                        if (!mark) continue;
+                        unsigned long nameLen = 0;
+                        if (!FPDFPageObjMark_GetName(mark, nullptr, 0, &nameLen)) continue;
+                        std::vector<unsigned short> nameBuf(nameLen / 2 + 1, 0);
+                        if (!FPDFPageObjMark_GetName(mark, reinterpret_cast<FPDF_WCHAR*>(nameBuf.data()), nameLen, &nameLen)) continue;
+                        QString markName = QString::fromUtf16(reinterpret_cast<const char16_t*>(nameBuf.data()));
+                        if (markName == QLatin1String("TRNote")) {
+                            FPDFPageObj_GetMatrix(obj, &afterMat);
+                            textObjFound = true;
+                            break;
+                        }
+                    }
+                }
+                if (!textObjFound) {
+                    out << "VNFONT: FAIL edit textobj-gone\n"; out.flush();
+                    FPDF_ClosePage(ep2); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+
+                if (qAbs(beforeMat.a - afterMat.a) > 1e-4f || qAbs(beforeMat.b - afterMat.b) > 1e-4f ||
+                    qAbs(beforeMat.c - afterMat.c) > 1e-4f || qAbs(beforeMat.d - afterMat.d) > 1e-4f) {
+                    out << "VNFONT: FAIL edit matrix-changed\n";
+                    out << "  before: a=" << beforeMat.a << " b=" << beforeMat.b << " c=" << beforeMat.c << " d=" << beforeMat.d << "\n";
+                    out << "  after:  a=" << afterMat.a << " b=" << afterMat.b << " c=" << afterMat.c << " d=" << afterMat.d << "\n";
+                    out.flush();
+                    FPDF_ClosePage(ep2); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+
+                FPDF_ANNOTATION annot = FPDFPage_GetAnnot(ep2, 0);
+                if (!annot) {
+                    out << "VNFONT: FAIL edit no-annot\n"; out.flush();
+                    FPDF_ClosePage(ep2); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                int flags = FPDFAnnot_GetFlags(annot);
+                if (!(flags & FPDF_ANNOT_FLAG_HIDDEN)) {
+                    out << "VNFONT: FAIL edit not-hidden\n"; out.flush();
+                    FPDFPage_CloseAnnot(annot); FPDF_ClosePage(ep2); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                if (!FPDFAnnot_HasKey(annot, "TRID")) {
+                    out << "VNFONT: FAIL edit trid-lost\n"; out.flush();
+                    FPDFPage_CloseAnnot(annot); FPDF_ClosePage(ep2); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                FPDFPage_CloseAnnot(annot);
+                FPDF_ClosePage(ep2);
+            }
+
+            // Save, reopen, extract text, compare
+            {
+                QFile f(editPath);
+                if (!f.open(QIODevice::WriteOnly)) {
+                    out << "VNFONT: FAIL edit cannot open output\n"; out.flush();
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                TRFileWriter fw;
+                fw.file = &f;
+                fw.base.version = 1;
+                fw.base.WriteBlock = TRFileWriter::WriteBlock;
+                {
+                    QMutexLocker lock(&s_pdfiumMutex);
+                    if (!FPDF_SaveAsCopy(editDoc, &fw.base, 0)) {
+                        out << "VNFONT: FAIL edit save\n"; out.flush();
+                        FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                    }
+                }
+            }
+
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_DOCUMENT reopenDoc = FPDF_LoadDocument(editPath.toUtf8().constData(), nullptr);
+                if (!reopenDoc) {
+                    out << "VNFONT: FAIL edit reopen doc\n"; out.flush();
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                FPDF_PAGE reopenPage = FPDF_LoadPage(reopenDoc, 0);
+                if (!reopenPage) {
+                    out << "VNFONT: FAIL edit reopen page\n"; out.flush();
+                    FPDF_CloseDocument(reopenDoc); FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                FPDF_TEXTPAGE textPage = FPDFText_LoadPage(reopenPage);
+                if (!textPage) {
+                    out << "VNFONT: FAIL edit FPDFText_LoadPage\n"; out.flush();
+                    FPDF_ClosePage(reopenPage); FPDF_CloseDocument(reopenDoc);
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                int len = FPDFText_CountChars(textPage);
+                QString extracted;
+                for (int i = 0; i < len; ++i) {
+                    unsigned int cp = FPDFText_GetUnicode(textPage, i);
+                    extracted += QChar(static_cast<char32_t>(cp));
+                }
+                QString editExpected = QStringLiteral("Sau khi sửa nội dung");
+                if (extracted == editExpected) {
+                    out << "VNFONT: PASS edit\n";
+                } else {
+                    out << "VNFONT: FAIL edit text\n";
+                    out << "  expected: \"" << editExpected << "\"\n";
+                    out << "  got:      \"" << extracted << "\"\n";
+                    int minLen = qMin(editExpected.length(), extracted.length());
+                    for (int i = 0; i < minLen; ++i) {
+                        if (editExpected[i] != extracted[i])
+                            out << "  diff at pos " << i << ": expected U+" << QString::number(editExpected[i].unicode(), 16)
+                                << " got U+" << QString::number(extracted[i].unicode(), 16) << "\n";
+                    }
+                    if (editExpected.length() != extracted.length()) {
+                        for (int i = minLen; i < editExpected.length(); ++i)
+                            out << "  extra expected char at pos " << i << ": U+" << QString::number(editExpected[i].unicode(), 16) << "\n";
+                        for (int i = minLen; i < extracted.length(); ++i)
+                            out << "  extra got char at pos " << i << ": U+" << QString::number(extracted[i].unicode(), 16) << "\n";
+                    }
+                    FPDFText_ClosePage(textPage);
+                    FPDF_ClosePage(reopenPage); FPDF_CloseDocument(reopenDoc);
+                    FPDF_CloseDocument(editDoc); FPDF_CloseDocument(doc); PdfDocument::libRelease();
+                    return 1;
+                }
+                FPDFText_ClosePage(textPage);
+                FPDF_ClosePage(reopenPage);
+                FPDF_CloseDocument(reopenDoc);
+            }
+
+            FPDF_CloseDocument(editDoc);
+        }
+
+        // Bloat check: add 5 more notes, save, verify < 700 KB
+        {
+            for (int i = 0; i < 5; ++i) {
+                mgr.createInlineNote(0, QRectF(50 + i * 10, 150 + i * 30, 400, 30), original, "tester", false, QColor(255,0,0), 12.0f);
+            }
+            QString bloatPath = outDir + QStringLiteral("/vnfont_bloat.pdf");
+            {
+                QFile f(bloatPath);
+                if (!f.open(QIODevice::WriteOnly)) {
+                    out << "VNFONT: FAIL cannot open bloat output\n"; out.flush();
+                    FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+                TRFileWriter fw;
+                fw.file = &f;
+                fw.base.version = 1;
+                fw.base.WriteBlock = TRFileWriter::WriteBlock;
+                QMutexLocker lock(&s_pdfiumMutex);
+                if (!FPDF_SaveAsCopy(doc, &fw.base, 0)) {
+                    out << "VNFONT: FAIL bloat save\n"; out.flush();
+                    FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+                }
+            }
+            qint64 bloatSize = QFileInfo(bloatPath).size();
+            if (bloatSize >= 700 * 1024) {
+                out << "VNFONT: FAIL bloat=" << bloatSize << "\n";
+                out.flush();
+                FPDF_CloseDocument(doc); PdfDocument::libRelease();
+                return 1;
+            }
+            out << "VNFONT: PASS bloat=" << bloatSize << "\n";
+        }
 
         FPDF_CloseDocument(doc);
         PdfDocument::libRelease();
@@ -2106,7 +2626,661 @@ int main(int argc, char* argv[]) {
         PdfDocument::libRelease();
         return 0;
     }
+
+    // usage: --movebench <input.pdf> [pageIndex]
+    // Headless benchmark: measure GenerateContent, create note, move note, render times
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--movebench")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 0;
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        if (!doc) {
+            out << "MOVEBENCH: FAIL cannot open " << inputPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc);
+        if (pageIndex < 0 || pageIndex >= pageCount) {
+            out << "MOVEBENCH: FAIL pageIndex " << pageIndex << " out of range (pages=" << pageCount << ")\n"; out.flush();
+            FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+
+        // Page info
+        double pageW = 0, pageH = 0;
+        int pageRot = 0, pageObjCount = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) {
+                pageW = FPDF_GetPageWidth(p);
+                pageH = FPDF_GetPageHeight(p);
+                pageRot = FPDFPage_GetRotation(p);
+                pageObjCount = FPDFPage_CountObjects(p);
+                FPDF_ClosePage(p);
+            }
+        }
+        out << "MOVEBENCH page=" << pageIndex << " size=" << pageW << "x" << pageH
+            << " rot=" << pageRot << " objects=" << pageObjCount << "\n"; out.flush();
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc, inputPath);
+
+        // Step A: single GenerateContent, 3 times
+        qint64 genTimes[3];
+        qint64 genTotal = 0;
+        for (int i = 0; i < 3; ++i) {
+            QElapsedTimer t; t.start();
+            mgr.generateContentForPage(pageIndex);
+            genTimes[i] = t.elapsed();
+            genTotal += genTimes[i];
+        }
+        qint64 genAvg = genTotal / 3;
+        out << "MOVEBENCH gen_content_ms: " << genTimes[0] << " " << genTimes[1] << " " << genTimes[2]
+            << " avg=" << genAvg << "\n"; out.flush();
+
+        // Step B: create inline note
+        QElapsedTimer t; t.start();
+        mgr.createInlineNote(pageIndex, QRectF(50, 100, 300, 30),
+            QStringLiteral("Move bench"), QStringLiteral("bench"),
+            false, QColor(255, 0, 0), 12.0f);
+        qint64 createMs = t.elapsed();
+        out << "MOVEBENCH create_note_ms: " << createMs << "\n"; out.flush();
+
+        // Step C: move note, 5 times
+        int annotCount = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) { annotCount = FPDFPage_GetAnnotCount(p); FPDF_ClosePage(p); }
+        }
+        int idx = annotCount - 1;
+        qint64 moveTimes[5];
+        qint64 moveTotal = 0;
+        for (int i = 0; i < 5; ++i) {
+            QElapsedTimer t2; t2.start();
+            mgr.moveAnnot(pageIndex, idx, 20.0, 15.0);
+            moveTimes[i] = t2.elapsed();
+            moveTotal += moveTimes[i];
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+                if (p) { annotCount = FPDFPage_GetAnnotCount(p); FPDF_ClosePage(p); }
+            }
+            idx = annotCount - 1;
+        }
+        qint64 moveAvg = moveTotal / 5;
+        out << "MOVEBENCH move_note_ms: " << moveTimes[0] << " " << moveTimes[1] << " " << moveTimes[2]
+            << " " << moveTimes[3] << " " << moveTimes[4] << " avg=" << moveAvg << "\n"; out.flush();
+
+        // Step D: render page at 1.5x, 2 times
+        qint64 renderTimes[2];
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) {
+                int w = qMax(1, static_cast<int>(pageW * 1.5));
+                int h = qMax(1, static_cast<int>(pageH * 1.5));
+                for (int i = 0; i < 2; ++i) {
+                    QImage image(w, h, QImage::Format_ARGB32);
+                    image.fill(Qt::white);
+                    FPDF_BITMAP bmp = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRA,
+                                                          image.bits(), image.bytesPerLine());
+                    QElapsedTimer t3; t3.start();
+                    FPDF_RenderPageBitmap(bmp, p, 0, 0, w, h, 0, FPDF_ANNOT);
+                    renderTimes[i] = t3.elapsed();
+                    FPDFBitmap_Destroy(bmp);
+                }
+                FPDF_ClosePage(p);
+            } else {
+                renderTimes[0] = renderTimes[1] = -1;
+            }
+        }
+        out << "MOVEBENCH render_page_ms: " << renderTimes[0] << " " << renderTimes[1] << "\n"; out.flush();
+
+        double genShare = (moveAvg > 0) ? (4.0 * genAvg / moveAvg * 100.0) : 0.0;
+        out << "MOVEBENCH SUMMARY objects=" << pageObjCount
+            << " gen_content_avg=" << genAvg
+            << " move_avg=" << moveAvg
+            << " render=" << renderTimes[0]
+            << " gen_share=" << QString::number(genShare, 'f', 1) << "%\n"; out.flush();
+
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --savebench <input.pdf>
+    // Headless save benchmark: measure each step of the save pipeline.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--savebench")) {
+        QTextStream out(stdout);
+        PdfDocument::libAddRef();
+
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QFileInfo fi(inputPath);
+        if (!fi.exists()) {
+            out << "SAVEBENCH: FAIL cannot open " << inputPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        QString workPath = inputPath + QStringLiteral(".savebench.pdf");
+        QFile::remove(workPath);
+        if (!QFile::copy(inputPath, workPath)) {
+            out << "SAVEBENCH: FAIL cannot copy to " << workPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+
+        PdfDocument doc;
+        if (!doc.open(workPath)) {
+            out << "SAVEBENCH: FAIL open document\n"; out.flush();
+            QFile::remove(workPath); PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = doc.pageCount();
+        qint64 fileSize = QFileInfo(workPath).size();
+        out << "SAVEBENCH pages=" << pageCount << " size=" << fileSize << "\n"; out.flush();
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc.raw(), workPath);
+
+        int nNotes = qMin(5, pageCount);
+        QSet<int> dirtyPages;
+        for (int i = 0; i < nNotes; ++i) {
+            mgr.createInlineNote(i, QRectF(50, 100 + i * 30, 300, 30),
+                QStringLiteral("Save bench note %1").arg(i + 1),
+                QStringLiteral("bench"), false, QColor(255, 0, 0), 12.0f);
+            dirtyPages.insert(i);
+        }
+
+        qint64 A = 0, B = 0, C = 0, D1 = 0, D2 = 0, D3 = 0;
+
+        {
+            QElapsedTimer t; t.start();
+            for (int pg : dirtyPages)
+                mgr.generateContentForPage(pg);
+            A = t.elapsed();
+            out << "SAVEBENCH gen_content_ms: " << A << " (pages=" << dirtyPages.size() << ")\n"; out.flush();
+        }
+
+        QString tmpPath = workPath + QStringLiteral(".savebench_tmp.pdf");
+        {
+            mgr.setDocument(doc.raw(), tmpPath);
+            QElapsedTimer t; t.start();
+            mgr.saveDocument();
+            B = t.elapsed();
+            qint64 tmpSize = QFileInfo(tmpPath).size();
+            out << "SAVEBENCH save_document_ms: " << B << " tmp_size=" << tmpSize << "\n"; out.flush();
+        }
+
+        doc.close();
+        {
+            extern bool replaceFileAtomically(const QString& srcTmp, const QString& dest, QString* errOut);
+            QString err;
+            QElapsedTimer t; t.start();
+            if (!replaceFileAtomically(tmpPath, workPath, &err)) {
+                C = t.elapsed();
+                out << "SAVEBENCH: FAIL replaceFileAtomically: " << err << "\n"; out.flush();
+                QFile::remove(tmpPath); QFile::remove(workPath); PdfDocument::libRelease(); return 1;
+            }
+            C = t.elapsed();
+            out << "SAVEBENCH replace_file_ms: " << C << "\n"; out.flush();
+        }
+
+        {
+            QElapsedTimer t; t.start();
+            TileCacheFile::hashFile(workPath);
+            D1 = t.elapsed();
+            out << "SAVEBENCH hash_file_ms: " << D1 << "\n"; out.flush();
+        }
+        {
+            PdfDocument d2;
+            QElapsedTimer t; t.start();
+            if (!d2.open(workPath)) {
+                out << "SAVEBENCH: FAIL reopen document\n"; out.flush();
+                QFile::remove(workPath); PdfDocument::libRelease(); return 1;
+            }
+            D2 = t.elapsed();
+            out << "SAVEBENCH reopen_doc_ms: " << D2 << "\n"; out.flush();
+        }
+        {
+            ThumbnailRenderPool pool;
+            QElapsedTimer t; t.start();
+            if (!pool.open(workPath)) {
+                out << "SAVEBENCH: FAIL ThumbnailRenderPool open\n"; out.flush();
+                QFile::remove(workPath); PdfDocument::libRelease(); return 1;
+            }
+            pool.close();
+            D3 = t.elapsed();
+            out << "SAVEBENCH thumbpool_open_ms: " << D3 << "\n"; out.flush();
+        }
+
+        qint64 total = A + B + C + D1 + D2 + D3;
+        out << "SAVEBENCH TOTAL_ms: " << total
+            << "  (gen=" << A << " save=" << B << " replace=" << C
+            << " hash=" << D1 << " reopen=" << D2 << " thumbpool=" << D3 << ")\n"; out.flush();
+
+        QFile::remove(workPath);
+        QFile::remove(tmpPath);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --dedup-test <input.pdf>
+    // Chung minh dedupStreams KHONG doi noi dung hien thi cua bat ky trang nao.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dedup-test")) {
+        QTextStream out(stdout);
+        const QString inPath = QString::fromLocal8Bit(argv[2]);
+        PdfDocument::libAddRef();
+
+        auto hashPages = [](const QString& p, QList<QByteArray>& outHashes, QString& err) -> bool {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_DOCUMENT d = FPDF_LoadDocument(p.toUtf8().constData(), nullptr);
+            if (!d) { err = "cannot open " + p; return false; }
+            const int n = FPDF_GetPageCount(d);
+            for (int i = 0; i < n; ++i) {
+                FPDF_PAGE pg = FPDF_LoadPage(d, i);
+                if (!pg) { FPDF_CloseDocument(d); err = QString("cannot load page %1").arg(i); return false; }
+                const int w = qMax(1, qRound(FPDF_GetPageWidth(pg)));
+                const int h = qMax(1, qRound(FPDF_GetPageHeight(pg)));
+                FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 1);
+                FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
+                FPDF_RenderPageBitmap(bmp, pg, 0, 0, w, h, 0, FPDF_ANNOT);
+                const int stride = FPDFBitmap_GetStride(bmp);
+                QCryptographicHash hh(QCryptographicHash::Sha256);
+                trHashAdd(hh, static_cast<const char*>(FPDFBitmap_GetBuffer(bmp)),
+                          static_cast<qsizetype>(stride) * h);
+                outHashes.append(hh.result());
+                FPDFBitmap_Destroy(bmp);
+                FPDF_ClosePage(pg);
+            }
+            FPDF_CloseDocument(d);
+            return true;
+        };
+
+        QList<QByteArray> before, after;
+        QString err;
+        if (!hashPages(inPath, before, err)) {
+            out << "DEDUP: FAIL " << err << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        const qint64 sizeBefore = QFileInfo(inPath).size();
+
+        const QString workPath = inPath + ".dedup.pdf";
+        QFile::remove(workPath);
+        if (!QFile::copy(inPath, workPath)) {
+            out << "DEDUP: FAIL cannot copy to " << workPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+
+        PdfEditor editor;
+        if (!editor.dedupStreams(workPath)) {
+            out << "DEDUP: FAIL dedupStreams returned false: " << editor.lastError() << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        const qint64 sizeAfter = QFileInfo(workPath).size();
+
+        if (!hashPages(workPath, after, err)) {
+            out << "DEDUP: FAIL " << err << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+
+        if (before.size() != after.size()) {
+            out << "DEDUP: FAIL pagecount " << before.size() << " vs " << after.size() << "\n";
+            out.flush(); PdfDocument::libRelease(); return 1;
+        }
+        for (int i = 0; i < before.size(); ++i) {
+            if (before[i] != after[i]) {
+                out << "DEDUP: FAIL page " << i << " render-differs\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+        }
+
+        const double pct = sizeBefore > 0 ? (100.0 * (sizeBefore - sizeAfter) / sizeBefore) : 0.0;
+        out << "DEDUP: PASS pages=" << before.size()
+            << " before=" << sizeBefore << " after=" << sizeAfter
+            << " saved=" << QString::number(pct, 'f', 1) << "%\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --rendernote-test <input.pdf> <pageIndex>
+    // Headless diagnosis: verify that a newly added inline note (FreeText)
+    // actually changes the rendered bitmap.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--rendernote-test")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+
+        FPDF_DOCUMENT doc = nullptr;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            doc = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        }
+        if (!doc) {
+            out << "RENDERNOTE: FAIL cannot open " << inputPath << "\n";
+            out.flush(); PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc);
+        if (pageIndex < 0 || pageIndex >= pageCount) {
+            out << "RENDERNOTE: FAIL pageIndex " << pageIndex << " out of range (pages=" << pageCount << ")\n";
+            out.flush();
+            { QMutexLocker lock(&s_pdfiumMutex); FPDF_CloseDocument(doc); }
+            PdfDocument::libRelease(); return 1;
+        }
+
+        double pageW = 0, pageH = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE tp = FPDF_LoadPage(doc, pageIndex);
+            if (tp) { pageW = FPDF_GetPageWidth(tp); pageH = FPDF_GetPageHeight(tp); FPDF_ClosePage(tp); }
+        }
+        int imgW = qMax(1, (int)pageW);
+        int imgH = qMax(1, (int)pageH);
+        out << "RENDERNOTE: page=" << pageIndex << " size=" << pageW << "x" << pageH
+            << " bitmap=" << imgW << "x" << imgH << "\n";
+        out.flush();
+
+        auto renderAndHash = [&]() -> QByteArray {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (!p) return {};
+            QImage image(imgW, imgH, QImage::Format_ARGB32);
+            image.fill(Qt::white);
+            FPDF_BITMAP bmp = FPDFBitmap_CreateEx(imgW, imgH, FPDFBitmap_BGRA,
+                                                  image.bits(), image.bytesPerLine());
+            FPDF_RenderPageBitmap(bmp, p, 0, 0, imgW, imgH, 0, FPDF_ANNOT);
+            FPDFBitmap_Destroy(bmp);
+            FPDF_ClosePage(p);
+            QCryptographicHash hh(QCryptographicHash::Sha256);
+            trHashAdd(hh, (const char*)image.bits(), (qsizetype)image.bytesPerLine() * imgH);
+            return hh.result();
+        };
+
+        QByteArray hashTruoc = renderAndHash();
+        if (hashTruoc.isEmpty()) {
+            out << "RENDERNOTE: FAIL render before\n"; out.flush();
+            { QMutexLocker lock(&s_pdfiumMutex); FPDF_CloseDocument(doc); }
+            PdfDocument::libRelease(); return 1;
+        }
+
+        int objBefore = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) { objBefore = FPDFPage_CountObjects(p); FPDF_ClosePage(p); }
+        }
+
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc, inputPath);
+            bool ok = mgr.createInlineNote(pageIndex, QRectF(50,100,300,30),
+                                           QStringLiteral("RENDERTEST"), QStringLiteral("t"),
+                                           false, QColor(255,0,0), 24.0f);
+            out << "RENDERNOTE: createInlineNote returned=" << (ok ? "true" : "false") << "\n";
+            out.flush();
+        }
+
+        int objAfter = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) { objAfter = FPDFPage_CountObjects(p); FPDF_ClosePage(p); }
+        }
+
+        QByteArray hashSau = renderAndHash();
+        if (hashSau.isEmpty()) {
+            out << "RENDERNOTE: FAIL render after\n"; out.flush();
+            { QMutexLocker lock(&s_pdfiumMutex); FPDF_CloseDocument(doc); }
+            PdfDocument::libRelease(); return 1;
+        }
+
+        bool match = (hashTruoc == hashSau);
+        out << "RENDERNOTE: hashTruoc=" << hashTruoc.toHex() << "\n";
+        out << "RENDERNOTE: hashSau=" << hashSau.toHex()
+            << " diff=" << (match ? "false" : "true") << "\n";
+        out << "RENDERNOTE: objCount before=" << objBefore << " after=" << objAfter << "\n";
+        out.flush();
+
+        if (match) {
+            out << "RENDERNOTE: FAIL trang KHONG doi sau khi them note (chu khong vao noi dung trang)\n";
+            out << "RENDERNOTE: DIAG — goi GenerateContent thu cong...\n";
+            {
+                AnnotationManager mgr;
+                mgr.setDocument(doc, inputPath);
+                mgr.generateContentForPage(pageIndex);
+            }
+            QByteArray hashGen = renderAndHash();
+            if (!hashGen.isEmpty()) {
+                bool genMatch = (hashTruoc == hashGen);
+                out << "RENDERNOTE: DIAG hash sau GenerateContent=" << hashGen.toHex()
+                    << " diff=" << (genMatch ? "false" : "true") << "\n";
+                out.flush();
+            }
+            { QMutexLocker lock(&s_pdfiumMutex); FPDF_CloseDocument(doc); }
+            PdfDocument::libRelease();
+            return 1;
+        }
+
+        out << "RENDERNOTE: PASS chu da xuat hien tren trang\n";
+        out.flush();
+        { QMutexLocker lock(&s_pdfiumMutex); FPDF_CloseDocument(doc); }
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --annotvis-test <pdf> <pageIndex>
+    // Trang co FreeText HIEN thi overlayCapable phai = 1 (foreign layer handles them)
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotvis-test")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+
+        PdfDocument doc;
+        if (!doc.open(inputPath)) {
+            out << "ANNOTVIS: FAIL cannot open " << inputPath << "\n";
+            out.flush(); PdfDocument::libRelease(); return 1;
+        }
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc.raw(), inputPath);
+        bool capable = true;
+        mgr.loadPageVisuals(pageIndex, &capable);
+
+        int k = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE page = FPDF_LoadPage(doc.raw(), pageIndex);
+            if (!page) {
+                out << "ANNOTVIS: FAIL cannot load page " << pageIndex << "\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+            int n = FPDFPage_GetAnnotCount(page);
+            for (int i = 0; i < n; ++i) {
+                FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
+                if (!annot) continue;
+                int flags = FPDFAnnot_GetFlags(annot);
+                if (flags & FPDF_ANNOT_FLAG_HIDDEN) { FPDFPage_CloseAnnot(annot); continue; }
+                int subtype = FPDFAnnot_GetSubtype(annot);
+                if (subtype == FPDF_ANNOT_FREETEXT || subtype == FPDF_ANNOT_TEXT)
+                    ++k;
+                FPDFPage_CloseAnnot(annot);
+            }
+            FPDF_ClosePage(page);
+        }
+
+        out << "ANNOTVIS page=" << pageIndex << " freetext_hien=" << k << " capable=" << (capable ? 1 : 0) << "\n";
+        out.flush();
+
+        if (k >= 1 && !capable) {
+            out << "ANNOTVIS: FAIL co " << k << " FreeText hien ma capable=0 (foreign layer dang le xu ly)\n";
+            out.flush(); PdfDocument::libRelease(); return 1;
+        }
+        if (k >= 1)
+            out << "ANNOTVIS: NOTE foreign layer handles " << k << " visible non-TorReader annotations\n";
+
+        if (k >= 1) {
+            double pageW = 0, pageH = 0;
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE p = FPDF_LoadPage(doc.raw(), pageIndex);
+                if (p) { pageW = FPDF_GetPageWidth(p); pageH = FPDF_GetPageHeight(p); FPDF_ClosePage(p); }
+            }
+            int w = qMax(1, (int)pageW);
+            int h = qMax(1, (int)pageH);
+
+            auto renderAndHash = [&](int flags) -> QByteArray {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE p = FPDF_LoadPage(doc.raw(), pageIndex);
+                if (!p) return {};
+                QImage image(w, h, QImage::Format_ARGB32);
+                image.fill(Qt::white);
+                FPDF_BITMAP bmp = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRA,
+                                                      image.bits(), image.bytesPerLine());
+                FPDF_RenderPageBitmap(bmp, p, 0, 0, w, h, 0, flags);
+                FPDFBitmap_Destroy(bmp);
+                FPDF_ClosePage(p);
+                QCryptographicHash hh(QCryptographicHash::Sha256);
+                trHashAdd(hh, (const char*)image.bits(), (qsizetype)image.bytesPerLine() * h);
+                return hh.result();
+            };
+
+            QElapsedTimer t0; t0.start();
+            QByteArray h0 = renderAndHash(0);
+            qint64 ms0 = t0.elapsed();
+            QElapsedTimer t1; t1.start();
+            QByteArray h1 = renderAndHash(FPDF_ANNOT);
+            qint64 ms1 = t1.elapsed();
+            if (h0.isEmpty() || h1.isEmpty()) {
+                out << "ANNOTVIS: FAIL render failed\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+            if (h0 == h1) {
+                out << "ANNOTVIS: FAIL render giong nhau, annotation khong co noi dung hien thi\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+
+            out << "ANNOTVIS render_ms: khong_annot=" << ms0 << " co_annot=" << ms1 << " chenh=" << (ms1 - ms0) << "\n";
+            out.flush();
+        }
+
+        out << "ANNOTVIS: PASS\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
 #endif
+
+    // usage: --foreignlayer-test <pdf> <pageIndex> <out.png>
+    // Headless: verify buildForeignAnnotLayer — foreign anootation layer extraction
+    // and TRUID flag restore.
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--foreignlayer-test")) {
+        QTextStream out(stdout);
+        QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        QString outPng = QString::fromLocal8Bit(argv[4]);
+
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(pdfPath.toUtf8().constData(), nullptr);
+        if (!doc) {
+            out << "FOREIGNLAYER: FAIL cannot open " << pdfPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+
+        int pageCount = FPDF_GetPageCount(doc);
+        if (pageIndex < 0 || pageIndex >= pageCount) {
+            out << "FOREIGNLAYER: FAIL pageIndex " << pageIndex << " out of range (pages=" << pageCount << ")\n";
+            out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+
+        double pageW = 0, pageH = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) { pageW = FPDF_GetPageWidth(p); pageH = FPDF_GetPageHeight(p); FPDF_ClosePage(p); }
+        }
+
+        int wPx = 1200;
+        int hPx = qMax(1, static_cast<int>(1200.0 * pageH / qMax(1.0, pageW)));
+
+        // Dem so annot truoc khi goi ham (check truoc khi goi)
+        int k = 0;
+        int truidHiddenBefore = 0;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+            if (p) {
+                int n = FPDFPage_GetAnnotCount(p);
+                for (int i = 0; i < n; ++i) {
+                    FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, i);
+                    if (!a) continue;
+                    int flags = FPDFAnnot_GetFlags(a);
+                    bool hidden = (flags & FPDF_ANNOT_FLAG_HIDDEN) != 0;
+                    bool isForeign = !hidden && FPDFAnnot_HasKey(a, "TRUID") == 0;
+                    if (isForeign) ++k;
+                    if (FPDFAnnot_HasKey(a, "TRUID") && hidden) ++truidHiddenBefore;
+                    FPDFPage_CloseAnnot(a);
+                }
+                FPDF_ClosePage(p);
+            }
+        }
+        out << "FOREIGNLAYER: page=" << pageIndex << " foreign annots=" << k
+            << " truid-hidden-before=" << truidHiddenBefore << "\n"; out.flush();
+
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc, pdfPath);
+            QImage layer = mgr.buildForeignAnnotLayer(pageIndex, wPx, hPx);
+
+            // Khang dinh 1:
+            if (k >= 1 && layer.isNull()) {
+                out << "FOREIGNLAYER: FAIL co " << k << " annot ngoai ma lop rong\n";
+                out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+            if (k == 0 && !layer.isNull()) {
+                out << "FOREIGNLAYER: FAIL khong co annot ngoai ma lop khong rong\n";
+                out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+
+            // Khang dinh 2: co Hidden da duoc tra lai
+            int truidHiddenAfter = 0;
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE p = FPDF_LoadPage(doc, pageIndex);
+                if (p) {
+                    int n = FPDFPage_GetAnnotCount(p);
+                    for (int i = 0; i < n; ++i) {
+                        FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, i);
+                        if (!a) continue;
+                        int flags = FPDFAnnot_GetFlags(a);
+                        if (FPDFAnnot_HasKey(a, "TRUID") && (flags & FPDF_ANNOT_FLAG_HIDDEN))
+                            ++truidHiddenAfter;
+                        FPDFPage_CloseAnnot(a);
+                    }
+                    FPDF_ClosePage(p);
+                }
+            }
+            if (truidHiddenBefore != truidHiddenAfter) {
+                out << "FOREIGNLAYER: FAIL co Hidden khong duoc tra lai (truoc="
+                    << truidHiddenBefore << " sau=" << truidHiddenAfter << ")\n";
+                out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+            }
+
+            if (!layer.isNull())
+                layer.save(outPng);
+
+            out << "FOREIGNLAYER: PASS page=" << pageIndex << " annot_ngoai=" << k
+                << " layer=" << layer.width() << "x" << layer.height() << "\n";
+            out.flush();
+        }
+
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        return 0;
+    }
 
     // ── Render probe (headless measurement: resolution-bound vs content-bound) ──
     // usage: TorReader.exe --render-probe <pdf_path> <page_number_1based>
@@ -2480,15 +3654,9 @@ int main(int argc, char* argv[]) {
                     if (!FPDFPageObj_GetStrokeWidth(obj, &s.sw)) s.sw = 0;
                     int dc = FPDFPageObj_GetDashCount(obj);
                     if (dc > 0) { s.dash.resize(dc); FPDFPageObj_GetDashArray(obj, s.dash.data(), dc); }
-#ifdef _WIN32
-                    FPDF_BOOL strokeFlag = FALSE;
-                    if (!FPDFPath_GetDrawMode(obj, &s.fillMode, &strokeFlag)) { s.fillMode = 0; strokeFlag = FALSE; }
-                    s.hasStroke = (strokeFlag != FALSE);
-#else
                     FPDF_BOOL strokeFlag = 0;
                     if (!FPDFPath_GetDrawMode(obj, &s.fillMode, &strokeFlag)) { s.fillMode = 0; strokeFlag = 0; }
                     s.hasStroke = (strokeFlag != 0);
-#endif
                     if (s.fillOk && s.hasStroke) ++nBoth;
                     else if (s.fillOk) ++nFillOnly;
                     else if (s.hasStroke) ++nStrokeOnly;
@@ -2666,6 +3834,1323 @@ int main(int argc, char* argv[]) {
 
             { QMutexLocker lock(&s_pdfiumMutex); FPDF_ClosePage(page); }
         }
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // ── VectorGL Phase 1: extract PDF paths → OpenGL offscreen → PNG ────────
+    // usage: --vectorgl <pdf_path> <page_1based> <out.png> [width_px]
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--vectorgl")) {
+        QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        int pageNum = QString::fromLocal8Bit(argv[3]).toInt();
+        QString outPng = QString::fromLocal8Bit(argv[4]);
+        int targetW = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 2000;
+        if (pageNum < 1 || targetW < 10) {
+            fprintf(stderr, "VECTORGL_FAIL invalid args (page>=1, width>=10)\n");
+            return 1;
+        }
+
+        QTextStream out(stdout);
+        QElapsedTimer tTotal;
+        tTotal.start();
+
+        // ── 1. Load page ──
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(pdfPath)) {
+            out << "VECTORGL_FAIL cannot open " << pdfPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        FPDF_PAGE page = nullptr;
+        qint64 loadPageMs = 0;
+        {
+            QElapsedTimer t;
+            t.start();
+            QMutexLocker lock(&s_pdfiumMutex);
+            page = FPDF_LoadPage(doc.raw(), pageNum - 1);
+            loadPageMs = t.elapsed();
+        }
+        if (!page) {
+            out << "VECTORGL_FAIL cannot load page " << pageNum << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        double pageW = FPDF_GetPageWidth(page);
+        double pageH = FPDF_GetPageHeight(page);
+        int wPx = targetW;
+        int hPx = qMax(1, static_cast<int>(pageH / pageW * wPx));
+        out << "LoadPage      : " << loadPageMs << " ms  (page " << pageNum
+            << " size=" << QString::number(pageW,'f',1) << "x" << QString::number(pageH,'f',1)
+            << " px=" << wPx << "x" << hPx << ")\n";
+
+        // ── 2. Extract path geometry + §2.1 statistics ──
+        struct Vtx { float x, y; uint8_t r, g, b, a; };
+        QVector<Vtx> vertices;
+        int pathCount = 0, segCount = 0, lineSegCount = 0;
+        int subpathCount = 0, outOfRangeCount = 0;
+
+        // §2.1 statistics
+        int fillCount = 0, strokeCount = 0, bothCount = 0;
+        QSet<quint32> uniqueStrokeColors, uniqueFillColors;
+        QVector<float> allStrokeWidths;
+
+        // §2.3 width-binned VBOs: 5 bins → ≤0.5, ≤1, ≤2, ≤4, >4
+        const float widthLimits[] = {0.5f, 1.0f, 2.0f, 4.0f};
+        QVector<Vtx> widthBins[5];
+        QVector<Vtx> fillVerts;
+        QVector<int> fillSubPathStarts; // start index in fillVerts for each subpath
+
+        auto flattenCubic = [&](float x0, float y0, float cx1, float cy1,
+                                float cx2, float cy2, float x3, float y3,
+                                uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca) {
+            const int N = 4;
+            float prevX = x0, prevY = y0;
+            for (int i = 1; i <= N; ++i) {
+                float t = float(i) / N;
+                float u = 1.0f - t;
+                float u2 = u * u, u3 = u2 * u;
+                float t2 = t * t, t3 = t2 * t;
+                float px = u3*x0 + 3*u2*t*cx1 + 3*u*t2*cx2 + t3*x3;
+                float py = u3*y0 + 3*u2*t*cy1 + 3*u*t2*cy2 + t3*y3;
+                vertices.append({prevX, prevY, cr, cg, cb, ca});
+                vertices.append({px, py, cr, cg, cb, ca});
+                prevX = px; prevY = py;
+            }
+            lineSegCount += N;
+        };
+
+        qint64 traverseMs = 0;
+        {
+            QElapsedTimer t;
+            t.start();
+            QMutexLocker lock(&s_pdfiumMutex);
+
+            int nObj = FPDFPage_CountObjects(page);
+            for (int oi = 0; oi < nObj; ++oi) {
+                FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, oi);
+                if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) continue;
+                ++pathCount;
+
+                FS_MATRIX mat{};
+                FPDFPageObj_GetMatrix(obj, &mat);
+
+                int nSeg = FPDFPath_CountSegments(obj);
+                segCount += nSeg;
+
+                // §2.1: classify path
+                int fillMode = 0;
+                FPDF_BOOL strokeBool = 0;
+                FPDFPath_GetDrawMode(obj, &fillMode, &strokeBool);
+                bool hasFill = (fillMode != FPDF_FILLMODE_NONE);
+                float sw = 0;
+                FPDFPageObj_GetStrokeWidth(obj, &sw);
+                bool hasStroke = (strokeBool != 0) && sw > 0;
+                unsigned int sr2 = 0, sg2 = 0, sb2 = 0, sa2 = 0;
+                bool strokeOk = FPDFPageObj_GetStrokeColor(obj, &sr2, &sg2, &sb2, &sa2);
+                if (!strokeOk) hasStroke = false;
+                float sr = sr2 / 255.0f, sg = sg2 / 255.0f, sb = sb2 / 255.0f, sa = sa2 / 255.0f;
+                unsigned int fr2 = 0, fg2 = 0, fb2 = 0, fa2 = 0;
+                bool fillOk = FPDFPageObj_GetFillColor(obj, &fr2, &fg2, &fb2, &fa2);
+                float fr = fr2 / 255.0f, fg = fg2 / 255.0f, fb = fb2 / 255.0f, fa = fa2 / 255.0f;
+
+                if (hasFill) ++fillCount;
+                if (hasStroke) {
+                    ++strokeCount;
+                    allStrokeWidths.append(sw);
+                    if (strokeOk) {
+                        uint32_t sc = (qMin(255, qMax(0, (int)(sr*255)))) |
+                                      (qMin(255, qMax(0, (int)(sg*255))) << 8) |
+                                      (qMin(255, qMax(0, (int)(sb*255))) << 16);
+                        uniqueStrokeColors.insert(sc);
+                    }
+                }
+                if (hasFill && hasStroke) ++bothCount;
+                if (hasFill && fillOk) {
+                    uint32_t fc = (qMin(255, qMax(0, (int)(fr*255)))) |
+                                 (qMin(255, qMax(0, (int)(fg*255))) << 8) |
+                                 (qMin(255, qMax(0, (int)(fb*255))) << 16);
+                    uniqueFillColors.insert(fc);
+                }
+
+                // stroke color → per-vertex color
+                uint8_t vr = 0, vg = 0, vb = 0, va = 255;
+                if (hasStroke && strokeOk) {
+                    vr = qMin(255, qMax(0, (int)(sr*255)));
+                    vg = qMin(255, qMax(0, (int)(sg*255)));
+                    vb = qMin(255, qMax(0, (int)(sb*255)));
+                    va = qMin(255, qMax(0, (int)(sa*255)));
+                }
+
+                // width bin (0-4 for ≤0.5, ≤1, ≤2, ≤4, >4)
+                int wBin = 4;
+                if (hasStroke) {
+                    for (int b = 0; b < 4; ++b)
+                        if (sw <= widthLimits[b]) { wBin = b; break; }
+                }
+
+                float curX = 0, curY = 0;
+                bool hasCur = false;
+                float subX = 0, subY = 0;
+
+                // fill-only: collect subpath points for triangle fan (§2.4)
+                QVector<QPointF> fillPts;
+
+                for (int si = 0; si < nSeg; ++si) {
+                    FPDF_PATHSEGMENT seg = FPDFPath_GetPathSegment(obj, si);
+                    if (!seg) continue;
+                    int segType = FPDFPathSegment_GetType(seg);
+                    float sx = 0, sy = 0;
+                    FPDFPathSegment_GetPoint(seg, &sx, &sy);
+
+                    float mx = mat.a * sx + mat.c * sy + mat.e;
+                    float my = mat.b * sx + mat.d * sy + mat.f;
+
+                    switch (segType) {
+                    case FPDF_SEGMENT_MOVETO:
+                        curX = mx; curY = my; hasCur = true;
+                        subX = mx; subY = my;
+                        ++subpathCount;
+                        if (hasFill && !hasStroke) fillPts.clear();
+                        break;
+                    case FPDF_SEGMENT_LINETO:
+                        if (hasCur) {
+                            vertices.append({curX, curY, vr, vg, vb, va});
+                            vertices.append({mx, my, vr, vg, vb, va});
+                            if (hasStroke) widthBins[wBin].append({curX, curY, vr, vg, vb, va});
+                            if (hasStroke) widthBins[wBin].append({mx, my, vr, vg, vb, va});
+                            ++lineSegCount;
+                        }
+                        if (hasFill && !hasStroke) fillPts.append(QPointF(mx, my));
+                        curX = mx; curY = my;
+                        break;
+                    case FPDF_SEGMENT_BEZIERTO: {
+                        float cx1 = mx, cy1 = my;
+                        float cx2 = 0, cy2 = 0;
+                        float ex = 0, ey = 0;
+                        if (si + 1 < nSeg) {
+                            FPDF_PATHSEGMENT s2 = FPDFPath_GetPathSegment(obj, si + 1);
+                            if (s2) {
+                                float px = 0, py = 0;
+                                FPDFPathSegment_GetPoint(s2, &px, &py);
+                                cx2 = mat.a * px + mat.c * py + mat.e;
+                                cy2 = mat.b * px + mat.d * py + mat.f;
+                            }
+                            ++si;
+                        }
+                        if (si + 1 < nSeg) {
+                            FPDF_PATHSEGMENT s3 = FPDFPath_GetPathSegment(obj, si + 1);
+                            if (s3) {
+                                float px = 0, py = 0;
+                                FPDFPathSegment_GetPoint(s3, &px, &py);
+                                ex = mat.a * px + mat.c * py + mat.e;
+                                ey = mat.b * px + mat.d * py + mat.f;
+                            }
+                            ++si;
+                        }
+                        if (hasCur) {
+                            flattenCubic(curX, curY, cx1, cy1, cx2, cy2, ex, ey, vr, vg, vb, va);
+                            if (hasStroke) {
+                                float prevX2 = curX;
+                                const int N2 = 4;
+                                for (int i2 = 1; i2 <= N2; ++i2) {
+                                    float t2 = float(i2)/N2; float u2 = 1-t2;
+                                    float u2b = u2*u2, u3b = u2b*u2;
+                                    float t2b = t2*t2, t3b = t2b*t2;
+                                    float px2 = u3b*curX + 3*u2b*t2*cx1 + 3*u2*t2b*cx2 + t3b*ex;
+                                    float py2 = u3b*curY + 3*u2b*t2*cy1 + 3*u2*t2b*cy2 + t3b*ey;
+                                    widthBins[wBin].append({prevX2, py2, vr, vg, vb, va});
+                                    widthBins[wBin].append({px2, py2, vr, vg, vb, va});
+                                    prevX2 = px2;
+                                }
+                            }
+                            if (hasFill && !hasStroke) {
+                                const int N2 = 4;
+                                for (int i2 = 1; i2 <= N2; ++i2) {
+                                    float t2 = float(i2)/N2; float u2 = 1-t2;
+                                    float u2b = u2*u2, u3b = u2b*u2;
+                                    float t2b = t2*t2, t3b = t2b*t2;
+                                    fillPts.append(QPointF(
+                                        u3b*curX + 3*u2b*t2*cx1 + 3*u2*t2b*cx2 + t3b*ex,
+                                        u3b*curY + 3*u2b*t2*cy1 + 3*u2*t2b*cy2 + t3b*ey));
+                                }
+                            }
+                        }
+                        curX = ex; curY = ey;
+                        break;
+                    }
+                    }
+                    if (hasCur && FPDFPathSegment_GetClose(seg)) {
+                        vertices.append({curX, curY, vr, vg, vb, va});
+                        vertices.append({subX, subY, vr, vg, vb, va});
+                        if (hasStroke) {
+                            widthBins[wBin].append({curX, curY, vr, vg, vb, va});
+                            widthBins[wBin].append({subX, subY, vr, vg, vb, va});
+                        }
+                        ++lineSegCount;
+                        hasCur = false;
+
+                        // §2.4: fill-only path → triangle fan from first point
+                        if (hasFill && !hasStroke && fillPts.size() >= 3) {
+                            int startIdx = fillVerts.size();
+                            fillSubPathStarts.append(startIdx);
+                            for (const auto& fp : fillPts) {
+                                float fnx = (fp.x() / pageW) * 2.0f - 1.0f;
+                                float fny = (fp.y() / pageH) * 2.0f - 1.0f;
+                                uint8_t fcr = qMin(255, qMax(0, (int)(fr*255)));
+                                uint8_t fcg = qMin(255, qMax(0, (int)(fg*255)));
+                                uint8_t fcb = qMin(255, qMax(0, (int)(fb*255)));
+                                uint8_t fca = qMin(255, qMax(0, (int)(fa*255)));
+                                fillVerts.append({fnx, fny, fcr, fcg, fcb, fca});
+                            }
+                        }
+                        fillPts.clear();
+                    }
+                }
+            }
+            traverseMs = t.elapsed();
+        }
+
+        // §2.1: compute fill path stats for §2.4 decision
+        int fillOnlyCount = fillCount - bothCount;
+        int fillVertsCount = fillVerts.size();
+        int fillVertTris = qMax(0, fillVertsCount - fillSubPathStarts.size() * 2); // GL_TRIANGLE_FAN: N-2 tris per subpath
+        int uniqueSW = 0;
+        { QSet<float> swSet; for (float w : allStrokeWidths) swSet.insert(w); uniqueSW = swSet.size(); }
+        out << "\n=== §2.1 Statistics ===\n";
+        out << "Fill paths      : " << fillCount << "\n";
+        out << "Stroke paths    : " << strokeCount << "\n";
+        out << "Both            : " << bothCount << "\n";
+        out << "Fill-only       : " << fillOnlyCount << "\n";
+        out << "Fill verts (tri): " << fillVertsCount << " (" << fillVertTris << " triangles)\n";
+        out << "Mau net khac nhau  : " << uniqueStrokeColors.size() << "\n";
+        out << "Mau to khac nhau   : " << uniqueFillColors.size() << "\n";
+        out << "Do day net khac nhau: " << uniqueSW << "\n";
+        {
+            QMap<float,int> swHist;
+            for (float w : allStrokeWidths) swHist[w]++;
+            QList<QPair<float,int>> swList;
+            for (auto it = swHist.constBegin(); it != swHist.constEnd(); ++it)
+                swList.append(qMakePair(it.key(), it.value()));
+            std::sort(swList.begin(), swList.end(), [](const QPair<float,int>& a, const QPair<float,int>& b){ return a.second > b.second; });
+            int show = qMin(10, swList.size());
+            for (int i = 0; i < show; ++i)
+                out << "  " << QString::number(swList[i].first,'f',2) << " pt: " << swList[i].second << " paths\n";
+        }
+        out << "=== End §2.1 ===\n\n";
+
+        bool doStencilFill = (fillOnlyCount <= 100000 && fillVertsCount > 0);
+        if (!doStencilFill && fillVertsCount > 0) {
+            out << "§2.4 SKIP: fill paths " << fillOnlyCount << " > 100,000 — stencil-then-cover not feasible\n";
+            out << "  (vertices generated: " << fillVertsCount << ", triangles: " << fillVertTris << ")\n\n";
+        }
+
+        // Convert stroke vertices to NDC (§2.2 + §2.3: per-vertex color already in Vtx)
+        for (int b = 0; b < 5; ++b) {
+            for (auto& v : widthBins[b]) {
+                v.x = (v.x / pageW) * 2.0f - 1.0f;
+                v.y = (v.y / pageH) * 2.0f - 1.0f;
+                if (v.x < -1.5f || v.x > 1.5f || v.y < -1.5f || v.y > 1.5f)
+                    ++outOfRangeCount;
+            }
+        }
+        // Also convert the legacy `vertices` array for total stats
+        float totalVBOBytes = 0;
+        for (int b = 0; b < 5; ++b) totalVBOBytes += widthBins[b].size() * sizeof(Vtx);
+        float vboMB = totalVBOBytes / (1024.0f * 1024.0f);
+        int totalVerts = 0;
+        for (int b = 0; b < 5; ++b) totalVerts += widthBins[b].size();
+        out << "Trich path    : " << traverseMs << " ms  (paths=" << pathCount
+            << " segs=" << segCount << " subpaths=" << subpathCount
+            << " lines=" << lineSegCount
+            << " verts=" << totalVerts << " VBO=" << QString::number(vboMB,'f',3) << " MB"
+            << " oor=" << outOfRangeCount << ")\n";
+
+        // ── 3. OpenGL offscreen render ──
+        qint64 uploadMs = 0, renderMs = 0, fillRenderMs = 0;
+        bool glOk = false;
+        QString glError;
+        {
+            QSurfaceFormat fmt;
+            fmt.setVersion(3, 3);
+            fmt.setProfile(QSurfaceFormat::CoreProfile);
+            fmt.setDepthBufferSize(24);
+            fmt.setStencilBufferSize(8);
+            fmt.setSamples(0);
+
+            QOffscreenSurface surf;
+            surf.setFormat(fmt);
+            surf.create();
+            if (!surf.isValid()) {
+                glError = QStringLiteral("QOffscreenSurface not valid");
+            } else {
+                QOpenGLContext ctx;
+                ctx.setFormat(fmt);
+                if (!ctx.create()) {
+                    fmt.setProfile(QSurfaceFormat::CompatibilityProfile);
+                    surf.setFormat(fmt);
+                    surf.create();
+                    ctx.setFormat(fmt);
+                    if (!ctx.create()) {
+                        glError = QStringLiteral("QOpenGLContext create failed (Core+Compat)");
+                    }
+                }
+                if (glError.isEmpty() && !ctx.makeCurrent(&surf)) {
+                    glError = QStringLiteral("makeCurrent failed");
+                }
+                if (glError.isEmpty()) {
+                    QOpenGLFunctions* gl = ctx.functions();
+
+                    // Print GL info for driver debugging
+                    out << "GL_VERSION  : " << (const char*)gl->glGetString(GL_VERSION) << "\n";
+                    out << "GL_RENDERER : " << (const char*)gl->glGetString(GL_RENDERER) << "\n";
+                    out << "GL_VENDOR   : " << (const char*)gl->glGetString(GL_VENDOR) << "\n";
+
+                    // VAO mandatory in Core Profile — Mesa tolerates VAO=0, NVIDIA/AMD/Intel reject draw calls without it
+                    QOpenGLExtraFunctions* glx = ctx.extraFunctions();
+                    if (glx) {
+                        GLuint vao = 0;
+                        glx->glGenVertexArrays(1, &vao);
+                        glx->glBindVertexArray(vao);
+                    } else {
+                        glError = QStringLiteral("QOpenGLExtraFunctions unavailable (need GL 3.0+)");
+                    }
+                }
+                if (glError.isEmpty()) {
+                    QOpenGLFramebufferObject fbo(wPx, hPx,
+                        QOpenGLFramebufferObject::CombinedDepthStencil);
+                    fbo.bind();
+                    out << "fbo.isValid() : " << fbo.isValid() << "\n";
+
+                    QOpenGLFunctions* gl = ctx.functions();
+                    gl->glViewport(0, 0, wPx, hPx);
+                    gl->glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+                    gl->glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                    gl->glEnable(GL_LINE_SMOOTH);
+                    gl->glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+
+                    // §2.5: measure GL_ALIASED_LINE_WIDTH_RANGE
+                    float lwRange[2] = {1.0f, 1.0f};
+                    gl->glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, lwRange);
+                    out << "GL_ALIASED_LINE_WIDTH_RANGE: " << lwRange[0] << " - " << lwRange[1] << "\n";
+                    { GLenum err = gl->glGetError(); if (err != GL_NO_ERROR)
+                        out << "GL_ERROR after init: 0x" << QString::number(err,16) << "\n"; }
+
+                    // §2.4: stencil-then-cover for fill paths
+                    qint64 fillStart = 0;
+                    if (doStencilFill) {
+                        fillStart = tTotal.elapsed();
+
+                        // Shader for fill (same as stroke, just uses color from VBO)
+                        const char* fillVsrc =
+                            "#version 330 core\n"
+                            "layout(location=0) in vec2 aPos;\n"
+                            "layout(location=1) in vec4 aColor;\n"
+                            "out vec4 vColor;\n"
+                            "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vColor = aColor; }\n";
+                        const char* fillFsrc =
+                            "#version 330 core\n"
+                            "in vec4 vColor;\n"
+                            "out vec4 FragColor;\n"
+                            "void main() { FragColor = vColor; }\n";
+
+                        QOpenGLShaderProgram fillProg;
+                        if (fillProg.addShaderFromSourceCode(QOpenGLShader::Vertex, fillVsrc) &&
+                            fillProg.addShaderFromSourceCode(QOpenGLShader::Fragment, fillFsrc) &&
+                            fillProg.link()) {
+                            fillProg.bind();
+                            { GLenum err = gl->glGetError(); if (err != GL_NO_ERROR)
+                                out << "GL_ERROR after fill shader: 0x" << QString::number(err,16) << "\n"; }
+
+                            QOpenGLBuffer fillVBO(QOpenGLBuffer::VertexBuffer);
+                            fillVBO.create();
+                            fillVBO.bind();
+                            fillVBO.allocate(fillVerts.constData(), fillVerts.size() * sizeof(Vtx));
+                            fillProg.enableAttributeArray(0);
+                            fillProg.setAttributeBuffer(0, GL_FLOAT, 0, 2, sizeof(Vtx));
+                            fillProg.enableAttributeArray(1);
+                            fillProg.setAttributeBuffer(1, GL_UNSIGNED_BYTE, 2 * sizeof(float), 4, sizeof(Vtx));
+
+                            // Stencil setup for even-odd fill
+                            gl->glEnable(GL_STENCIL_TEST);
+                            gl->glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                            gl->glStencilOp(GL_INVERT, GL_INVERT, GL_INVERT);
+                            gl->glStencilFunc(GL_ALWAYS, 0, 0xFF);
+                            gl->glStencilMask(0xFF);
+
+                            // Draw triangle fans: each subpath = 1 GL_TRIANGLE_FAN
+                            for (int si = 0; si < fillSubPathStarts.size(); ++si) {
+                                int start = fillSubPathStarts[si];
+                                int count = (si + 1 < fillSubPathStarts.size())
+                                    ? fillSubPathStarts[si + 1] - start
+                                    : fillVerts.size() - start;
+                                if (count >= 3)
+                                    gl->glDrawArrays(GL_TRIANGLE_FAN, start, count);
+                            }
+
+                            // Cover: draw bounding box with fill color where stencil != 0
+                            gl->glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                            gl->glStencilFunc(GL_NOTEQUAL, 0, 0xFF);
+                            gl->glStencilMask(0x00);
+
+                            // Use average fill color for cover (since we batched all fills)
+                            float ar = 0, ag = 0, ab = 0;
+                            if (fillVertTris > 0) {
+                                for (const auto& v : fillVerts) { ar += v.r; ag += v.g; ab += v.b; }
+                                ar /= (fillVerts.size() * 255.0f);
+                                ag /= (fillVerts.size() * 255.0f);
+                                ab /= (fillVerts.size() * 255.0f);
+                            }
+                            fillProg.setUniformValue("uColor", 0, 0, 0, 0); // unused when per-vertex
+
+                            // Draw full-screen quad (stencil test clips to filled regions)
+                            struct FillVtx2 { float x, y; uint8_t r,g,b,a; };
+                            FillVtx2 cover[] = {{-1,-1,0,0,0,255},{1,-1,0,0,0,255},{-1,1,0,0,0,255},
+                                                {1,-1,0,0,0,255},{1,1,0,0,0,255},{-1,1,0,0,0,255}};
+                            // Use red for visibility: stencil-covered areas show fill
+                            for (auto& cv : cover) { cv.r = (uint8_t)(ar*255); cv.g = (uint8_t)(ag*255); cv.b = (uint8_t)(ab*255); }
+                            fillVBO.bind();
+                            fillVBO.allocate(cover, sizeof(cover));
+                            fillProg.setAttributeBuffer(0, GL_FLOAT, 0, 2, sizeof(FillVtx2));
+                            fillProg.setAttributeBuffer(1, GL_UNSIGNED_BYTE, 2*sizeof(float), 4, sizeof(FillVtx2));
+                            gl->glDrawArrays(GL_TRIANGLES, 0, 6);
+
+                            gl->glDisable(GL_STENCIL_TEST);
+                            gl->glStencilMask(0xFF);
+                            gl->glClear(GL_STENCIL_BUFFER_BIT);
+
+                            fillVBO.destroy();
+                            fillProg.release();
+                        }
+                        fillRenderMs = tTotal.elapsed() - fillStart;
+                    }
+
+                    // §2.2 + §2.3: stroke shader with per-vertex color
+                    const char* vsrc =
+                        "#version 330 core\n"
+                        "layout(location=0) in vec2 aPos;\n"
+                        "layout(location=1) in vec4 aColor;\n"
+                        "out vec4 vColor;\n"
+                        "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vColor = aColor; }\n";
+                    const char* fsrc =
+                        "#version 330 core\n"
+                        "in vec4 vColor;\n"
+                        "out vec4 FragColor;\n"
+                        "void main() { FragColor = vColor; }\n";
+
+                    QOpenGLShaderProgram prog;
+                    if (!prog.addShaderFromSourceCode(QOpenGLShader::Vertex, vsrc) ||
+                        !prog.addShaderFromSourceCode(QOpenGLShader::Fragment, fsrc) ||
+                        !prog.link()) {
+                        glError = QStringLiteral("shader link: ") + prog.log();
+                    } else {
+                        prog.bind();
+                        { GLenum err = gl->glGetError(); if (err != GL_NO_ERROR)
+                            out << "GL_ERROR after stroke shader: 0x" << QString::number(err,16) << "\n"; }
+
+                        // §2.3: draw each width bin with its own glLineWidth
+                        const float binWidths[] = {0.5f, 1.0f, 2.0f, 4.0f, 1.0f};
+                        {
+                            QElapsedTimer t;
+                            t.start();
+
+                            for (int b = 0; b < 5; ++b) {
+                                if (widthBins[b].isEmpty()) continue;
+                                float lw = binWidths[b];
+                                if (lw < lwRange[0]) lw = lwRange[0];
+                                if (lw > lwRange[1]) lw = lwRange[1];
+                                gl->glLineWidth(lw);
+
+                                QOpenGLBuffer vbo(QOpenGLBuffer::VertexBuffer);
+                                vbo.create();
+                                vbo.bind();
+                                vbo.allocate(widthBins[b].constData(), widthBins[b].size() * sizeof(Vtx));
+
+                                prog.enableAttributeArray(0);
+                                prog.setAttributeBuffer(0, GL_FLOAT, 0, 2, sizeof(Vtx));
+                                prog.enableAttributeArray(1);
+                                prog.setAttributeBuffer(1, GL_UNSIGNED_BYTE, 2 * sizeof(float), 4, sizeof(Vtx));
+
+                                if (widthBins[b].size() >= 2)
+                                    gl->glDrawArrays(GL_LINES, 0, widthBins[b].size());
+
+                                vbo.destroy();
+                            }
+                            gl->glFinish();
+                            { GLenum err = gl->glGetError(); if (err != GL_NO_ERROR)
+                                out << "GL_ERROR after render: 0x" << QString::number(err,16) << "\n"; }
+                            renderMs = t.elapsed();
+                        }
+
+                        QImage img = fbo.toImage();
+                        bool saved = img.save(outPng, "PNG");
+                        glOk = saved;
+                        if (!saved)
+                            glError = QStringLiteral("QImage.save failed: ") + outPng;
+
+                        prog.release();
+                    }
+                    fbo.release();
+                }
+            }
+        }
+
+        qint64 totalMs = tTotal.elapsed();
+        out << "Upload VBO    : " << uploadMs << " ms\n";
+        out << "Ve fill (stencil): " << fillRenderMs << " ms\n";
+        out << "Ve GL (stroke): " << renderMs << " ms\n";
+        out << "TONG          : " << totalMs << " ms\n";
+
+        if (glOk)
+            out << "VECTORGL_OK " << outPng << " (" << wPx << "x" << hPx << ")\n";
+        else
+            out << "VECTORGL_FAIL " << glError << "\n";
+        out.flush();
+
+        { QMutexLocker lock(&s_pdfiumMutex); FPDF_ClosePage(page); }
+        PdfDocument::libRelease();
+        return glOk ? 0 : 1;
+    }
+
+    // Ghost geometry helpers (defined in PdfGpuView.cpp, file scope — not static)
+    QPointF trGhostBaseline(const QRectF& dispRect);
+    qreal trGhostPixelSize(float fontSizePt, double zoom);
+
+    // usage: --safedelete-test
+    // Headless verify removeWorkingCopy safety gate — prevents deletion of user's original files.
+    if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--safedelete-test")) {
+        QTextStream out(stdout);
+        extern bool removeWorkingCopy(const QString& path);
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        QString tmpDir = QDir::temp().absolutePath();
+        int failures = 0;
+        auto CHECK = [&](const QString& label, bool ok) {
+            if (!ok) { out << "FAIL " << label << "\n"; ++failures; }
+        };
+        // case 1: temp dir, .tortmp → true, file gone
+        {
+            QString p = tmpDir + "/safedel_" + QString::number(now) + ".tortmp";
+            QFile f(p);
+            f.open(QIODevice::WriteOnly); f.write("x"); f.close();
+            bool ret = removeWorkingCopy(p);
+            CHECK("case1-returned-true", ret);
+            CHECK("case1-file-gone", !QFile::exists(p));
+        }
+        // case 2: temp dir, .pdf → false, file survives
+        {
+            QString p = tmpDir + "/safedel_" + QString::number(now) + ".pdf";
+            QFile f(p);
+            f.open(QIODevice::WriteOnly); f.write("x"); f.close();
+            bool ret = removeWorkingCopy(p);
+            CHECK("case2-returned-false", !ret);
+            CHECK("case2-file-exists", QFile::exists(p));
+            QFile::remove(p);
+        }
+        // case 3: cwd, .tortmp → false, file survives
+        {
+            QString p = "./safedel_fake_" + QString::number(now) + ".tortmp";
+            QFile f(p);
+            f.open(QIODevice::WriteOnly); f.write("x"); f.close();
+            bool ret = removeWorkingCopy(p);
+            CHECK("case3-returned-false", !ret);
+            CHECK("case3-file-exists", QFile::exists(p));
+            QFile::remove(p);
+        }
+        // case 4: empty path → false
+        {
+            bool ret = removeWorkingCopy("");
+            CHECK("case4-empty-returned-false", !ret);
+        }
+        if (failures == 0)
+            out << "SAFEDELETE: PASS\n";
+        else
+            out << "SAFEDELETE: FAIL failures=" << failures << "\n";
+        out.flush();
+        return failures == 0 ? 0 : 1;
+    }
+
+    // usage: --ghostgeom
+    // Headless verify of ghost geometry helpers.
+    if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ghostgeom")) {
+        QTextStream out(stdout);
+        bool ok = true;
+        auto check = [&](const QString& label, bool cond) {
+            if (!cond) { out << "FAIL " << label << "\n"; ok = false; }
+        };
+        {
+            QPointF bl = trGhostBaseline(QRectF(50, 100, 200, 20));
+            check("baseline-x", qAbs(bl.x() - 54.0) < 1e-6);
+            check("baseline-y", qAbs(bl.y() - 118.0) < 1e-6);
+        }
+        check("pixelsize-z1", qAbs(trGhostPixelSize(12.0f, 1.0) - 12.0) < 1e-6);
+        check("pixelsize-z2", qAbs(trGhostPixelSize(12.0f, 2.5) - 30.0) < 1e-6);
+        if (ok) out << "GHOSTGEOM: PASS\n";
+        else    out << "GHOSTGEOM: FAIL\n";
+        out.flush();
+        return ok ? 0 : 1;
+    }
+
+    // usage: --safesave-test
+    // Headless verify replaceFileAtomically — không bao giờ mất file gốc.
+    if (argc >= 2 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--safesave-test")) {
+        QTextStream out(stdout);
+        extern bool replaceFileAtomically(const QString& srcTmp, const QString& dest, QString* errOut);
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        QString workDir = QDir::temp().absolutePath() + QStringLiteral("/safesave_") + QString::number(now);
+        QDir().mkpath(workDir);
+        auto rd = [&](const QString& p) -> QString {
+            QFile f(p); if (!f.open(QIODevice::ReadOnly)) return {};
+            return QString::fromUtf8(f.readAll());
+        };
+        auto wr = [&](const QString& p, const QByteArray& data) {
+            QFile f(p); f.open(QIODevice::WriteOnly); f.write(data); f.close();
+        };
+        auto clean = [&]() { QDir(workDir).removeRecursively(); };
+        int failures = 0;
+        auto CHECK = [&](const QString& label, bool ok) {
+            if (!ok) { out << "FAIL " << label << "\n"; ++failures; }
+        };
+        QString err;
+        // case 1: thay thế bình thường
+        {
+            QString src = workDir + QStringLiteral("/src1");
+            QString dest = workDir + QStringLiteral("/dest1");
+            wr(src, "NEWDATA"); wr(dest, "OLD");
+            bool ret = replaceFileAtomically(src, dest, &err);
+            CHECK("case1-returned-true", ret);
+            CHECK("case1-content", rd(dest) == "NEWDATA");
+            CHECK("case1-no-savetmp", !QFile::exists(dest + ".savetmp"));
+            CHECK("case1-no-savebak", !QFile::exists(dest + ".savebak"));
+        }
+        // case 2: đích chưa tồn tại
+        {
+            QString src = workDir + QStringLiteral("/src2");
+            QString dest = workDir + QStringLiteral("/dest2");
+            wr(src, "NEWDATA");
+            bool ret = replaceFileAtomically(src, dest, &err);
+            CHECK("case2-returned-true", ret);
+            CHECK("case2-content", rd(dest) == "NEWDATA");
+        }
+        // case 3: nguồn không tồn tại → dest phải y hệt
+        {
+            QString src = workDir + QStringLiteral("/nonexistent3");
+            QString dest = workDir + QStringLiteral("/dest3");
+            wr(dest, "OLD");
+            bool ret = replaceFileAtomically(src, dest, &err);
+            CHECK("case3-returned-false", !ret);
+            CHECK("case3-content-preserved", rd(dest) == "OLD");
+        }
+        // case 4: nguồn rỗng (0 byte) → dest phải y hệt
+        {
+            QString src = workDir + QStringLiteral("/src4");
+            QString dest = workDir + QStringLiteral("/dest4");
+            wr(src, ""); wr(dest, "OLD");
+            bool ret = replaceFileAtomically(src, dest, &err);
+            CHECK("case4-returned-false", !ret);
+            CHECK("case4-content-preserved", rd(dest) == "OLD");
+        }
+        // case 5: không sót rác
+        {
+            bool hasSavetmp = !QDir(workDir).entryList({"*.savetmp"}, QDir::Files).isEmpty();
+            bool hasSavebak = !QDir(workDir).entryList({"*.savebak"}, QDir::Files).isEmpty();
+            CHECK("case5-no-savetmp-leak", !hasSavetmp);
+            CHECK("case5-no-savebak-leak", !hasSavebak);
+        }
+        clean();
+        if (failures == 0)
+            out << "SAFESAVE: PASS\n";
+        else
+            out << "SAFESAVE: FAIL failures=" << failures << "\n";
+        out.flush();
+        return failures == 0 ? 0 : 1;
+    }
+
+    // usage: --thumbbench <input.pdf> [maxPages]
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--thumbbench")) {
+        QTextStream out(stdout);
+        const QString inPath = QString::fromLocal8Bit(argv[2]);
+        int maxPages = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 60;
+        PdfDocument::libAddRef();
+
+        ThumbnailRenderPool pool;
+        QElapsedTimer t; t.start();
+        if (!pool.open(inPath)) {
+            out << "THUMBBENCH: FAIL pool.open\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        const qint64 openMs = t.elapsed();
+        const int total = qMin(maxPages, pool.pageCount());
+        if (total <= 0) {
+            out << "THUMBBENCH: FAIL pageCount=" << pool.pageCount() << "\n"; out.flush();
+            pool.close(); PdfDocument::libRelease(); return 1;
+        }
+
+        int received = 0;
+        qint64 firstMs = -1;
+        QEventLoop loop;
+        QObject::connect(&pool, &ThumbnailRenderPool::thumbnailReady, &loop,
+            [&](int, QImage, quint64) {
+                if (firstMs < 0) firstMs = t.elapsed();
+                if (++received >= total) loop.quit();
+            });
+        QTimer guard;
+        guard.setSingleShot(true);
+        QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+        guard.start(120000);
+
+        t.restart();
+        for (int i = 0; i < total; ++i) pool.requestThumbnail(i, 2);
+        loop.exec();
+        const qint64 wallMs = t.elapsed();
+        pool.close();
+        PdfDocument::libRelease();
+
+        out << "THUMBBENCH pages=" << total << " open_ms=" << openMs
+            << " first_ms=" << firstMs << " wall_ms=" << wallMs
+            << " received=" << received
+            << " per_page_ms=" << QString::number(received ? double(wallMs)/received : 0.0, 'f', 1)
+            << (received < total ? "  [THIEU - het gio]" : "")
+            << "\n";
+        out.flush();
+        return received == total ? 0 : 1;
+    }
+
+    // usage: --thumbepoch-test <pdfA> <pdfB>
+    // Deterministic harness: verify old-thumbnail epoch gating works without
+    // race conditions. Requires two PDFs with different page counts.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--thumbepoch-test")) {
+        QTextStream out(stdout);
+        QString pdfA = QString::fromLocal8Bit(argv[2]);
+        QString pdfB = QString::fromLocal8Bit(argv[3]);
+
+        // Step 1: open both documents
+        PdfDocument docA, docB;
+        if (!docA.open(pdfA)) { out << "THUMBEPOCH: FAIL cannot open " << pdfA << "\n"; out.flush(); return 1; }
+        if (!docB.open(pdfB)) { out << "THUMBEPOCH: FAIL cannot open " << pdfB << "\n"; out.flush(); return 1; }
+        if (docA.pageCount() == docB.pageCount()) {
+            out << "THUMBEPOCH: FAIL hai file cung so trang (" << docA.pageCount() << ")\n";
+            out.flush(); return 1;
+        }
+
+        // Step 2: open pool on pdfA, record epochA
+        ThumbnailRenderPool poolA;
+        if (!poolA.open(pdfA)) { out << "THUMBEPOCH: FAIL poolA.open\n"; out.flush(); return 1; }
+        quint64 epochA = poolA.epoch();
+
+        // Step 3: set up panel with docA
+        PdfRenderer rendererA;
+        rendererA.setDocument(&docA);
+        ThumbnailPanel panel;
+        panel.setDocument(&docA, &rendererA, &poolA, true);
+
+        // Step 4: switch pool to pdfB, verify epoch advances
+        poolA.close();
+        if (!poolA.open(pdfB)) { out << "THUMBEPOCH: FAIL poolA.open(pdfB)\n"; out.flush(); return 1; }
+        quint64 epochB = poolA.epoch();
+        if (epochB == epochA) {
+            out << "THUMBEPOCH: FAIL epoch khong tang sau open()\n";
+            out.flush(); return 1;
+        }
+
+        // Step 5: point panel to docB
+        PdfRenderer rendererB;
+        rendererB.setDocument(&docB);
+        panel.setDocument(&docB, &rendererB, &poolA, true);
+        panel.debugResetCounters();
+
+        // Step 6: a fake image sized according to actual page width
+        const double pw0 = docB.pageSize(0).width();
+        const int imgW = qMax(8, static_cast<int>(pw0 * 0.2));
+        const int imgH = qMax(8, static_cast<int>(imgW * 1.4));
+        QImage img(imgW, imgH, QImage::Format_RGB32);
+        img.fill(Qt::white);
+
+        // Step 7: Case A — old epoch image arrives late, must be dropped
+        panel.onPageReady(0, img, epochA);
+        if (panel.debugDroppedCount() != 1 || panel.debugAcceptedCount() != 0
+            || panel.debugPendingCount() != 0 || panel.debugRejectedCount() != 0) {
+            out << "THUMBEPOCH: FAIL anh cu VAN LOT (dropped="
+                << panel.debugDroppedCount() << " accepted="
+                << panel.debugAcceptedCount() << " pending="
+                << panel.debugPendingCount() << " rejected="
+                << panel.debugRejectedCount() << ")\n";
+            out.flush(); return 1;
+        }
+
+        // Step 8: Case B — current epoch image, must be accepted or pending
+        panel.debugResetCounters();
+        panel.onPageReady(0, img, epochB);
+        {
+            const int acc = panel.debugAcceptedCount();
+            const int drp = panel.debugDroppedCount();
+            const int pen = panel.debugPendingCount();
+            const int rej = panel.debugRejectedCount();
+            if (drp != 0 || rej != 0 || (acc + pen) != 1) {
+                out << "THUMBEPOCH: FAIL anh moi bi loai nham (accepted=" << acc
+                    << " dropped=" << drp << " pending=" << pen
+                    << " rejected=" << rej << ")\n";
+                out.flush(); return 1;
+            }
+        }
+
+        // Step 9: Case C — verify early-return fires when same doc is reloaded
+        // (forceRebuild=false + same pointers → must NOT rebuild list).
+        panel.setDocument(&docA, &rendererA, &poolA, true);
+        poolA.close();
+        if (!poolA.open(pdfA)) { out << "THUMBEPOCH: FAIL poolA.open(pdfA)\n"; out.flush(); return 1; }
+        quint64 epochC = poolA.epoch();
+        panel.debugResetCounters();
+        panel.setDocument(&docA, &rendererA, &poolA, false);
+        if (panel.debugEarlyReturnCount() != 1) {
+            out << "THUMBEPOCH: FAIL ca C khong cham duoc nhanh thoat som (early="
+                << panel.debugEarlyReturnCount() << ")\n";
+            out.flush(); return 1;
+        }
+        {
+            const double pwA = docA.pageSize(0).width();
+            const int imgWC = qMax(8, static_cast<int>(pwA * 0.2));
+            const int imgHC = qMax(8, static_cast<int>(imgWC * 1.4));
+            QImage imgC(imgWC, imgHC, QImage::Format_RGB32);
+            imgC.fill(Qt::white);
+            panel.debugResetCounters();
+            panel.onPageReady(0, imgC, epochC);
+            const int acc = panel.debugAcceptedCount();
+            const int drp = panel.debugDroppedCount();
+            const int pen = panel.debugPendingCount();
+            const int rej = panel.debugRejectedCount();
+            if (drp != 0 || rej != 0 || (acc + pen) != 1) {
+                out << "THUMBEPOCH: FAIL ca C (forceRebuild=false) accepted=" << acc
+                    << " dropped=" << drp << " pending=" << pen
+                    << " rejected=" << rej << " epochC=" << epochC << "\n";
+                out.flush(); return 1;
+            }
+        }
+
+        // Step 10: Case D — reload like Insert (forceRebuild=true), must also succeed
+        quint64 epochD = 0;
+        {
+            ThumbnailRenderPool poolD;
+            if (!poolD.open(pdfA)) { out << "THUMBEPOCH: FAIL poolD.open(pdfA)\n"; out.flush(); return 1; }
+            epochD = poolD.epoch();
+            const double pwA = docA.pageSize(0).width();
+            const int imgWD = qMax(8, static_cast<int>(pwA * 0.2));
+            const int imgHD = qMax(8, static_cast<int>(imgWD * 1.4));
+            QImage imgD(imgWD, imgHD, QImage::Format_RGB32);
+            imgD.fill(Qt::white);
+            panel.setDocument(&docA, &rendererA, &poolD, true);
+            panel.debugResetCounters();
+            panel.onPageReady(0, imgD, epochD);
+            const int acc = panel.debugAcceptedCount();
+            const int drp = panel.debugDroppedCount();
+            const int pen = panel.debugPendingCount();
+            const int rej = panel.debugRejectedCount();
+            if (drp != 0 || rej != 0 || (acc + pen) != 1) {
+                out << "THUMBEPOCH: FAIL ca D (forceRebuild=true) accepted=" << acc
+                    << " dropped=" << drp << " pending=" << pen
+                    << " rejected=" << rej << " epochD=" << epochD << "\n";
+                out.flush(); return 1;
+            }
+        }
+
+        out << "THUMBEPOCH: PASS epochA=" << epochA << " epochB=" << epochB
+            << " epochC=" << epochC << " epochD=" << epochD << "\n";
+        out.flush();
+        return 0;
+    }
+
+    // usage: --thumbreload-test <pdfA> <pdfB>
+    // Real signal-path harness: pool -> worker -> panel through 3 phases (mo, insert, save).
+    // Requires two PDFs with different page counts.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--thumbreload-test")) {
+        QTextStream out(stdout);
+        QString pdfA = QString::fromLocal8Bit(argv[2]);
+        QString pdfB = QString::fromLocal8Bit(argv[3]);
+
+        PdfDocument docA, docB;
+        if (!docA.open(pdfA)) { out << "THUMBRELOAD: FAIL cannot open " << pdfA << "\n"; out.flush(); return 1; }
+        if (!docB.open(pdfB)) { out << "THUMBRELOAD: FAIL cannot open " << pdfB << "\n"; out.flush(); return 1; }
+        if (docA.pageCount() == docB.pageCount()) {
+            out << "THUMBRELOAD: FAIL hai file cung so trang (" << docA.pageCount() << ")\n";
+            out.flush(); return 1;
+        }
+
+        PdfRenderer rendererA, rendererB;
+        rendererA.setDocument(&docA);
+        rendererB.setDocument(&docB);
+
+        ThumbnailRenderPool pool;
+        ThumbnailPanel panel;
+
+        auto runPhase = [&](const char* label, ThumbnailRenderPool& p,
+                            ThumbnailPanel& pnl, int n) -> bool {
+            pnl.debugResetCounters();
+            QEventLoop loop;
+            int got = 0;
+            auto conn = QObject::connect(&p, &ThumbnailRenderPool::thumbnailReady, &loop,
+                [&](int, QImage, quint64) { if (++got >= n) loop.quit(); });
+            QTimer guard; guard.setSingleShot(true);
+            QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
+            guard.start(30000);
+            for (int i = 0; i < n; ++i) p.requestThumbnail(i, 2);
+            loop.exec();
+            QObject::disconnect(conn);
+            loop.processEvents();
+            const int acc = pnl.debugAcceptedCount();
+            const int pen = pnl.debugPendingCount();
+            const int drp = pnl.debugDroppedCount();
+            const int rej = pnl.debugRejectedCount();
+            out << "THUMBRELOAD [" << label << "] emitted=" << got
+                << " accepted=" << acc << " pending=" << pen
+                << " dropped=" << drp << " rejected=" << rej << "\n";
+            out.flush();
+            if (drp > 0) { out << "THUMBRELOAD: FAIL [" << label << "] co anh bi cong epoch loai\n"; return false; }
+            if (acc + pen == 0) { out << "THUMBRELOAD: FAIL [" << label << "] panel khong nhan duoc anh nao\n"; return false; }
+            return true;
+        };
+
+        if (!pool.open(pdfA)) { out << "THUMBRELOAD: FAIL pool.open(pdfA)\n"; out.flush(); return 1; }
+        panel.setDocument(&docA, &rendererA, &pool, true);
+        QCoreApplication::processEvents();
+        if (!runPhase("mo", pool, panel, 5)) return 1;
+
+        pool.close();
+        docA.close();
+        docB.open(pdfB);
+        if (!pool.open(pdfB)) { out << "THUMBRELOAD: FAIL pool.open(pdfB) insert\n"; out.flush(); return 1; }
+        panel.setDocument(&docB, &rendererB, &pool, true);
+        QCoreApplication::processEvents();
+        if (!runPhase("insert", pool, panel, 5)) return 1;
+
+        pool.close();
+        if (!pool.open(pdfB)) { out << "THUMBRELOAD: FAIL pool.open(pdfB) save\n"; out.flush(); return 1; }
+        panel.setDocument(&docB, &rendererB, &pool, false);
+        QCoreApplication::processEvents();
+        if (!runPhase("save", pool, panel, 5)) return 1;
+
+        out << "THUMBRELOAD: PASS\n";
+        out.flush();
+        return 0;
+    }
+
+    // usage: --guiprobe <input.pdf> <out.png>
+    // Probe: kiem tra offscreen OpenGL (PdfGpuView) co render duoc trong Docker khong
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--guiprobe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QString outPng = QString::fromLocal8Bit(argv[3]);
+
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+
+        for (int i = 0; i < 60; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QPixmap pm = w.grab();
+        QImage img = pm.toImage();
+        if (img.isNull()) {
+            fprintf(stderr, "GUIPROBE: FAIL grab returned null\n");
+            return 1;
+        }
+        if (!img.save(outPng, "PNG")) {
+            fprintf(stderr, "GUIPROBE: FAIL cannot save %s\n", outPng.toLocal8Bit().constData());
+            return 1;
+        }
+
+        int total = img.width() * img.height();
+        int nonBlack = 0;
+        for (int y = 0; y < img.height(); ++y) {
+            const QRgb* row = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+            for (int x = 0; x < img.width(); ++x) {
+                QRgb px = row[x];
+                if (qAlpha(px) > 0 && (qRed(px) > 10 || qGreen(px) > 10 || qBlue(px) > 10))
+                    ++nonBlack;
+            }
+        }
+        double pct = (total > 0) ? (100.0 * nonBlack / total) : 0.0;
+        fprintf(stdout, "GUIPROBE size=%dx%d nonblack=%.2f%%\n", img.width(), img.height(), pct);
+        if (pct < 5.0) {
+            fprintf(stderr, "GUIPROBE: FAIL anh gan nhu den, offscreen GL khong render duoc\n");
+            return 1;
+        }
+        fprintf(stdout, "GUIPROBE: PASS\n");
+        return 0;
+    }
+
+    // usage: --foreignbench <input.pdf>
+    // Measure 3 approaches to render foreign annotation layer, choose cheapest.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--foreignbench")) {
+        QTextStream out(stdout);
+        const QString inPath = QString::fromLocal8Bit(argv[2]);
+        PdfDocument::libAddRef();
+
+        FPDF_DOCUMENT doc = nullptr;
+        { QMutexLocker lock(&s_pdfiumMutex); doc = FPDF_LoadDocument(inPath.toUtf8().constData(), nullptr); }
+        if (!doc) { out << "FOREIGNBENCH: FAIL cannot open " << inPath << "\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        // 2.1 Scan up to 30 pages, pick the one with most foreign annots
+        const int pageCount = FPDF_GetPageCount(doc);
+        const int limit = qMin(pageCount, 30);
+        int bestPage = -1, bestCount = 0;
+        double bestW = 0, bestH = 0;
+        for (int i = 0; i < limit; ++i) {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE pg = FPDF_LoadPage(doc, i);
+            if (!pg) continue;
+            double w = FPDF_GetPageWidth(pg), h = FPDF_GetPageHeight(pg);
+            int n = FPDFPage_GetAnnotCount(pg), foreign = 0;
+            for (int j = 0; j < n; ++j) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(pg, j);
+                if (!a) continue;
+                int fl = FPDFAnnot_GetFlags(a);
+                if (!(fl & FPDF_ANNOT_FLAG_HIDDEN) && FPDFAnnot_HasKey(a, "TRUID") == 0
+                    && FPDFAnnot_GetSubtype(a) != FPDF_ANNOT_POPUP)
+                    ++foreign;
+                FPDFPage_CloseAnnot(a);
+            }
+            FPDF_ClosePage(pg);
+            if (foreign > bestCount) { bestCount = foreign; bestPage = i; bestW = w; bestH = h; }
+        }
+        if (bestPage < 0) { out << "KHONG CO ANNOT NGOAI\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+
+        int wPx, hPx;
+        if (bestW >= bestH) { wPx = 2000; hPx = qMax(1, (int)(2000 * bestH / bestW)); }
+        else                { hPx = 2000; wPx = qMax(1, (int)(2000 * bestW / bestH)); }
+        out << "page=" << bestPage << " foreignAnnots=" << bestCount
+            << " pageSize=" << bestW << "x" << bestH << "\n"; out.flush();
+
+        // Render lambdas (require mutex held outside)
+        auto renderTo = [&](FPDF_PAGE pg, int flags) -> QImage {
+            QImage img(wPx, hPx, QImage::Format_ARGB32);
+            img.fill(Qt::white);
+            FPDF_BITMAP bmp = FPDFBitmap_CreateEx(wPx, hPx, FPDFBitmap_BGRA, img.bits(), img.bytesPerLine());
+            if (bmp) { FPDFBitmap_FillRect(bmp, 0, 0, wPx, hPx, 0xFFFFFFFF);
+                       FPDF_RenderPageBitmap(bmp, pg, 0, 0, wPx, hPx, 0, flags); FPDFBitmap_Destroy(bmp); }
+            return img;
+        };
+        auto hideOurs = [&](FPDF_PAGE pg) -> QVector<int> {
+            QVector<int> hid; int n = FPDFPage_GetAnnotCount(pg);
+            for (int i = 0; i < n; ++i) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(pg, i);
+                if (!a) continue;
+                if (FPDFAnnot_HasKey(a, "TRUID")) {
+                    int f = FPDFAnnot_GetFlags(a);
+                    if (!(f & FPDF_ANNOT_FLAG_HIDDEN)) { FPDFAnnot_SetFlags(a, f | FPDF_ANNOT_FLAG_HIDDEN); hid.append(i); }
+                }
+                FPDFPage_CloseAnnot(a);
+            }
+            return hid;
+        };
+        auto restoreOurs = [&](FPDF_PAGE pg, const QVector<int>& idxs) {
+            for (int i : idxs) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(pg, i);
+                if (!a) continue;
+                FPDFAnnot_SetFlags(a, FPDFAnnot_GetFlags(a) & ~FPDF_ANNOT_FLAG_HIDDEN);
+                FPDFPage_CloseAnnot(a);
+            }
+        };
+
+        const int RUNS = 3;
+        qint64 aTimes[RUNS], bTimes[RUNS], cAnnotTimes[RUNS], cPlainTimes[RUNS];
+        QImage benchALayer, benchAPlain, benchBLayer, benchCFull;
+        int aDiffPixels = 0, bNonTransparent = 0, bFormType = -1;
+        bool bFormOk = false;
+
+        for (int r = 0; r < RUNS; ++r) {
+            // Method A: current approach — double render + diff
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE page = FPDF_LoadPage(doc, bestPage);
+                if (!page) { out << "FOREIGNBENCH: FAIL load page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+                QElapsedTimer t; t.start();
+                auto hid = hideOurs(page);
+                QImage plain = renderTo(page, 0);
+                QImage annot = renderTo(page, FPDF_ANNOT);
+                restoreOurs(page, hid);
+                aTimes[r] = t.elapsed();
+                FPDF_ClosePage(page);
+                // Diff outside mutex
+                QImage layer(wPx, hPx, QImage::Format_ARGB32);
+                layer.fill(Qt::transparent);
+                int dc = 0;
+                for (int y = 0; y < hPx; ++y) {
+                    const QRgb* pa = (const QRgb*)plain.constScanLine(y);
+                    const QRgb* pb = (const QRgb*)annot.constScanLine(y);
+                    QRgb* po = (QRgb*)layer.scanLine(y);
+                    for (int x = 0; x < wPx; ++x) {
+                        if ((pa[x] & 0x00FFFFFF) != (pb[x] & 0x00FFFFFF)) { po[x] = (pb[x] | 0xFF000000); ++dc; }
+                    }
+                }
+                if (r == 0) { benchALayer = layer; benchAPlain = plain; aDiffPixels = dc; }
+            }
+
+            // Method B: FFLDraw on transparent bitmap (no page render)
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE page = FPDF_LoadPage(doc, bestPage);
+                if (!page) continue;
+                QImage img(wPx, hPx, QImage::Format_ARGB32);
+                img.fill(Qt::transparent);
+                FPDF_BITMAP bmp = FPDFBitmap_CreateEx(wPx, hPx, FPDFBitmap_BGRA, img.bits(), img.bytesPerLine());
+                if (bmp) FPDFBitmap_FillRect(bmp, 0, 0, wPx, hPx, 0x00000000);
+                FPDF_FORMFILLINFO ffi; memset(&ffi, 0, sizeof(ffi)); ffi.version = 2;
+                FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(doc, &ffi);
+                if (r == 0) { bFormOk = (form != nullptr); bFormType = FPDF_GetFormType(doc); }
+                QElapsedTimer t; t.start();
+                if (form) {
+                    FORM_OnAfterLoadPage(page, form);
+                    FPDF_FFLDraw(form, bmp, page, 0, 0, wPx, hPx, 0, FPDF_ANNOT);
+                    FORM_OnBeforeClosePage(page, form);
+                    FPDFDOC_ExitFormFillEnvironment(form);
+                }
+                bTimes[r] = t.elapsed();
+                FPDFBitmap_Destroy(bmp);
+                FPDF_ClosePage(page);
+                if (r == 0) {
+                    benchBLayer = img; int ntp = 0;
+                    for (int y = 0; y < hPx; ++y) {
+                        const QRgb* row = (const QRgb*)img.constScanLine(y);
+                        for (int x = 0; x < wPx; ++x) if (qAlpha(row[x]) != 0) ++ntp;
+                    }
+                    bNonTransparent = ntp;
+                }
+            }
+
+            // Method C: single render with FPDF_ANNOT (TRUID hidden) + measure plain overhead
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE page = FPDF_LoadPage(doc, bestPage);
+                if (!page) continue;
+                auto hid = hideOurs(page);
+                QElapsedTimer t; t.start();
+                QImage annot = renderTo(page, FPDF_ANNOT);
+                qint64 t1 = t.elapsed();
+                t.restart();
+                QImage plain = renderTo(page, 0);
+                cPlainTimes[r] = t.elapsed();
+                cAnnotTimes[r] = t1;
+                restoreOurs(page, hid);
+                FPDF_ClosePage(page);
+                if (r == 0) benchCFull = annot;
+            }
+        }
+
+        // Averages
+        double avgA=0, avgB=0, avgCAnnot=0, avgCPlain=0;
+        for (int i = 0; i < RUNS; ++i) { avgA += aTimes[i]; avgB += bTimes[i]; avgCAnnot += cAnnotTimes[i]; avgCPlain += cPlainTimes[i]; }
+        avgA /= RUNS; avgB /= RUNS; avgCAnnot /= RUNS; avgCPlain /= RUNS;
+        double overheadPct = avgCPlain > 0 ? ((avgCAnnot - avgCPlain) / avgCPlain * 100.0) : 0.0;
+
+        // Save PNGs
+        benchAPlain.save("bench_A_plain.png");
+        benchALayer.save("bench_A_layer.png");
+        benchBLayer.save("bench_B_layer.png");
+        benchCFull.save("bench_C_full.png");
+
+        out << "A: ms=" << QString::number(avgA, 'f', 1) << " diffPixels=" << aDiffPixels << "\n";
+        out << "B: ms=" << QString::number(avgB, 'f', 1) << " nonTransparentPixels=" << bNonTransparent
+            << " formHandle=" << (bFormOk ? "ok" : "null") << " formType=" << bFormType << "\n";
+        out << "C: ms_annot=" << QString::number(avgCAnnot, 'f', 1)
+            << " ms_plain=" << QString::number(avgCPlain, 'f', 1)
+            << " overhead=" << QString::number(overheadPct, 'f', 1) << "%\n";
+        out << "KET LUAN:\n"
+            << "  A (hien tai) = " << QString::number(avgA, 'f', 1) << "\n"
+            << "  B (FFLDraw)  = " << QString::number(avgB, 'f', 1)
+            << "  -> co ve duoc annot ngoai khong: " << (bNonTransparent > 1000 ? "CO" : "KHONG") << "\n"
+            << "  C (1 render) = " << QString::number(avgCAnnot, 'f', 1)
+            << "  -> dat them " << QString::number(overheadPct, 'f', 1) << "% so voi render tran\n";
+        out.flush();
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --flagbench <input.pdf> <page_1based>
+    // Benchmark: render one page with 5 flag combos, 3 runs each, report avg ms + save PNGs.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--flagbench")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageIdx = QString::fromLocal8Bit(argv[3]).toInt() - 1; // 1-based → 0-based
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        if (!doc) {
+            out << "FLAGBENCH: FAIL cannot open " << inputPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc);
+        if (pageIdx < 0 || pageIdx >= pageCount) {
+            out << "FLAGBENCH: FAIL page " << (pageIdx + 1) << " out of range (pages=" << pageCount << ")\n"; out.flush();
+            FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+
+        // Load page ONCE, reuse for all renders
+        QMutexLocker lock(&s_pdfiumMutex);
+        FPDF_PAGE page = FPDF_LoadPage(doc, pageIdx);
+        if (!page) {
+            out << "FLAGBENCH: FAIL cannot load page " << (pageIdx + 1) << "\n"; out.flush();
+            FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+        lock.unlock();
+
+        double pageW = FPDF_GetPageWidth(page);
+        double pageH = FPDF_GetPageHeight(page);
+        int W = 2000;
+        int H = static_cast<int>(pageW > 0 ? (pageH / pageW * W) : 2000);
+        if (H < 1) H = 1;
+
+        // 5 flag combinations
+        struct Combo { const char label; const char* name; int flags; };
+        // ponytail: FPDF_RENDER_NO_NATIVETEXT = 0x800 (not in this pdfium header)
+        const int NO_NATIVETEXT = 0x800;
+        const Combo combos[] = {
+            {'A', "FPDF_ANNOT|LIMITEDIMAGECACHE",              FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE},
+            {'B', "A|NO_SMOOTHPATH",                           FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE | FPDF_RENDER_NO_SMOOTHPATH},
+            {'C', "A|NO_SMOOTHPATH|NO_SMOOTHTEXT|NO_SMOOTHIMAGE", FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE | FPDF_RENDER_NO_SMOOTHPATH | FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHIMAGE},
+            {'D', "FPDF_ANNOT (no LIMITEDIMAGECACHE)",         FPDF_ANNOT},
+            {'E', "A|LIMITEDIMAGECACHE|NO_NATIVETEXT",         FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE | NO_NATIVETEXT},
+        };
+
+        double avgMs[5] = {};
+        QString outDir = QDir::currentPath();
+
+        for (int c = 0; c < 5; ++c) {
+            qint64 total = 0;
+            for (int r = 0; r < 3; ++r) {
+                QImage img(W, H, QImage::Format_ARGB32);
+                img.fill(Qt::white);
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_BITMAP bmp = FPDFBitmap_CreateEx(W, H, FPDFBitmap_BGRA,
+                                                      img.bits(), img.bytesPerLine());
+                QElapsedTimer t; t.start();
+                FPDF_RenderPageBitmap(bmp, page, 0, 0, W, H, 0, combos[c].flags);
+                qint64 ms = t.elapsed();
+                FPDFBitmap_Destroy(bmp);
+                lk.unlock();
+                total += ms;
+                if (r == 0) {
+                    QString fn = outDir + QString("/flag_%1.png").arg(combos[c].label);
+                    img.save(fn, "PNG");
+                }
+            }
+            avgMs[c] = static_cast<double>(total) / 3.0;
+            out << combos[c].label << ": ms=" << QString::number(avgMs[c], 'f', 1) << "\n";
+        }
+
+        // Find fastest
+        int fastest = 0;
+        for (int i = 1; i < 5; ++i)
+            if (avgMs[i] < avgMs[fastest]) fastest = i;
+        double pctSaved = avgMs[0] > 0 ? ((avgMs[0] - avgMs[fastest]) / avgMs[0] * 100.0) : 0.0;
+        out << "KET LUAN: nhanh nhat=" << combos[fastest].label
+            << " giam " << QString::number(pctSaved, 'f', 1) << "% so voi A\n";
+        out.flush();
+
+        FPDF_ClosePage(page);
+        FPDF_CloseDocument(doc);
         PdfDocument::libRelease();
         return 0;
     }

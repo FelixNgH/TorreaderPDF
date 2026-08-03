@@ -48,7 +48,8 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     };
 
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
+    const bool sharedPg = (m_annotMgr && m_annotMgr->isSharedPage(pageIndex));
+    FPDF_PAGE page = sharedPg ? m_annotMgr->acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
     if (!page) return;
 
     double pageH  = FPDF_GetPageHeight(page);
@@ -58,7 +59,7 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     // Line & Arrow → INK annotation. A bare FPDF_ANNOT_LINE (no /L, no AP) is dropped on save.
     if (tool == AnnotTool::Line || tool == AnnotTool::Arrow) {
         FPDF_ANNOTATION ink = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
-        if (!ink) { FPDF_ClosePage(page); return; }
+        if (!ink) { if (!sharedPg) FPDF_ClosePage(page); return; }
         QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
         QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
         FS_POINTF a{ static_cast<float>(pa.x()), static_cast<float>(pa.y()) };
@@ -99,9 +100,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
         setUid(ink);
         setTool(ink);
+        AnnotVisual _av;
+        bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ink, pageIndex, _av);
         FPDFPage_CloseAnnot(ink);
-        FPDF_ClosePage(page);
+        if (!sharedPg) FPDF_ClosePage(page);
         lock.unlock();
+        if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+        if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
         return;
     }
@@ -109,9 +114,9 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     // Freehand → INK annotation from collected points
     if (tool == AnnotTool::Freehand) {
         FPDF_ANNOTATION ink = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
-        if (!ink) { FPDF_ClosePage(page); return; }
+        if (!ink) { if (!sharedPg) FPDF_ClosePage(page); return; }
         int n = freehand.size();
-        if (n == 0) { FPDFPage_CloseAnnot(ink); FPDF_ClosePage(page); return; }
+        if (n == 0) { FPDFPage_CloseAnnot(ink); if (!sharedPg) FPDF_ClosePage(page); return; }
         std::vector<FS_POINTF> pts(n);
         float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
         for (int i = 0; i < n; ++i) {
@@ -135,9 +140,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
         setUid(ink);
         setTool(ink);
+        AnnotVisual _av;
+        bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ink, pageIndex, _av);
         FPDFPage_CloseAnnot(ink);
-        FPDF_ClosePage(page);
+        if (!sharedPg) FPDF_ClosePage(page);
         lock.unlock();
+        if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+        if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
         return;
     }
@@ -145,7 +154,7 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     // Cloud → INK annotation tracing a scalloped (cloud) outline. Reliable render like Line/Arrow.
     if (tool == AnnotTool::Cloud) {
         FPDF_ANNOTATION ck = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
-        if (!ck) { FPDF_ClosePage(page); return; }
+        if (!ck) { if (!sharedPg) FPDF_ClosePage(page); return; }
         QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
         QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
         float x0 = static_cast<float>(qMin(pa.x(), pb.x()));
@@ -192,9 +201,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ck, 0.0f, 0.0f, style.strokeWidth);
         setUid(ck);
         setTool(ck);
+        AnnotVisual _av;
+        bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ck, pageIndex, _av);
         FPDFPage_CloseAnnot(ck);
-        FPDF_ClosePage(page);
+        if (!sharedPg) FPDF_ClosePage(page);
         lock.unlock();
+        if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+        if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
         return;
     }
@@ -202,7 +215,7 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     // Highlight with text-bound QuadPoints (fallback to rect if no text)
     if (tool == AnnotTool::Highlight) {
         FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_HIGHLIGHT);
-        if (!annot) { FPDF_ClosePage(page); return; }
+        if (!annot) { if (!sharedPg) FPDF_ClosePage(page); return; }
 
         QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
         QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
@@ -256,7 +269,7 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         if (rw < 1.0f && rh < 1.0f) {
             FPDFText_ClosePage(textPage);
             FPDFPage_CloseAnnot(annot);
-            FPDF_ClosePage(page);
+            if (!sharedPg) FPDF_ClosePage(page);
             lock.unlock();
             return;
         }
@@ -276,9 +289,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         }
         setUid(annot);
         setTool(annot);
+        AnnotVisual _av;
+        bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, annot, pageIndex, _av);
         FPDFPage_CloseAnnot(annot);
-        FPDF_ClosePage(page);
+        if (!sharedPg) FPDF_ClosePage(page);
         lock.unlock();
+        if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+        if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
         return;
     }
@@ -293,15 +310,15 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         case AnnotTool::Strikethrough: subtype = FPDF_ANNOT_STRIKEOUT; break;
         case AnnotTool::FreeText:
             // Handled via noteRequested signal, not via PDF annotation
-            FPDF_ClosePage(page);
+            if (!sharedPg) FPDF_ClosePage(page);
             return;
         default:
-            FPDF_ClosePage(page);
+            if (!sharedPg) FPDF_ClosePage(page);
             return;
     }
 
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, subtype);
-    if (!annot) { FPDF_ClosePage(page); return; }
+    if (!annot) { if (!sharedPg) FPDF_ClosePage(page); return; }
 
     QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
     QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
@@ -340,9 +357,13 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
 
     setUid(annot);
     setTool(annot);
+    AnnotVisual _av;
+    bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, annot, pageIndex, _av);
     FPDFPage_CloseAnnot(annot);
-    FPDF_ClosePage(page);
+    if (!sharedPg) FPDF_ClosePage(page);
     lock.unlock();
 
+    if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+    if (_avOk) emit annotVisualAdded(pageIndex, _av);
     emit annotationAdded(pageIndex);
 }

@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "PdfRenderer.h"
+#include "../annotations/AnnotationManager.h"
 #include <QMutex>
 #include <QMutexLocker>
 #include <QFile>
@@ -36,19 +37,46 @@ public:
     }
 };
 
+class OwnAnnotHideGuard {
+    FPDF_PAGE m_page;
+    QVector<int> m_hidden;
+    bool m_active;
+public:
+    explicit OwnAnnotHideGuard(FPDF_PAGE page, bool active) : m_page(page), m_active(active) {
+        if (!m_active || !m_page) return;
+        const int n = FPDFPage_GetAnnotCount(m_page);
+        for (int i = 0; i < n; ++i) {
+            FPDF_ANNOTATION a = FPDFPage_GetAnnot(m_page, i);
+            if (!a) continue;
+            const int flags = FPDFAnnot_GetFlags(a);
+            if (FPDFAnnot_HasKey(a, "TRUID") && !(flags & FPDF_ANNOT_FLAG_HIDDEN)) {
+                FPDFAnnot_SetFlags(a, flags | FPDF_ANNOT_FLAG_HIDDEN);
+                m_hidden.append(i);
+            }
+            FPDFPage_CloseAnnot(a);
+        }
+    }
+    ~OwnAnnotHideGuard() {
+        if (!m_active) return;
+        for (int i : m_hidden) {
+            FPDF_ANNOTATION a = FPDFPage_GetAnnot(m_page, i);
+            if (!a) continue;
+            FPDFAnnot_SetFlags(a, FPDFAnnot_GetFlags(a) & ~FPDF_ANNOT_FLAG_HIDDEN);
+            FPDFPage_CloseAnnot(a);
+        }
+    }
+};
+
 std::atomic<int> PdfRenderer::s_renderCount{0};
+std::atomic<qint64> PdfRenderer::s_globalCacheBytes{0};
 
 // ── PageRenderTask ────────────────────────────────────────────────────────────
 
 PageRenderTask::PageRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc, RenderRequest req,
                                QObject* receiver,
-                               std::shared_ptr<QAtomicInt> genRef,
-                               FormibDocPtr formibDoc,
-                               std::shared_ptr<FormibGate> gate)
+                               std::shared_ptr<QAtomicInt> genRef)
     : m_renderer(renderer), m_pdfDoc(pdfDoc), m_req(req)
     , m_genRef(std::move(genRef))
-    , m_formibDoc(std::move(formibDoc))
-    , m_gate(std::move(gate))
 {
     setAutoDelete(true);
     connect(this, &PageRenderTask::finished, receiver,
@@ -67,79 +95,9 @@ void PageRenderTask::run() {
              << "fullQuality=" << m_req.fullQuality
              << "thread=" << QThread::currentThreadId();
 
-    // ── Try FormibPDF (no global mutex, fully parallel) ─────────────────────
-    bool isPreviewScale = m_req.scaleFactor <= 0.16;
-    bool tryFormib = isPreviewScale && m_formibDoc && (!m_gate || m_gate->shouldTry(m_req.pageIndex));
-    if (tryFormib && formibpdf_page_count(m_formibDoc.get()) > 0) {
-        double wPt = 0, hPt = 0;
-        bool sizeOk = formibpdf_page_size(m_formibDoc.get(),
-                                static_cast<uint32_t>(m_req.pageIndex),
-                                &wPt, &hPt) && wPt > 0 && hPt > 0;
-        if (sizeOk && qMax(wPt, hPt) > 8000.0) {
-            if (m_gate) m_gate->skipPage(m_req.pageIndex);
-            qDebug() << "[Renderer]   FormibPDF skip oversized page" << m_req.pageIndex
-                     << "(" << wPt << "x" << hPt << ")";
-        } else if (sizeOk) {
-            double scale = m_req.scaleFactor;
-            int imgW = qMax(1, static_cast<int>(wPt * scale));
-            int imgH = qMax(1, static_cast<int>(hPt * scale));
-            double maxDim = m_req.fullQuality ? 4000.0 : PdfRenderer::kThumbMaxPx;
-            if (qMax(imgW, imgH) > maxDim) {
-                double cap = maxDim / qMax(imgW, imgH);
-                imgW = qMax(1, static_cast<int>(imgW * cap));
-                imgH = qMax(1, static_cast<int>(imgH * cap));
-            }
-            qDebug() << "[Renderer]   FormibPDF page=" << m_req.pageIndex
-                     << "ptSize=(" << wPt << "x" << hPt << ")"
-                     << "px=(" << imgW << "x" << imgH << ")";
-            QImage fimg(imgW, imgH, QImage::Format_RGBA8888);
-            bool ok = formibpdf_render_page(
-                m_formibDoc.get(),
-                static_cast<uint32_t>(m_req.pageIndex),
-                static_cast<uint32_t>(imgW),
-                static_cast<uint32_t>(imgH),
-                fimg.bits());
-            qDebug() << "[Renderer]   FormibPDF render ok=" << ok;
-            if (ok && !fimg.isNull()) {
-                const QRgb* px = reinterpret_cast<const QRgb*>(fimg.constBits());
-                int total = imgW * imgH;
-                int sampleStep = qMax(1, total / 256);
-                int sampled  = 0;
-                int nonWhite = 0;
-                int nearBlack = 0;
-                for (int i = 0; i < total; i += sampleStep) {
-                    QRgb c = px[i];
-                    ++sampled;
-                    if ((c & 0x00FFFFFF) != 0x00FFFFFF) ++nonWhite;
-                    if (qRed(c) + qGreen(c) + qBlue(c) < 60) ++nearBlack;
-                }
-                double blackFrac = sampled > 0 ? (double)nearBlack / sampled : 0.0;
-                bool hasContent  = nonWhite > 2;
-                bool looksBroken = blackFrac > 0.60;
-                if (hasContent && !looksBroken) {
-                    if (m_genRef->loadRelaxed() != m_req.generation) {
-                        emit finished(m_req.pageIndex, QImage()); return;
-                    }
-                    if (m_gate) m_gate->recordAccept();
-                    qDebug() << "[Renderer]   -> USING FormibPDF for page" << m_req.pageIndex;
-                    emit finished(m_req.pageIndex,
-                                  fimg.convertToFormat(QImage::Format_ARGB32));
-                    return;
-                }
-                if (m_gate) m_gate->recordReject(m_req.pageIndex);
-            } else {
-                if (m_gate) m_gate->recordReject(m_req.pageIndex);
-                qDebug() << "[Renderer]   -> FormibPDF FAILED, fallback to PDFium page" << m_req.pageIndex;
-            }
-        } else {
-            if (m_gate) m_gate->recordReject(m_req.pageIndex);
-            qDebug() << "[Renderer]   FormibPDF page_size FAILED for page" << m_req.pageIndex;
-        }
-    }
-
     QImage image;
     if (m_genRef->loadRelaxed() != m_req.generation) {
-        qDebug() << "[perf] drop page=" << m_req.pageIndex << "reason=genMismatchPostFormib thread=" << QThread::currentThreadId();
+        qDebug() << "[perf] drop page=" << m_req.pageIndex << "reason=genMismatchPreLock thread=" << QThread::currentThreadId();
         emit finished(m_req.pageIndex, QImage()); return;
     }
 
@@ -155,6 +113,8 @@ void PageRenderTask::run() {
 
         FPDF_PAGE page = m_renderer->acquirePage(m_req.pageIndex);
         if (!page) { emit finished(m_req.pageIndex, QImage()); return; }
+
+        OwnAnnotHideGuard _ah(page, m_req.hideOwnAnnots);
 
         double w = FPDF_GetPageWidth(page);
         double h = FPDF_GetPageHeight(page);
@@ -206,13 +166,9 @@ void PageRenderTask::run() {
 // ── ProgressiveRenderTask ─────────────────────────────────────────────────────
 
 ProgressiveRenderTask::ProgressiveRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc, RenderRequest req,
-                                             QObject* receiver, std::shared_ptr<QAtomicInt> genRef,
-                                             FormibDocPtr formibDoc,
-                                             std::shared_ptr<FormibGate> gate)
+                                             QObject* receiver, std::shared_ptr<QAtomicInt> genRef)
     : m_renderer(renderer), m_pdfDoc(pdfDoc), m_req(req)
     , m_genRef(std::move(genRef))
-    , m_formibDoc(std::move(formibDoc))
-    , m_gate(std::move(gate))
 {
     setAutoDelete(true);
     connect(this, &ProgressiveRenderTask::finished, receiver,
@@ -239,76 +195,7 @@ void ProgressiveRenderTask::run() {
              << "fullQuality=" << m_req.fullQuality
              << "thread=" << QThread::currentThreadId();
 
-    // ── Try FormibPDF (non-progressive, same as PageRenderTask) ────────────────
-    bool isPreviewScale = m_req.scaleFactor <= 0.16;
-    bool tryFormib = isPreviewScale && m_formibDoc && (!m_gate || m_gate->shouldTry(m_req.pageIndex));
-    if (tryFormib && formibpdf_page_count(m_formibDoc.get()) > 0) {
-        double wPt = 0, hPt = 0;
-        bool sizeOk = formibpdf_page_size(m_formibDoc.get(),
-                                static_cast<uint32_t>(m_req.pageIndex),
-                                &wPt, &hPt) && wPt > 0 && hPt > 0;
-        if (sizeOk && qMax(wPt, hPt) > 8000.0) {
-            if (m_gate) m_gate->skipPage(m_req.pageIndex);
-            qDebug() << "[Renderer]   FormibPDF skip oversized page" << m_req.pageIndex
-                     << "(" << wPt << "x" << hPt << ")";
-        } else if (sizeOk) {
-            double scale = m_req.scaleFactor;
-            int imgW = qMax(1, static_cast<int>(wPt * scale));
-            int imgH = qMax(1, static_cast<int>(hPt * scale));
-            double maxDim = m_req.fullQuality ? 4000.0 : PdfRenderer::kThumbMaxPx;
-            if (qMax(imgW, imgH) > maxDim) {
-                double cap = maxDim / qMax(imgW, imgH);
-                imgW = qMax(1, static_cast<int>(imgW * cap));
-                imgH = qMax(1, static_cast<int>(imgH * cap));
-            }
-            qDebug() << "[Renderer]   FormibPDF page=" << m_req.pageIndex
-                     << "ptSize=(" << wPt << "x" << hPt << ")"
-                     << "px=(" << imgW << "x" << imgH << ")";
-            QImage fimg(imgW, imgH, QImage::Format_RGBA8888);
-            bool ok = formibpdf_render_page(
-                m_formibDoc.get(),
-                static_cast<uint32_t>(m_req.pageIndex),
-                static_cast<uint32_t>(imgW),
-                static_cast<uint32_t>(imgH),
-                fimg.bits());
-            qDebug() << "[Renderer]   FormibPDF render ok=" << ok;
-            if (ok && !fimg.isNull()) {
-                const QRgb* px = reinterpret_cast<const QRgb*>(fimg.constBits());
-                int total = imgW * imgH;
-                int sampleStep = qMax(1, total / 256);
-                int sampled  = 0;
-                int nonWhite = 0;
-                int nearBlack = 0;
-                for (int i = 0; i < total; i += sampleStep) {
-                    QRgb c = px[i];
-                    ++sampled;
-                    if ((c & 0x00FFFFFF) != 0x00FFFFFF) ++nonWhite;
-                    if (qRed(c) + qGreen(c) + qBlue(c) < 60) ++nearBlack;
-                }
-                double blackFrac = sampled > 0 ? (double)nearBlack / sampled : 0.0;
-                bool hasContent  = nonWhite > 2;
-                bool looksBroken = blackFrac > 0.60;
-                if (hasContent && !looksBroken) {
-                    if (m_genRef->loadRelaxed() != m_req.generation) {
-                        emit finished(m_req.pageIndex, QImage()); return;
-                    }
-                    if (m_gate) m_gate->recordAccept();
-                    qDebug() << "[Renderer]   -> USING FormibPDF for page" << m_req.pageIndex;
-                    emit finished(m_req.pageIndex,
-                                  fimg.convertToFormat(QImage::Format_ARGB32));
-                    return;
-                }
-                if (m_gate) m_gate->recordReject(m_req.pageIndex);
-            } else {
-                if (m_gate) m_gate->recordReject(m_req.pageIndex);
-                qDebug() << "[Renderer]   -> FormibPDF FAILED, fallback to PDFium page" << m_req.pageIndex;
-            }
-        } else {
-            if (m_gate) m_gate->recordReject(m_req.pageIndex);
-            qDebug() << "[Renderer]   FormibPDF page_size FAILED for page" << m_req.pageIndex;
-        }
-    }
-
+    std::unique_ptr<OwnAnnotHideGuard> _ahGuard;
     QElapsedTimer renderTimer;
     renderTimer.start();
 
@@ -323,6 +210,9 @@ void ProgressiveRenderTask::run() {
 
         m_fpdfPage = m_renderer->acquirePage(m_req.pageIndex);
         if (!m_fpdfPage) { emit finished(m_req.pageIndex, QImage()); return; }
+
+        if (m_req.hideOwnAnnots)
+            _ahGuard = std::make_unique<OwnAnnotHideGuard>(m_fpdfPage, true);
 
         double w = FPDF_GetPageWidth(m_fpdfPage);
         double h = FPDF_GetPageHeight(m_fpdfPage);
@@ -413,6 +303,8 @@ void ProgressiveRenderTask::run() {
             FPDF_RenderPage_Close(m_fpdfPage);
         if (m_bmp) { FPDFBitmap_Destroy(m_bmp); m_bmp = nullptr; }
 
+        _ahGuard.reset();  // unhide our annots before closing page
+
         int objCount = 0;
         if (m_fpdfPage) {
             objCount = FPDFPage_CountObjects(m_fpdfPage);
@@ -446,12 +338,14 @@ RegionRenderTask::RegionRenderTask(PdfRenderer* renderer, PdfDocument* pdfDoc,
                                    int pageIndex, double scale, QRect regionPx,
                                    QObject* receiver,
                                    std::shared_ptr<QAtomicInt> genRef,
-                                   bool renderAnnotations)
+                                   bool renderAnnotations,
+                                   bool hideOwnAnnots)
     : m_renderer(renderer), m_pdfDoc(pdfDoc)
     , m_pageIndex(pageIndex), m_scale(scale), m_regionPx(regionPx)
     , m_genRef(std::move(genRef))
     , m_reqGen(m_genRef ? m_genRef->loadRelaxed() : 0)
     , m_renderAnnotations(renderAnnotations)
+    , m_hideOwnAnnots(hideOwnAnnots)
 {
     setAutoDelete(true);
     connect(this, &RegionRenderTask::finished, receiver,
@@ -470,53 +364,96 @@ void RegionRenderTask::run() {
         emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
     }
 
-    TimedMutexLocker lock(s_pdfiumMutex, "RegionRenderTask::run");
-    if (!m_genRef || m_genRef->loadRelaxed() != m_reqGen) {
-        emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
+    // ── Step 1: Start — lock, load page, create bitmap, FPDF_RenderPageBitmap_Start ──
+    {
+        TimedMutexLocker lock(s_pdfiumMutex, "RegionRenderTask::Start");
+        if (m_genRef->loadRelaxed() != m_reqGen) {
+            emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
+        }
+
+        m_fpdfPage = m_renderer->acquirePage(m_pageIndex);
+        if (!m_fpdfPage) {
+            emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
+        }
+
+        OwnAnnotHideGuard _ah(m_fpdfPage, m_hideOwnAnnots);
+
+        double wPt = FPDF_GetPageWidth(m_fpdfPage);
+        double hPt = FPDF_GetPageHeight(m_fpdfPage);
+        double fullW = qMax(1.0, wPt * m_scale);
+        double fullH = qMax(1.0, hPt * m_scale);
+        m_bmpW = rw;
+        m_bmpH = rh;
+
+        m_image = QImage(m_bmpW, m_bmpH, QImage::Format_ARGB32);
+        m_image.fill(Qt::white);
+        m_bmp = FPDFBitmap_CreateEx(m_bmpW, m_bmpH, FPDFBitmap_BGRA,
+                                     m_image.bits(), m_image.bytesPerLine());
+
+        ProgressivePauseCtx pctx;
+        pctx.timer.start();
+        IFSDK_PAUSE pause;
+        pause.version = 1;
+        pause.NeedToPauseNow = ProgressiveNeedToPauseNow;
+        pause.user = &pctx;
+
+        PdfRenderer::s_renderCount.fetch_add(1);
+        { int rflags = FPDF_RENDER_LIMITEDIMAGECACHE;
+          if (m_renderAnnotations) rflags |= FPDF_ANNOT;
+          m_renderStatus = FPDF_RenderPageBitmap_Start(m_bmp, m_fpdfPage,
+                                                        -m_regionPx.x(), -m_regionPx.y(),
+                                                        static_cast<int>(fullW),
+                                                        static_cast<int>(fullH),
+                                                        0, rflags, &pause); }
+        // Mutex unlocked here — other threads can use PDFium between slices
     }
 
-    FPDF_PAGE page = m_renderer->acquirePage(m_pageIndex);
-    if (!page) {
-        emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
-    }
+    // ── Step 2: Continue loop — lock per slice, unlock between ──────────────────
+    while (m_renderStatus == FPDF_RENDER_TOBECONTINUED) {
+        if (m_genRef->loadRelaxed() != m_reqGen) {
+            qDebug() << "[perf] region HUY giua chung page=" << m_pageIndex;
+            break;
+        }
 
-    double wPt = FPDF_GetPageWidth(page);
-    double hPt = FPDF_GetPageHeight(page);
-    int fullW = qMax(1, static_cast<int>(wPt * m_scale));
-    int fullH = qMax(1, static_cast<int>(hPt * m_scale));
+        {
+            TimedMutexLocker lock(s_pdfiumMutex, "RegionRenderTask::Continue");
+            ProgressivePauseCtx pctx;
+            pctx.timer.start();
+            IFSDK_PAUSE pause;
+            pause.version = 1;
+            pause.NeedToPauseNow = ProgressiveNeedToPauseNow;
+            pause.user = &pctx;
 
-    QImage image(rw, rh, QImage::Format_ARGB32);
-    image.fill(Qt::white);
-    FPDF_BITMAP bmp = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA,
-                                           image.bits(), image.bytesPerLine());
-    PdfRenderer::s_renderCount.fetch_add(1);
-    { int rflags = FPDF_RENDER_LIMITEDIMAGECACHE;
-      if (m_renderAnnotations) rflags |= FPDF_ANNOT;
-    FPDF_RenderPageBitmap(bmp, page,
-                          -m_regionPx.x(), -m_regionPx.y(),
-                          fullW, fullH, 0, rflags); }
-    if (m_pdfDoc && FPDF_GetFormType(m_pdfDoc->raw()) != FORMTYPE_NONE) {
-        FPDF_FORMFILLINFO ffi;
-        memset(&ffi, 0, sizeof(ffi));
-        ffi.version = 2;
-        FPDF_FORMHANDLE form = FPDFDOC_InitFormFillEnvironment(m_pdfDoc->raw(), &ffi);
-        if (form) {
-            FORM_OnAfterLoadPage(page, form);
-            FPDF_FFLDraw(form, bmp, page,
-                         -m_regionPx.x(), -m_regionPx.y(),
-                         fullW, fullH, 0, FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE);
-            FORM_OnBeforeClosePage(page, form);
-            FPDFDOC_ExitFormFillEnvironment(form);
+            m_renderStatus = FPDF_RenderPage_Continue(m_fpdfPage, &pause);
+            // Mutex unlocked here — other threads can use PDFium between slices
         }
     }
-    FPDFBitmap_Destroy(bmp);
-    FPDF_ClosePage(page);
 
-    if (!m_genRef || m_genRef->loadRelaxed() != m_reqGen) {
-        emit finished(m_pageIndex, m_scale, m_regionPx, QImage()); return;
+    // ── Step 3: Close — lock, cleanup resources ─────────────────────────────────
+    {
+        TimedMutexLocker lock(s_pdfiumMutex, "RegionRenderTask::Close");
+        if (m_renderStatus == FPDF_RENDER_TOBECONTINUED || m_renderStatus == FPDF_RENDER_DONE)
+            FPDF_RenderPage_Close(m_fpdfPage);
+        if (m_bmp) { FPDFBitmap_Destroy(m_bmp); m_bmp = nullptr; }
+        if (m_fpdfPage) {
+            FPDF_ClosePage(m_fpdfPage);
+            m_fpdfPage = nullptr;
+        }
     }
 
-    emit finished(m_pageIndex, m_scale, m_regionPx, image);
+    if (m_renderStatus == FPDF_RENDER_FAILED) {
+        qDebug() << "[perf] region render FAILED page=" << m_pageIndex;
+        emit finished(m_pageIndex, m_scale, m_regionPx, QImage());
+        return;
+    }
+
+    if (m_genRef->loadRelaxed() != m_reqGen) {
+        qDebug() << "[perf] region HUY sau render page=" << m_pageIndex;
+        emit finished(m_pageIndex, m_scale, m_regionPx, QImage());
+        return;
+    }
+
+    emit finished(m_pageIndex, m_scale, m_regionPx, std::move(m_image));
 }
 
 // ── TileBatchRenderTask ────────────────────────────────────────────────────────
@@ -526,13 +463,15 @@ TileBatchRenderTask::TileBatchRenderTask(PdfRenderer* renderer, PdfDocument* pdf
                                          QVector<QPoint> tiles,
                                          QObject* receiver,
                                          std::shared_ptr<QAtomicInt> genRef,
-                                         bool renderAnnotations)
+                                         bool renderAnnotations,
+                                         bool hideOwnAnnots)
     : m_renderer(renderer), m_pdfDoc(pdfDoc)
     , m_pageIndex(pageIndex), m_scale(scale)
     , m_tiles(std::move(tiles))
     , m_genRef(std::move(genRef))
     , m_reqGen(m_genRef ? m_genRef->loadRelaxed() : 0)
     , m_renderAnnotations(renderAnnotations)
+    , m_hideOwnAnnots(hideOwnAnnots)
 {
     setAutoDelete(true);
     connect(this, &TileBatchRenderTask::tileDone, receiver,
@@ -557,6 +496,8 @@ void TileBatchRenderTask::run() {
         if (!page) {
             emit tileDone(m_pageIndex, m_scale, 0, 0, QImage()); return;
         }
+
+        OwnAnnotHideGuard _ah(page, m_hideOwnAnnots);
 
         double wPt = FPDF_GetPageWidth(page);
         double hPt = FPDF_GetPageHeight(page);
@@ -640,7 +581,6 @@ PdfRenderer::PdfRenderer(QObject* parent)
     , m_fullRenderGen(std::make_shared<QAtomicInt>(0))
     , m_progressiveGen(std::make_shared<QAtomicInt>(0))
     , m_continuousGen(std::make_shared<QAtomicInt>(0))
-    , m_formibGate(std::make_shared<FormibGate>())
 {
     const int cpus = qMax(1, QThread::idealThreadCount());
     m_thumbPool.setMaxThreadCount(qMax(2, cpus / 2));
@@ -650,12 +590,13 @@ PdfRenderer::PdfRenderer(QObject* parent)
 }
 
 PdfRenderer::~PdfRenderer() {
+    s_globalCacheBytes.fetch_sub(m_cacheBytes);
+    m_cacheBytes = 0;
     m_generation->fetchAndAddOrdered(999);
     m_thumbPool.waitForDone();
     m_mainPool.waitForDone();
     if (s_renderCount.load() > 0)
         qDebug() << "[Renderer] total FPDF_RenderPageBitmap calls:" << s_renderCount.load();
-    m_formibDoc.reset();
 }
 
 void PdfRenderer::setDocument(PdfDocument* doc) {
@@ -664,14 +605,9 @@ void PdfRenderer::setDocument(PdfDocument* doc) {
     m_thumbPool.waitForDone();
     m_doc = doc;
     clearCache();
-    m_formibDoc.reset();
     m_pageObjectCount.clear();
     m_pageAnnotRender.clear();
-    m_formibGate = std::make_shared<FormibGate>();
-}
-
-void PdfRenderer::setFormibDoc(FormibDocPtr doc) {
-    m_formibDoc = std::move(doc);
+    m_pageAnnotOverlay.clear();
 }
 
 void PdfRenderer::cancelPending() {
@@ -693,7 +629,7 @@ void PdfRenderer::clearStalePending() {
 
 // Single O(n log n) pass: sort entries by distance from current page, evict farthest first.
 void PdfRenderer::evictCache() {
-    if (m_cacheBytes <= kMaxCacheBytes) return;
+    if (s_globalCacheBytes.load() <= kMaxCacheBytes) return;
     using KV = QPair<int, int>;  // distance, pageIndex
     QVector<KV> byDist;
     byDist.reserve(m_cache.size());
@@ -703,12 +639,27 @@ void PdfRenderer::evictCache() {
               [](const KV& a, const KV& b) { return a.first > b.first; });
     // ponytail: always keep at least 5 pages (current ± 2)
     const int kMinKeep = 5;
-    int kept = 0;
     for (const auto& kv : byDist) {
-        if (m_cacheBytes <= kMaxCacheBytes || m_cache.size() <= kMinKeep) break;
-        ++kept;
-        m_cacheBytes -= static_cast<qint64>(m_cache[kv.second].sizeInBytes());
+        if (s_globalCacheBytes.load() <= kMaxCacheBytes || m_cache.size() <= kMinKeep) break;
+        qint64 sz = static_cast<qint64>(m_cache[kv.second].sizeInBytes());
+        m_cacheBytes -= sz;
+        s_globalCacheBytes.fetch_sub(sz);
         m_cache.remove(kv.second);
+    }
+}
+
+TileKey PdfRenderer::regionKey(int page, double scale, const QRect& r) {
+    return TileKey{ page, scale, r.x() / kRegionGrid, r.y() / kRegionGrid };
+}
+
+void PdfRenderer::evictRegionCache() {
+    while (m_regionCacheBytes > kMaxRegionCacheBytes && !m_regionOrder.isEmpty()) {
+        TileKey oldest = m_regionOrder.takeFirst();
+        auto it = m_regionCache.find(oldest);
+        if (it != m_regionCache.end()) {
+            m_regionCacheBytes -= it->img.sizeInBytes();
+            m_regionCache.erase(it);
+        }
     }
 }
 
@@ -725,12 +676,6 @@ static qint64 pendingCacheKey(int pageIndex, bool fullQuality) {
 
 void PdfRenderer::requestPage(int pageIndex, double scale) {
     if (!m_doc || !m_doc->isOpen()) return;
-
-    // If FormibPDF proved unable to handle this document, free its in-memory copy
-    if (m_formibDoc && m_formibGate && m_formibGate->disabled.load()) {
-        qDebug() << "[Renderer] FormibPDF disabled for this document — freeing FormibDoc, using PDFium only";
-        m_formibDoc.reset();
-    }
 
     bool isThumb      = (scale <= 0.25);
     bool fullQuality  = !isThumb;
@@ -751,6 +696,10 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
                 qDebug() << "[perf] cache hit page=" << pageIndex << "source=disk thread=" << QThread::currentThreadId();
                 m_cache.insert(pageIndex, cached);
                 m_cacheBytes += static_cast<qint64>(cached.sizeInBytes());
+                s_globalCacheBytes.fetch_add(static_cast<qint64>(cached.sizeInBytes()));
+                qDebug() << "[perf] cache add page=" << pageIndex
+                         << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                         << "pages(tab)=" << m_cache.size();
                 evictCache();
                 emit pageReady(pageIndex, cached);
                 return;
@@ -784,12 +733,12 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
     }
 
     bool renderAnnots = m_pageAnnotRender.value(pageIndex, true);
-    RenderRequest req{pageIndex, scale, renderAnnots, fullQuality, gen};
+    bool hideOwn = renderAnnots && m_pageAnnotOverlay.value(pageIndex, false);
+    RenderRequest req{pageIndex, scale, renderAnnots, fullQuality, gen, hideOwn};
 
     if (fullQuality) {
         auto* ptask = new ProgressiveRenderTask(this, m_doc, req, this,
-                                                 genRef,
-                                                 m_formibDoc, m_formibGate);
+                                                 genRef);
         connect(ptask, &ProgressiveRenderTask::finished, this,
                 [this, pageIndex, fullQuality, gen](int idx, QImage img) {
             qint64 finishedKey = pendingCacheKey(idx, fullQuality);
@@ -808,7 +757,11 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
             if (!img.isNull()) {
                 if (fullQuality && !m_cache.contains(pageIndex)) {
                     m_cacheBytes += static_cast<qint64>(img.sizeInBytes());
+                    s_globalCacheBytes.fetch_add(static_cast<qint64>(img.sizeInBytes()));
                     m_cache.insert(pageIndex, img);
+                    qDebug() << "[perf] cache add page=" << pageIndex
+                             << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                             << "pages(tab)=" << m_cache.size();
                 }
                 evictCache();
                 if (fullQuality && m_tileCache && m_tileCache->isOpen() && !m_writingCache.contains(pageIndex)) {
@@ -831,6 +784,7 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
             }
         });
         connect(ptask, &ProgressiveRenderTask::pageObjectCount, this, &PdfRenderer::setPageObjectCount);
+        connect(ptask, &ProgressiveRenderTask::pageObjectCount, this, &PdfRenderer::objectCountReady);
         connect(ptask, &ProgressiveRenderTask::pagePartial, this,
                 [this](int idx, double sc, QImage img) {
             emit pagePartial(idx, sc, img);
@@ -843,8 +797,7 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
     }
 
     auto* task = new PageRenderTask(this, m_doc, req, this,
-                                    genRef,
-                                    m_formibDoc, m_formibGate);
+                                    genRef);
 
     connect(task, &PageRenderTask::finished, this,
             [this, pageIndex, fullQuality, gen](int idx, QImage img) {
@@ -864,7 +817,11 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
         if (!img.isNull()) {
             if (fullQuality && !m_cache.contains(pageIndex)) {
                 m_cacheBytes += static_cast<qint64>(img.sizeInBytes());
+                s_globalCacheBytes.fetch_add(static_cast<qint64>(img.sizeInBytes()));
                 m_cache.insert(pageIndex, img);
+                qDebug() << "[perf] cache add page=" << pageIndex
+                         << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                         << "pages(tab)=" << m_cache.size();
             }
             evictCache();
 
@@ -889,6 +846,7 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
         }
     });
     connect(task, &PageRenderTask::pageObjectCount, this, &PdfRenderer::setPageObjectCount);
+    connect(task, &PageRenderTask::pageObjectCount, this, &PdfRenderer::objectCountReady);
 
     if (isThumb)
         m_thumbPool.start(task, 0);
@@ -898,15 +856,44 @@ void PdfRenderer::requestPage(int pageIndex, double scale) {
 
 void PdfRenderer::requestRegion(int pageIndex, double scale, QRect regionPx) {
     if (!m_doc || !m_doc->isOpen()) return;
+
+    // 2.2 Cache HIT — must be BEFORE m_regionInFlightPage and m_regionGeneration
+    {
+        const TileKey k = regionKey(pageIndex, scale, regionPx);
+        auto it = m_regionCache.constFind(k);
+        if (it != m_regionCache.constEnd() && it->rect == regionPx) {
+            qDebug() << "[perf] region CACHE HIT page=" << pageIndex << "scale=" << scale;
+            emit regionReady(pageIndex, scale, regionPx, it->img);
+            return;
+        }
+    }
+
+    if (m_regionInFlightPage == pageIndex && qAbs(m_regionInFlightScale - scale) < 1e-6 && m_regionInFlightRect == regionPx) {
+        qDebug() << "[perf] region BO QUA trung yeu cau dang chay page=" << pageIndex;
+        return;
+    }
+    m_regionInFlightPage = pageIndex;
+    m_regionInFlightScale = scale;
+    m_regionInFlightRect = regionPx;
+
     m_regionGeneration->fetchAndAddOrdered(1);
     auto genRef = m_regionGeneration;
     bool regionRenderAnnots = m_pageAnnotRender.value(pageIndex, true);
+    bool regionHideOwn = regionRenderAnnots && m_pageAnnotOverlay.value(pageIndex, false);
     auto* task = new RegionRenderTask(this, m_doc,
                                        pageIndex, scale, regionPx,
-                                       this, genRef, regionRenderAnnots);
+                                       this, genRef, regionRenderAnnots, regionHideOwn);
     connect(task, &RegionRenderTask::finished, this,
             [this](int idx, double sc, QRect reg, QImage img) {
+        m_regionInFlightPage = -1;
         if (!img.isNull()) {
+            const TileKey k = regionKey(idx, sc, reg);
+            m_regionCache.insert(k, RegionEntry{reg, img});
+            m_regionOrder.append(k);
+            m_regionCacheBytes += img.sizeInBytes();
+            evictRegionCache();
+            qDebug() << "[perf] region CACHE ghi page=" << idx
+                     << "tong=" << (m_regionCacheBytes / 1048576) << "MB";
             emit regionReady(idx, sc, reg, img);
         }
     });
@@ -926,6 +913,10 @@ bool PdfRenderer::requestFromCacheOnly(int pageIndex, double scale) {
             qDebug() << "[perf] cache-only hit disk page=" << pageIndex;
             m_cache.insert(pageIndex, cached);
             m_cacheBytes += static_cast<qint64>(cached.sizeInBytes());
+            s_globalCacheBytes.fetch_add(static_cast<qint64>(cached.sizeInBytes()));
+            qDebug() << "[perf] cache add page=" << pageIndex
+                     << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                     << "pages(tab)=" << m_cache.size();
             evictCache();
             emit pageReady(pageIndex, cached);
             return true;
@@ -965,6 +956,10 @@ bool PdfRenderer::requestFromCacheOnlyForContinuous(int pageIndex, double /*scal
                      << "renderedScale=" << renderedScale;
             m_cache.insert(pageIndex, cached);
             m_cacheBytes += static_cast<qint64>(cached.sizeInBytes());
+            s_globalCacheBytes.fetch_add(static_cast<qint64>(cached.sizeInBytes()));
+            qDebug() << "[perf] cache add page=" << pageIndex
+                     << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                     << "pages(tab)=" << m_cache.size();
             evictCache();
             emit continuousPageReady(pageIndex, cached, renderedScale);
             return true;
@@ -1003,10 +998,11 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double /*scale*/)
 
     int gen = m_continuousGen->loadRelaxed();
     bool renderAnnots = m_pageAnnotRender.value(pageIndex, true);
-    RenderRequest req{pageIndex, renderedScale, renderAnnots, true, gen};
+    bool hideOwn = renderAnnots && m_pageAnnotOverlay.value(pageIndex, false);
+    RenderRequest req{pageIndex, renderedScale, renderAnnots, true, gen, hideOwn};
 
     auto* ptask = new ProgressiveRenderTask(this, m_doc, req, this,
-                                             m_continuousGen, m_formibDoc, m_formibGate);
+                                             m_continuousGen);
 
     connect(ptask, &ProgressiveRenderTask::finished, this,
             [this, pageIndex, renderedScale, gen](int idx, QImage img) {
@@ -1021,7 +1017,11 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double /*scale*/)
         }
         if (!m_cache.contains(pageIndex)) {
             m_cacheBytes += static_cast<qint64>(img.sizeInBytes());
+            s_globalCacheBytes.fetch_add(static_cast<qint64>(img.sizeInBytes()));
             m_cache.insert(pageIndex, img);
+            qDebug() << "[perf] cache add page=" << pageIndex
+                     << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                     << "pages(tab)=" << m_cache.size();
         }
         evictCache();
 
@@ -1066,6 +1066,11 @@ void PdfRenderer::requestTiles(int page, double scale, QRect /*viewportPx*/) {
 
 void PdfRenderer::preloadAdjacent(int pageIndex, double scale) {
     if (!m_doc || !m_doc->isOpen()) return;
+    // Dang render trang chinh o chat luong day du -> KHONG preload, se cuop khoa cua no.
+    if (m_fullRenderRunning) {
+        qDebug() << "[perf] preload SKIP (full render dang chay) page=" << pageIndex;
+        return;
+    }
     int total = m_doc->pageCount();
     // Preload only 1 page each side (each full 4000px render costs ~4.4s on heavy pages)
     for (int delta : {1, -1}) {
@@ -1082,18 +1087,23 @@ void PdfRenderer::preloadAdjacent(int pageIndex, double scale) {
         int gen = m_generation->loadRelaxed();
         RenderRequest req{idx, 1.0, false, true, gen};
         auto* task = new PageRenderTask(this, m_doc, req, this,
-                                        m_generation, nullptr, nullptr);
+                                        m_generation);
         connect(task, &PageRenderTask::finished, this,
                 [this, idx](int /*idx2*/, QImage img) {
             qint64 fk = pendingCacheKey(idx, true);
             m_pendingRequests.remove(fk);
             if (!img.isNull() && !m_cache.contains(idx)) {
                 m_cacheBytes += static_cast<qint64>(img.sizeInBytes());
+                s_globalCacheBytes.fetch_add(static_cast<qint64>(img.sizeInBytes()));
                 m_cache.insert(idx, img);
+                qDebug() << "[perf] cache add page=" << idx
+                         << "global=" << (s_globalCacheBytes.load() / 1048576) << "MB"
+                         << "pages(tab)=" << m_cache.size();
                 evictCache();
             }
         });
         connect(task, &PageRenderTask::pageObjectCount, this, &PdfRenderer::setPageObjectCount);
+        connect(task, &PageRenderTask::pageObjectCount, this, &PdfRenderer::objectCountReady);
         m_thumbPool.start(task, 0);
     }
 }
@@ -1104,17 +1114,35 @@ void PdfRenderer::clearCache() {
     m_progressiveGen->fetchAndAddOrdered(1);
     m_continuousGen->fetchAndAddOrdered(1);
     m_tileGeneration->fetchAndAddOrdered(1);
-    m_cache.clear();
+    s_globalCacheBytes.fetch_sub(m_cacheBytes);
     m_cacheBytes = 0;
+    m_cache.clear();
     m_tileCacheInMem.clear();
     m_tileCacheBytes = 0;
     m_pendingTiles.clear();
+    m_regionCache.clear();
+    m_regionOrder.clear();
+    m_regionCacheBytes = 0;
     m_pageObjectCount.clear();
+    m_pageAnnotOverlay.clear();
     m_fullRenderRunning = false;
 }
 
 void PdfRenderer::invalidatePage(int pageIndex) {
-    m_cache.remove(pageIndex);
+    auto it = m_cache.find(pageIndex);
+    if (it != m_cache.end()) {
+        qint64 sz = static_cast<qint64>(it.value().sizeInBytes());
+        m_cacheBytes -= sz;
+        s_globalCacheBytes.fetch_sub(sz);
+        m_cache.erase(it);
+    }
+    for (auto rit = m_regionCache.begin(); rit != m_regionCache.end(); ) {
+        if (rit.key().page == pageIndex) {
+            m_regionCacheBytes -= rit->img.sizeInBytes();
+            m_regionOrder.removeAll(rit.key());
+            rit = m_regionCache.erase(rit);
+        } else ++rit;
+    }
     m_pageObjectCount.remove(pageIndex);
     m_generation->fetchAndAddOrdered(1);
     m_fullRenderGen->fetchAndAddOrdered(1);
