@@ -66,19 +66,6 @@ Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 <details>
 <summary>In 2.3</summary>
 
-![What's new in TorReader PDF 2.2.4](docs/screenshots/whats_new_2.2.4.png)
-
-- **Sharp zoom in Continuous scroll** — the visible area is re-rendered at true
-  resolution, so zoomed-in text stays crisp in scroll mode too, not just single-page.
-- **Freehand** and **Highlight** markup tools; Highlight snaps to the real text.
-- **Hold Shift while drawing Line/Arrow** to snap to vertical, horizontal or 45°.
-- **Find text** — `Ctrl+F` floating bar with a match counter, plus a Search tab in
-  the sidebar listing every hit with context.
-- Markup is now painted as an overlay instead of going through the page raster, so
-  adding, deleting or moving it is instant even on heavy CAD drawings.
-
-</details>
-
 ![TorReader PDF demo](docs/screenshots/demo.gif)
 ![What's new in TorReader PDF 2.3](docs/screenshots/whats_new_2.3.png)
 
