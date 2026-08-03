@@ -80,6 +80,7 @@ Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 </details>
 
 ![TorReader PDF demo](docs/screenshots/demo.gif)
+![What's new in TorReader PDF 2.3](docs/screenshots/whats_new_2.3.png)
 
 <details>
 <summary>More screenshots (viewer, dark mode, markup, digital signature, merge)</summary>
