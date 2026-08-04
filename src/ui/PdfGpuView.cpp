@@ -459,6 +459,20 @@ void PdfGpuView::paintGL() {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
         m_program->release();
+    } else if (pureVector && !m_pageSizePt.isEmpty()) {
+        // Vector thuan: khong ve raster nhung VAN phai co nen trang trang.
+        // Ve bang GL (quad trang + u_bgColor) vi net QPainter khong song sot qua
+        // beginNativePainting() tren Qt 6.2/Linux -> trang bi trong suot.
+        m_program->bind();
+        QMatrix4x4 transform = computeTransform();
+        glUniformMatrix4fv(m_uTransform, 1, GL_FALSE, transform.constData());
+        glUniform1i(m_uHasTex, 0);
+        glUniform4f(m_uBgColor, 1.0f, 1.0f, 1.0f, 1.0f);
+        {
+            QOpenGLVertexArrayObject::Binder binder(&m_vao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+        m_program->release();
     }
 
     // Overlays via QPainter (drawn on top of GL — valid inside paintGL for QOpenGLWidget)
