@@ -5,15 +5,19 @@
 [![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF?v=2)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 
-**TorReader is a lightweight, portable PDF app for Windows and Linux** — a fast
-PDF viewer that also handles the everyday jobs quickly: **merge, extract, split,
-and insert** pages, **sign PDFs** digitally, and **translate PDFs for free**.
-Everything runs **locally on your machine**, with **no installation required** —
-unzip (or `chmod +x`) and run.
+TorReader PDF is a free, portable PDF reader and editor for Windows and Linux.
+It opens large documents quickly, and it does the everyday jobs without a
+subscription: merge, split, extract and insert pages, annotate, sign with a
+certificate, and translate text in place.
 
-Open a 900MB PDF in a second or two, combine files **without losing bookmarks**,
-pull out or split pages, insert pages from another PDF, add a digital signature,
-and translate text in place — free and open-source (MIT).
+Everything runs locally on your own machine. There is no installer, no account,
+no upload, and no internet connection required — unzip it (or `chmod +x` the
+AppImage) and run it. A 900MB drawing set opens in one to two seconds, merging
+keeps every bookmark, and the whole thing is open source under the MIT licence.
+
+It was built for people who work with large technical documents — drawing sets,
+tender packages, scanned reports — on machines where installing software is
+awkward or not permitted.
 
 ### 🚀 Built for large, multi-hundred-page drawing sets
 
@@ -22,6 +26,31 @@ A1 CAD drawing set** opens fast, scrolls and pages **without freezing**, and kee
 memory low. The renderer draws each page in short, interruptible slices so the UI
 never blocks, backs it with a two-layer (memory + disk) cache, and evicts
 off-screen pages so RAM stays flat no matter how many pages you flip through.
+
+### 🔐 Official downloads — please read
+
+There are only **two** places that publish TorReader PDF:
+
+| Source | URL |
+|---|---|
+| This repository's Releases | https://github.com/FelixNgH/TorreaderPDF/releases |
+| The official website | https://torreader.cloud |
+
+Anything else is not ours. In particular, a page that calls itself an "official
+releases page" but sends you to a generic archive such as `Application-x.y.zip`
+on a third-party site is **not** TorReader PDF, whatever it is named. We have seen
+copies of this project's name and description used that way.
+
+Two checks that take five seconds and settle it:
+
+- **The download link must be on `github.com/FelixNgH/...` or `torreader.cloud`.** Nowhere else.
+- **The file name carries the product name and version** — `TorReaderPDF-2.3.0-win64.zip`,
+  `torreader_2.3.0_amd64.deb`, `TorReaderPDF-2.3.0-x86_64.AppImage`. Never a generic
+  `Application-*.zip` or a bare `setup.exe`.
+
+If you find a copy being distributed elsewhere, please
+[open an issue](https://github.com/FelixNgH/TorreaderPDF/issues) — it helps protect
+other people looking for this app.
 
 ### ⬇ Download
 
