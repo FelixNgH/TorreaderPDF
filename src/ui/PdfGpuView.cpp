@@ -526,6 +526,27 @@ void PdfGpuView::paintGL() {
             p.endNativePainting();
         }
 
+        // ── Lop annotation cua phan mem khac ──
+        // Chi can khi nen la vector thuan: luc do anh raster (von chua san chu thich cua ho)
+        // bi bo hoan toan, xem PdfGpuView.cpp khoi `!pureVector` o tren.
+        if (pureVector && m_fgnLayer && m_fgnLayer->isReady()
+            && m_fgnLayer->pageIndex() == m_pageIndex && !m_fgnLayer->image().isNull()) {
+            p.save();
+            p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            p.drawImage(QRectF(orig.x(), orig.y(), pw, ph), m_fgnLayer->image());
+            p.restore();
+        }
+
+        // Vung sac net cua lop annot, ve DE LEN lop tho 4000px
+        if (pureVector && m_fgnRegPage == m_pageIndex
+            && qAbs(m_fgnRegScale - m_zoom) < 1e-6 && !m_fgnRegImg.isNull()) {
+            p.save();
+            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+            p.drawImage(QPoint(qRound(orig.x() + m_fgnRegRect.x()),
+                               qRound(orig.y() + m_fgnRegRect.y())), m_fgnRegImg);
+            p.restore();
+        }
+
         // Highlights (display coords: Y-down, rotation applied)
         if (!m_highlights.isEmpty()) {
             p.save();
@@ -1521,6 +1542,7 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         double pageH = m_pageSizePt.height();
         double pageW = m_pageSizePt.width();
         QRectF rectPt(qMax(0.0, L), qMax(0.0, pageH - botY), qMin(Wd, pageW), qMin(Hd, pageH));
+        rectPt.translate(m_pageBoxOrigin);
         emit signatureRectPicked(m_pageIndex, rectPt);
         update();
         return;
@@ -1604,6 +1626,7 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
             double pdfYbot = pageH - pdf1.y();  // smaller PDF y (lower edge)
             // QRectF: x=left, y=smaller PDF y (.top()), w, h — matches MainWindow handler
             QRectF pageRect(pdf0.x(), pdfYbot, pdf1.x() - pdf0.x(), pdfYtop - pdfYbot);
+            pageRect.translate(m_pageBoxOrigin);
             emit textRegionSelected(m_pageIndex, pageRect, e->globalPosition().toPoint());
         }
         return;
@@ -1650,6 +1673,26 @@ void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> layer) {
         m_tileTexImg.clear();
         doneCurrent();
     }
+    update();
+}
+
+void PdfGpuView::setForeignAnnotLayer(std::shared_ptr<ForeignAnnotLayer> layer) {
+    m_fgnLayer = layer;
+    m_fgnRegPage = -1;
+    m_fgnRegImg  = {};
+    qDebug().noquote() << "[fgnlayer] set page=" << (layer ? layer->pageIndex() : -1)
+                       << "ready=" << (layer && layer->isReady());
+    update();
+}
+
+void PdfGpuView::setForeignAnnotRegion(int page, double scale, QRect regionPx, const QImage& img) {
+    if (img.isNull()) return;
+    if (page != m_pageIndex) return;
+    if (qAbs(scale - m_zoom) > 1e-6) return;
+    m_fgnRegPage  = page;
+    m_fgnRegScale = scale;
+    m_fgnRegRect  = regionPx;
+    m_fgnRegImg   = img;
     update();
 }
 

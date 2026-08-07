@@ -2,6 +2,7 @@
 #include <QObject>
 #include <QString>
 #include <QSizeF>
+#include <QPointF>
 #include <QVector>
 #include <QMutex>
 #include <QByteArray>
@@ -39,6 +40,13 @@ public:
     QSizeF pageSize(int pageIndex) const; // in points (1pt = 1/72 inch)
     // Called from render thread after LoadPage to correct /Rotate-aware dimensions.
     void updatePageSize(int pageIndex, double w, double h);
+    // Nap san goc hop trang tu luong render (giong updatePageSize). Chi ghi cache, KHONG LoadPage.
+    void updatePageBoxOrigin(int pageIndex, QPointF origin);
+
+    // Goc hop trang (CropBox.left, CropBox.bottom) trong he PDF CHUA xoay.
+    // Trang CAD/Revit thuong lay TAM trang lam goc => KHONG phai (0,0).
+    // Lazy: chi LoadPage lan dau cho moi trang roi cache (LoadPage tren trang CAD ton ~1,3s).
+    QPointF pageBoxOrigin(int pageIndex) const;
 
     FPDF_DOCUMENT raw() const { return m_doc; }
     QString filePath() const { return m_filePath; }
@@ -63,6 +71,8 @@ private:
     QByteArray      m_password;
     int             m_pageCount = 0;
     QVector<QSizeF> m_pageSizes;
+    mutable QVector<QPointF> m_pageBoxOrigins;   // song song m_pageSizes
+    mutable QVector<bool>    m_pageBoxKnown;     // da tinh chua
     mutable QMutex  m_sizesMutex;
 
     // ── Cross-platform mmap state ──────────────────────────────────────────────

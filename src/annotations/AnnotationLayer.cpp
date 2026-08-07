@@ -55,13 +55,14 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     double pageH  = FPDF_GetPageHeight(page);
     double pageW  = FPDF_GetPageWidth(page);
     int    rot    = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
     // Line & Arrow → INK annotation. A bare FPDF_ANNOT_LINE (no /L, no AP) is dropped on save.
     if (tool == AnnotTool::Line || tool == AnnotTool::Arrow) {
         FPDF_ANNOTATION ink = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (!ink) { if (!sharedPg) FPDF_ClosePage(page); return; }
-        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
-        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot, box.x(), box.y());
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot, box.x(), box.y());
         FS_POINTF a{ static_cast<float>(pa.x()), static_cast<float>(pa.y()) };
         FS_POINTF b{ static_cast<float>(pb.x()), static_cast<float>(pb.y()) };
         FS_POINTF shaft[2] = { a, b };
@@ -120,7 +121,7 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         std::vector<FS_POINTF> pts(n);
         float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
         for (int i = 0; i < n; ++i) {
-            QPointF p = dispToPdf(freehand[i].x(), freehand[i].y(), pageW, pageH, rot);
+            QPointF p = dispToPdf(freehand[i].x(), freehand[i].y(), pageW, pageH, rot, box.x(), box.y());
             pts[i] = { static_cast<float>(p.x()), static_cast<float>(p.y()) };
             x0 = qMin(x0, pts[i].x); x1 = qMax(x1, pts[i].x);
             y0 = qMin(y0, pts[i].y); y1 = qMax(y1, pts[i].y);
@@ -155,8 +156,8 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     if (tool == AnnotTool::Cloud) {
         FPDF_ANNOTATION ck = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (!ck) { if (!sharedPg) FPDF_ClosePage(page); return; }
-        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
-        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot, box.x(), box.y());
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot, box.x(), box.y());
         float x0 = static_cast<float>(qMin(pa.x(), pb.x()));
         float x1 = static_cast<float>(qMax(pa.x(), pb.x()));
         float yBot = static_cast<float>(qMin(pa.y(), pb.y()));
@@ -217,8 +218,8 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_HIGHLIGHT);
         if (!annot) { if (!sharedPg) FPDF_ClosePage(page); return; }
 
-        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
-        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+        QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot, box.x(), box.y());
+        QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot, box.x(), box.y());
         float l = static_cast<float>(qMin(pa.x(), pb.x()));
         float b = static_cast<float>(qMin(pa.y(), pb.y()));
         float r = static_cast<float>(qMax(pa.x(), pb.x()));
@@ -320,8 +321,8 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, subtype);
     if (!annot) { if (!sharedPg) FPDF_ClosePage(page); return; }
 
-    QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot);
-    QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot);
+    QPointF pa = dispToPdf(start.x(), start.y(), pageW, pageH, rot, box.x(), box.y());
+    QPointF pb = dispToPdf(end.x(), end.y(), pageW, pageH, rot, box.x(), box.y());
     FS_RECTF rect{
         static_cast<float>(qMin(pa.x(), pb.x())),
         static_cast<float>(qMin(pa.y(), pb.y())),

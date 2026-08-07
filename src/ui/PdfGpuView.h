@@ -22,6 +22,7 @@
 #include "annotations/AnnotationTypes.h"
 #include "annotations/AnnotationManager.h"
 #include "core/VectorLayer.h"
+#include "core/ForeignAnnotLayer.h"
 
 // GPU-accelerated PDF page viewer with viewport tiling.
 // Renders the page as a low-res full-page background texture plus a grid of
@@ -64,6 +65,8 @@ public:
     void setDarkMode(bool dark);
     void beginLoading();
     void setPendingPage(int pageIndex, QSizeF pageSizePt);
+    // Goc hop trang cua trang dang hien (CropBox.left, CropBox.bottom). Mac dinh (0,0).
+    void setPageBoxOrigin(const QPointF& o) { m_pageBoxOrigin = o; }
     void setTool(ViewTool tool);
     void beginSignaturePick();
     void setHighlights(const QList<QRectF>& rects);
@@ -81,6 +84,8 @@ public:
                        float fontSizePt, const QColor& ghostColor);
     void clearDragTarget();
     void setVectorLayer(std::shared_ptr<VectorLayer> layer);
+    void setForeignAnnotLayer(std::shared_ptr<ForeignAnnotLayer> layer);
+    void setForeignAnnotRegion(int page, double scale, QRect regionPx, const QImage& img);
     void setDragNote(const QRectF& rPt);
     void clearDragState();
 
@@ -152,6 +157,11 @@ private:
 
     // Vector overlay GL resources
     std::shared_ptr<VectorLayer> m_vecLayer;
+    std::shared_ptr<ForeignAnnotLayer> m_fgnLayer;
+    int    m_fgnRegPage  = -1;
+    double m_fgnRegScale = 0.0;
+    QRect  m_fgnRegRect;
+    QImage m_fgnRegImg;
     GLuint  m_vecVao = 0, m_vecVboPos = 0, m_vecVboCol = 0, m_vecVboQuad = 0, m_vecVboWidth = 0, m_vecVboDepth = 0, m_vecVboClip = 0;
     int     m_vecUploadedPage = -1;
     QOpenGLShaderProgram* m_vecProg = nullptr;
@@ -182,6 +192,7 @@ private:
     // View state
     int     m_pageIndex   = 0;
     QSizeF  m_pageSizePt;
+    QPointF m_pageBoxOrigin;   // (0,0) voi PDF thong thuong
     double  m_zoom        = 1.0;
     QPointF m_panOffset;
     double  m_flipAccum = 0.0;

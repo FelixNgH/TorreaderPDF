@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.3.0 LANGUAGES CXX)
+project(TorReader VERSION 2.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -257,6 +257,7 @@ set(SOURCES
     src/core/UpdateChecker.cpp
     src/core/GoogleAuth.cpp
     src/core/Translator.cpp
+    src/core/ForeignAnnotLayer.cpp
 
     # Annotations
     src/annotations/AnnotationLayer.cpp

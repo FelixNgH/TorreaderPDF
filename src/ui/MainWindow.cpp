@@ -14,6 +14,7 @@
 #include "core/PdfEditor.h"
 #include "core/TextSearch.h"
 #include "core/VectorLayer.h"
+#include "core/ForeignAnnotLayer.h"
 #include "annotations/AnnotationManager.h"
 #include "core/GoogleAuth.h"
 #include "core/Translator.h"
@@ -1183,7 +1184,10 @@ void MainWindow::invalidateAnnotPage(DocTab* t, int page) {
     t->visualsRev.remove(page);
     t->visualsHasForeign.remove(page);
     t->overlayCapablePage.remove(page);
-
+    if (t->fgnLayer && t->fgnLayer->pageIndex() == page) {
+        t->fgnLayer.reset();
+        if (t->view) t->view->setForeignAnnotLayer(nullptr);
+    }
 }
 
 void MainWindow::buildVectorLayer(DocTab* t, int pageIndex, bool force) {
@@ -2074,6 +2078,32 @@ void MainWindow::openFile(const QString& path) {
         if (tab->view) tab->view->setRegion(page, scale, regionPx, img);
     });
 
+    // ── Lop annot phan mem khac: dung vung sac net theo zoom ──
+    connect(tab->view, &PdfGpuView::tilesNeeded, this,
+            [this, tab](int page, double scale, QRect regionPx) {
+        if (!m_openDocs.contains(tab) || !tab->doc || !tab->doc->isOpen()) return;
+        if (!tab->visualsHasForeign.value(page, false)) return;
+        if (!baseIsVector(tab, page)) return;
+        if (!(tab->fgnLayer && tab->fgnLayer->pageIndex() == page)) return;
+        if (tab->fgnRegionBuilding) return;
+        tab->fgnRegionBuilding = true;
+        auto fl = tab->fgnLayer;
+        FPDF_DOCUMENT d = tab->doc->raw();
+        auto* wr = new QFutureWatcher<bool>(this);
+        connect(wr, &QFutureWatcher<bool>::finished, this,
+                [this, wr, tab, fl, page, scale, regionPx]{
+            wr->deleteLater();
+            tab->fgnRegionBuilding = false;
+            if (!m_openDocs.contains(tab)) return;
+            if (wr->result() && tab->view)
+                tab->view->setForeignAnnotRegion(page, scale, regionPx, fl->regionImage());
+        });
+        wr->setFuture(QtConcurrent::run([fl, d, page, scale, regionPx]{
+            QMutexLocker lk(&s_pdfiumMutex);
+            return fl->buildRegion(d, page, scale, regionPx);
+        }));
+    });
+
     // ── Annotation signals ────────────────────────────────────────────────────
     connect(tab->annotMgr.get(), &AnnotationManager::pageContentChanged, this,
             [this, tab](int page) {
@@ -2660,6 +2690,7 @@ void MainWindow::openFile(const QString& path) {
                          << "imgSize=" << img.size()
                          << "hasImage=" << tab->view->hasImage();
                 tab->view->setPage(idx, img, tab->doc->pageSize(idx));
+                tab->view->setPageBoxOrigin(tab->doc->pageBoxOrigin(idx));
                 refreshAnnotVisuals(tab, tab->currentPage);
                 if (!m_searchResults.isEmpty())
                     applySearchHighlights(m_searchResults, m_searchCurrentIdx);
@@ -2686,6 +2717,7 @@ void MainWindow::openFile(const QString& path) {
                     m_zoomEdit->setText(QString::number(qRound(tab->zoom * 100)) + "%");
             }
             tab->view->setPendingPage(0, sz);
+            tab->view->setPageBoxOrigin(tab->doc->pageBoxOrigin(0));
         }
         refreshAnnotVisuals(tab, 0);
         tab->renderer->requestPage(0, tab->zoom);
@@ -3051,15 +3083,45 @@ void MainWindow::onPageChanged(int pageIndex) {
             }));
         }
 
+        // ── Lop annot phan mem khac: chi khi trang CO annot la (hasForeign) ──
+        if (t->visualsHasForeign.value(pageIndex, false)
+            && !t->fgnBuilding.contains(pageIndex)
+            && !(t->fgnLayer && t->fgnLayer->pageIndex() == pageIndex)) {
+            int pgF = pageIndex;
+            t->fgnBuilding.insert(pgF);
+            auto fl = std::make_shared<ForeignAnnotLayer>();
+            auto* wf = new QFutureWatcher<bool>(this);
+            connect(wf, &QFutureWatcher<bool>::finished, this, [this, wf, t, pgF, fl]{
+                wf->deleteLater();
+                t->fgnBuilding.remove(pgF);
+                if (!m_openDocs.contains(t)) return;
+                if (t->currentPage != pgF) return;
+                if (wf->result()) {
+                    t->fgnLayer = fl;
+                    if (t->view) t->view->setForeignAnnotLayer(fl);
+                } else {
+                    t->fgnLayer.reset();
+                    if (t->view) t->view->setForeignAnnotLayer(nullptr);
+                }
+            });
+            FPDF_DOCUMENT df = t->doc->raw();
+            wf->setFuture(QtConcurrent::run([fl, df, pgF]{
+                QMutexLocker lk(&s_pdfiumMutex);
+                return fl->build(df, pgF, PdfRenderer::kFullRenderMaxPx);
+            }));
+        }
+
         // Show placeholder from cache immediately — NO render wait
         QImage cached = t->renderer->bestCachedForPage(pageIndex);
         QSizeF sz = t->doc->pageSize(pageIndex);
         if (!cached.isNull()) {
             t->view->setPage(pageIndex, cached, sz);
+            t->view->setPageBoxOrigin(t->doc->pageBoxOrigin(pageIndex));
         } else {
             // Show pending page immediately. Old image is cleared; placeholder thumbnail
             // is shown while full render loads (same pattern as Okular/Acrobat).
             t->view->setPendingPage(pageIndex, sz);
+            t->view->setPageBoxOrigin(t->doc->pageBoxOrigin(pageIndex));
             QImage thumb = m_thumbPanel->thumbnailForPage(pageIndex);
             if (!thumb.isNull()) {
                 qDebug() << "[perf] placeholder feed thumb page=" << pageIndex;

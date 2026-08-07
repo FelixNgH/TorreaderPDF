@@ -1167,6 +1167,7 @@ void ContinuousView::mouseReleaseEvent(QMouseEvent* event)
             // Convert to PDF coords (PDF origin is bottom-left)
             double pageH_pts = m_pageSizePt[foundPage].height();
             QRectF pageRect(left, pageH_pts - bot_s, right - left, bot_s - top_s);
+            if (m_doc) pageRect.translate(m_doc->pageBoxOrigin(foundPage));
             emit textRegionSelected(foundPage, pageRect,
                                     event->globalPosition().toPoint());
         }

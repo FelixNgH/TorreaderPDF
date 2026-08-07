@@ -2382,7 +2382,8 @@ int main(int argc, char* argv[]) {
                     }
 
                     QRectF pdfRect(left, bottomPdf, right - left, topPdf - bottomPdf);
-                    QRectF dispRect = pdfRectToDisp(pdfRect, dispW, dispH, rot);
+                    const QPointF box = pdfBoxOrigin(page);
+                    QRectF dispRect = pdfRectToDisp(pdfRect, dispW, dispH, rot, box.x(), box.y());
 
                     int snippetStart = qMax(0, charIdx - 20);
                     int snippetLen = charCount + 40;

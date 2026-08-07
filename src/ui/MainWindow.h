@@ -32,6 +32,7 @@ class UpdateChecker;
 class QTimer;
 class FindBar;
 class VectorLayer;
+class ForeignAnnotLayer;
 
 struct DocTab {
     std::unique_ptr<PdfDocument>       doc;
@@ -58,6 +59,9 @@ struct DocTab {
     QString  originalPath;        // real on-disk file — Save target & tab name source
     bool     dirty = false;       // has unsaved in-memory edits (working copy != original)
     std::shared_ptr<VectorLayer> vecLayer;  // GPU vector overlay for heavy pages
+    std::shared_ptr<ForeignAnnotLayer> fgnLayer;   // lop annot phan mem khac cho trang vector thuan
+    QSet<int> fgnBuilding;                          // trang dang dung, tranh dung chong
+    bool fgnRegionBuilding = false;
     int warmingPage = -1;
     QSet<int> vecBuilding;  // pages currently building vector layer (anti-duplicate)
     QList<MarkupUndoEntry> undoStack;

@@ -218,6 +218,7 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
     int count = FPDFPage_GetAnnotCount(page);
 
     QElapsedTimer _parseT;
@@ -240,8 +241,8 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
 
         FS_RECTF r{};
         if (FPDFAnnot_GetRect(annot, &r)) {
-            QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot);
-            QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot);
+            QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot, box.x(), box.y());
+            QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot, box.x(), box.y());
             info.rect = QRectF(d1, d2).normalized();
         }
 
@@ -339,6 +340,7 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     double Wd = FPDF_GetPageWidth(page);
     double Hd = FPDF_GetPageHeight(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
     out.page = pageIndex;
     out.subtype = sub;
@@ -346,7 +348,7 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
 
     FS_RECTF r{};
     if (FPDFAnnot_GetRect(annot, &r))
-        out.rect = pdfRectToDisp(QRectF(r.left, r.bottom, r.right - r.left, r.top - r.bottom), Wd, Hd, rot);
+        out.rect = pdfRectToDisp(QRectF(r.left, r.bottom, r.right - r.left, r.top - r.bottom), Wd, Hd, rot, box.x(), box.y());
 
     unsigned int cr = 0, cg = 0, cb = 0, ca = 255;
     if (FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &cr, &cg, &cb, &ca)) {
@@ -384,7 +386,7 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
             FPDFAnnot_GetInkListPath(annot, s, pts.data(), pc);
             QVector<QPointF> stroke;
             for (auto& p : pts)
-                stroke.append(pdfToDisp(p.x, p.y, Wd, Hd, rot));
+                stroke.append(pdfToDisp(p.x, p.y, Wd, Hd, rot, box.x(), box.y()));
             out.ink.append(stroke);
         }
     } else if (sub == FPDF_ANNOT_HIGHLIGHT) {
@@ -392,10 +394,10 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
         for (size_t q = 0; q < nQuads; ++q) {
             FS_QUADPOINTSF qp{};
             if (FPDFAnnot_GetAttachmentPoints(annot, q, &qp)) {
-                QPointF tl = pdfToDisp(qp.x1, qp.y1, Wd, Hd, rot);
-                QPointF tr = pdfToDisp(qp.x2, qp.y2, Wd, Hd, rot);
-                QPointF bl = pdfToDisp(qp.x3, qp.y3, Wd, Hd, rot);
-                QPointF br = pdfToDisp(qp.x4, qp.y4, Wd, Hd, rot);
+                QPointF tl = pdfToDisp(qp.x1, qp.y1, Wd, Hd, rot, box.x(), box.y());
+                QPointF tr = pdfToDisp(qp.x2, qp.y2, Wd, Hd, rot, box.x(), box.y());
+                QPointF bl = pdfToDisp(qp.x3, qp.y3, Wd, Hd, rot, box.x(), box.y());
+                QPointF br = pdfToDisp(qp.x4, qp.y4, Wd, Hd, rot, box.x(), box.y());
                 double l = std::min({tl.x(), tr.x(), bl.x(), br.x()});
                 double t = std::min({tl.y(), tr.y(), bl.y(), br.y()});
                 double r2 = std::max({tl.x(), tr.x(), bl.x(), br.x()});
@@ -406,8 +408,8 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     } else if (sub == FPDF_ANNOT_LINE) {
         FS_POINTF ptA{}, ptB{};
         if (FPDFAnnot_GetLine(annot, &ptA, &ptB)) {
-            QPointF dA = pdfToDisp(ptA.x, ptA.y, Wd, Hd, rot);
-            QPointF dB = pdfToDisp(ptB.x, ptB.y, Wd, Hd, rot);
+            QPointF dA = pdfToDisp(ptA.x, ptA.y, Wd, Hd, rot, box.x(), box.y());
+            QPointF dB = pdfToDisp(ptB.x, ptB.y, Wd, Hd, rot, box.x(), box.y());
             out.rect = QRectF(dA, dB);
         }
     }
@@ -573,9 +575,10 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
-    QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot);
-    QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot);
+    QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot, box.x(), box.y());
+    QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot, box.x(), box.y());
     QRectF dispRect = QRectF(d1, d2).normalized();
     double wDisp = (std::max)(24.0, contents.length() * newFontSize * 0.55 + 8.0);
     double hDisp = newFontSize * 1.5 + 4.0;
@@ -778,6 +781,7 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
     float parsedFontSize = 11.0f;
     QColor parsedColor = Qt::black;
@@ -792,8 +796,8 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
 
     FPDFPage_CloseAnnot(annot);
 
-    QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot);
-    QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot);
+    QPointF d1 = pdfToDisp(r.left, r.bottom, pageW, pageH, rot, box.x(), box.y());
+    QPointF d2 = pdfToDisp(r.right, r.top, pageW, pageH, rot, box.x(), box.y());
     QRectF oldDispRect = QRectF(d1, d2).normalized();
 
     QRectF fitRect = oldDispRect;
@@ -1451,13 +1455,14 @@ bool AnnotationManager::createInlineNote_locked(FPDF_PAGE page, int pageIndex, Q
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
     qDebug() << "[inote] enter page=" << pageIndex << "rot=" << rot << "disp=" << pageW << "x" << pageH << "text=" << text;
 
-    QPointF tl = dispToPdf(rectPdf.left(),  rectPdf.top(),    pageW, pageH, rot);
-    QPointF tr = dispToPdf(rectPdf.right(), rectPdf.top(),    pageW, pageH, rot);
-    QPointF bl = dispToPdf(rectPdf.left(),  rectPdf.bottom(), pageW, pageH, rot);
-    QPointF br = dispToPdf(rectPdf.right(), rectPdf.bottom(), pageW, pageH, rot);
+    QPointF tl = dispToPdf(rectPdf.left(),  rectPdf.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF tr = dispToPdf(rectPdf.right(), rectPdf.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF bl = dispToPdf(rectPdf.left(),  rectPdf.bottom(), pageW, pageH, rot, box.x(), box.y());
+    QPointF br = dispToPdf(rectPdf.right(), rectPdf.bottom(), pageW, pageH, rot, box.x(), box.y());
     float xu_min = static_cast<float>((std::min)({tl.x(), tr.x(), bl.x(), br.x()}));
     float xu_max = static_cast<float>((std::max)({tl.x(), tr.x(), bl.x(), br.x()}));
     float yu_min = static_cast<float>((std::min)({tl.y(), tr.y(), bl.y(), br.y()}));
@@ -1622,8 +1627,9 @@ bool AnnotationManager::createPopupNote_locked(FPDF_PAGE page, int pageIndex, QP
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
+    const QPointF box = pdfBoxOrigin(page);
 
-    QPointF pt = dispToPdf(pointDisp.x(), pointDisp.y(), pageW, pageH, rot);
+    QPointF pt = dispToPdf(pointDisp.x(), pointDisp.y(), pageW, pageH, rot, box.x(), box.y());
     float x0 = static_cast<float>(pt.x());
     float y0 = static_cast<float>(pt.y());
     float iconW = 40.0f, iconH = 40.0f;

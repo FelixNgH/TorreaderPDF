@@ -47,6 +47,7 @@ QList<SearchResult> TextSearch::searchPage(FPDF_DOCUMENT doc, int pageIndex,
     int pageRot = FPDFPage_GetRotation(page);
     double dispW = FPDF_GetPageWidth(page);
     double dispH = FPDF_GetPageHeight(page);
+    const QPointF box = pdfBoxOrigin(page);
 
     FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
     if (!textPage) { FPDF_ClosePage(page); return results; }
@@ -72,7 +73,7 @@ QList<SearchResult> TextSearch::searchPage(FPDF_DOCUMENT doc, int pageIndex,
 
         // Convert to display coordinates (Y-down, rotation applied)
         QRectF dispRect = pdfRectToDisp(QRectF(left, bottom, right - left, top - bottom),
-                                        dispW, dispH, pageRot);
+                                        dispW, dispH, pageRot, box.x(), box.y());
 
         // Context snippet: up to 40 chars around the match
         int snippetStart = qMax(0, charIdx - 20);

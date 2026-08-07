@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "PdfRenderer.h"
+#include "PdfCoords.h"
 #include "../annotations/AnnotationManager.h"
 #include <QMutex>
 #include <QMutexLocker>
@@ -37,35 +38,7 @@ public:
     }
 };
 
-class OwnAnnotHideGuard {
-    FPDF_PAGE m_page;
-    QVector<int> m_hidden;
-    bool m_active;
-public:
-    explicit OwnAnnotHideGuard(FPDF_PAGE page, bool active) : m_page(page), m_active(active) {
-        if (!m_active || !m_page) return;
-        const int n = FPDFPage_GetAnnotCount(m_page);
-        for (int i = 0; i < n; ++i) {
-            FPDF_ANNOTATION a = FPDFPage_GetAnnot(m_page, i);
-            if (!a) continue;
-            const int flags = FPDFAnnot_GetFlags(a);
-            if (FPDFAnnot_HasKey(a, "TRUID") && !(flags & FPDF_ANNOT_FLAG_HIDDEN)) {
-                FPDFAnnot_SetFlags(a, flags | FPDF_ANNOT_FLAG_HIDDEN);
-                m_hidden.append(i);
-            }
-            FPDFPage_CloseAnnot(a);
-        }
-    }
-    ~OwnAnnotHideGuard() {
-        if (!m_active) return;
-        for (int i : m_hidden) {
-            FPDF_ANNOTATION a = FPDFPage_GetAnnot(m_page, i);
-            if (!a) continue;
-            FPDFAnnot_SetFlags(a, FPDFAnnot_GetFlags(a) & ~FPDF_ANNOT_FLAG_HIDDEN);
-            FPDFPage_CloseAnnot(a);
-        }
-    }
-};
+#include "OwnAnnotHideGuard.h"
 
 std::atomic<int> PdfRenderer::s_renderCount{0};
 std::atomic<qint64> PdfRenderer::s_globalCacheBytes{0};
@@ -119,6 +92,7 @@ void PageRenderTask::run() {
         double w = FPDF_GetPageWidth(page);
         double h = FPDF_GetPageHeight(page);
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_req.pageIndex, w, h);
+        if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_req.pageIndex, pdfBoxOrigin(page));
 
         double longSide = qMax(w, h);
         double maxPx = m_req.fullQuality ? PdfRenderer::kFullRenderMaxPx
@@ -217,6 +191,7 @@ void ProgressiveRenderTask::run() {
         double w = FPDF_GetPageWidth(m_fpdfPage);
         double h = FPDF_GetPageHeight(m_fpdfPage);
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_req.pageIndex, w, h);
+        if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_req.pageIndex, pdfBoxOrigin(m_fpdfPage));
 
         double longSide = qMax(w, h);
         double maxPx = m_req.fullQuality ? PdfRenderer::kFullRenderMaxPx
@@ -502,6 +477,7 @@ void TileBatchRenderTask::run() {
         double wPt = FPDF_GetPageWidth(page);
         double hPt = FPDF_GetPageHeight(page);
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_pageIndex, wPt, hPt);
+        if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_pageIndex, pdfBoxOrigin(page));
 
         int fullW = qMax(1, static_cast<int>(wPt * m_scale));
         int fullH = qMax(1, static_cast<int>(hPt * m_scale));

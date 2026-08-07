@@ -2,6 +2,7 @@
 #include <QMutex>
 #include <QDebug>
 #include <fpdf_text.h>
+#include <fpdf_transformpage.h>
 
 #ifndef _WIN32
 #include <QFile>
@@ -86,6 +87,8 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
                                 FPDF_GetPageSizeByIndex(m_doc, i, &w, &h);
                                 m_pageSizes[i] = {w, h};
                             }
+                            m_pageBoxOrigins.fill(QPointF(0.0, 0.0), m_pageCount);
+                            m_pageBoxKnown.fill(false, m_pageCount);
                         }
                     }
                     if (m_doc) {
@@ -127,6 +130,8 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
                             FPDF_GetPageSizeByIndex(m_doc, i, &w, &h);
                             m_pageSizes[i] = {w, h};
                         }
+                        m_pageBoxOrigins.fill(QPointF(0.0, 0.0), m_pageCount);
+                        m_pageBoxKnown.fill(false, m_pageCount);
                     }
                 }
                 if (m_doc) {
@@ -149,7 +154,7 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
     {
         QMutexLocker lock(&s_pdfiumMutex);
         m_doc = FPDF_LoadDocument(pathUtf8.constData(),
-                                  pwd.isEmpty() ? nullptr : pwd.constData());
+                                   pwd.isEmpty() ? nullptr : pwd.constData());
         if (m_doc) {
             m_pageCount = FPDF_GetPageCount(m_doc);
             m_pageSizes.resize(m_pageCount);
@@ -158,6 +163,8 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
                 FPDF_GetPageSizeByIndex(m_doc, i, &w, &h);
                 m_pageSizes[i] = {w, h};
             }
+            m_pageBoxOrigins.fill(QPointF(0.0, 0.0), m_pageCount);
+            m_pageBoxKnown.fill(false, m_pageCount);
         }
     }
     if (!m_doc) return false;
@@ -174,6 +181,8 @@ void PdfDocument::close() {
         m_filePath.clear();
         m_pageCount = 0;
         m_pageSizes.clear();
+        m_pageBoxOrigins.clear();
+        m_pageBoxKnown.clear();
     }
 #ifdef _WIN32
     if (m_mapView)  { UnmapViewOfFile(m_mapView);  m_mapView  = nullptr; }
@@ -204,10 +213,48 @@ QSizeF PdfDocument::pageSize(int pageIndex) const {
     return s;
 }
 
+QPointF PdfDocument::pageBoxOrigin(int pageIndex) const {
+    {
+        QMutexLocker lk(&m_sizesMutex);
+        if (pageIndex < 0 || pageIndex >= m_pageBoxKnown.size()) return QPointF(0.0, 0.0);
+        if (m_pageBoxKnown[pageIndex]) return m_pageBoxOrigins[pageIndex];
+    }
+    // 🔴 NHA m_sizesMutex TRUOC khi lay khoa PDFium — giu ca hai = khoa long nhau.
+    QPointF org(0.0, 0.0);
+    {
+        QMutexLocker lk(&pdfiumGlobalMutex());
+        if (!m_doc) return org;
+        FPDF_PAGE page = FPDF_LoadPage(m_doc, pageIndex);
+        if (page) {
+            float l = 0.f, b = 0.f, r = 0.f, t = 0.f;
+            bool ok = FPDFPage_GetCropBox(page, &l, &b, &r, &t) != 0;
+            if (!ok) ok = FPDFPage_GetMediaBox(page, &l, &b, &r, &t) != 0;
+            if (ok && r > l && t > b) org = QPointF(double(l), double(b));
+            FPDF_ClosePage(page);
+        }
+    }
+    {
+        QMutexLocker lk(&m_sizesMutex);
+        if (pageIndex >= 0 && pageIndex < m_pageBoxKnown.size()) {
+            m_pageBoxOrigins[pageIndex] = org;
+            m_pageBoxKnown[pageIndex]   = true;
+        }
+    }
+    return org;
+}
+
 void PdfDocument::updatePageSize(int pageIndex, double w, double h) {
     QMutexLocker lk(&m_sizesMutex);
     if (pageIndex >= 0 && pageIndex < m_pageSizes.size() && w > 0 && h > 0)
         m_pageSizes[pageIndex] = {w, h};
+}
+
+void PdfDocument::updatePageBoxOrigin(int pageIndex, QPointF origin) {
+    QMutexLocker lk(&m_sizesMutex);
+    if (pageIndex >= 0 && pageIndex < m_pageBoxKnown.size()) {
+        m_pageBoxOrigins[pageIndex] = origin;
+        m_pageBoxKnown[pageIndex]   = true;
+    }
 }
 
 bool PdfDocument::hasRasterPages() const {
