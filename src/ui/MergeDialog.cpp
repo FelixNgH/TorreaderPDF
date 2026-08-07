@@ -16,7 +16,7 @@
 
 MergeDialog::MergeDialog(PdfEditor* editor, QWidget* parent)
     : QDialog(parent), m_editor(editor) {
-    setWindowTitle("Merge PDFs — TorReader");
+    setWindowTitle("Merge PDFs — TorReader PDF");
     resize(520, 380);
 
     auto* hint = new QLabel("Drag rows to reorder  •  Add files then click Merge", this);
@@ -128,7 +128,7 @@ void MergeDialog::onMoveDown() {
 
 void MergeDialog::onMerge() {
     if (m_fileList->count() < 2) {
-        QMessageBox::warning(this, "TorReader", "Add at least 2 PDF files to merge.");
+        QMessageBox::warning(this, "TorReader PDF", "Add at least 2 PDF files to merge.");
         return;
     }
     QStringList paths;
@@ -152,7 +152,7 @@ void MergeDialog::onMerge() {
         setEnabled(true);
         m_progressBar->setValue(100);
         m_progressBar->setVisible(false);
-        QMessageBox::information(this, "TorReader",
+        QMessageBox::information(this, "TorReader PDF",
             ok ? "Merge complete!" : "Merge failed:\n" + m_editor->lastError());
         if (ok) accept();
     });

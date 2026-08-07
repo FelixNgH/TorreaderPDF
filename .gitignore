@@ -23,3 +23,6 @@ TR_AppDir/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# aider
+.aider*

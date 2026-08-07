@@ -5156,7 +5156,7 @@ int main(int argc, char* argv[]) {
     }
 
     MainWindow window;
-    window.setWindowTitle("TorReader");
+    window.setWindowTitle("TorReader PDF");
     window.resize(1280, 800);
     window.show();
 

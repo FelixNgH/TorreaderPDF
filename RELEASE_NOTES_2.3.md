@@ -3,7 +3,7 @@
 **Release date:** 2026-08-02 · **Previous:** 2.2.4 (2026-07-26)
 
 The headline of 2.3: on large CAD drawing sets, **the page is sharp the moment you
-zoom or pan** — no more waiting seconds for the picture to catch up. TorReader now
+zoom or pan** — no more waiting seconds for the picture to catch up. TorReader PDF now
 uploads the page's vector geometry to the GPU and draws it directly, instead of
 asking the PDF engine to re-rasterise the viewport every time you move.
 

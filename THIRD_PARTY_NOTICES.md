@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-TorReader's own code is MIT-licensed (see `LICENSE`). It links against the
+TorReader PDF's own code is MIT-licensed (see `LICENSE`). It links against the
 following third-party components, each under its own license:
 
 | Component | License | Used for |
@@ -15,10 +15,10 @@ following third-party components, each under its own license:
 | [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) (optional) | Apache License 2.0 | OCR on scanned pages — only if built with `FELIXPDF_ENABLE_OCR` |
 | [Noto Sans](https://fonts.google.com/noto/specimen/Noto+Sans) (Google) | SIL Open Font License 1.1 | Default UI font — free for commercial use |
 
-**Qt 6 (LGPL v3):** TorReader links Qt **dynamically** (shared libraries), as
+**Qt 6 (LGPL v3):** TorReader PDF links Qt **dynamically** (shared libraries), as
 required by LGPL v3 for proprietary or differently-licensed applications to
 remain compliant without having to release their own source under LGPL. Since
-TorReader's own code is MIT-licensed anyway, this is a non-issue in practice,
+TorReader PDF's own code is MIT-licensed anyway, this is a non-issue in practice,
 but the dynamic-linking choice is intentional and should not be changed to
 static linking without re-checking LGPL obligations.
 

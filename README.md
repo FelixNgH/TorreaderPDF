@@ -21,7 +21,7 @@ awkward or not permitted.
 
 ### 🚀 Built for large, multi-hundred-page drawing sets
 
-TorReader stays smooth on the files that make other viewers crawl — a **300-page
+TorReader PDF stays smooth on the files that make other viewers crawl — a **300-page
 A1 CAD drawing set** opens fast, scrolls and pages **without freezing**, and keeps
 memory low. The renderer draws each page in short, interruptible slices so the UI
 never blocks, backs it with a two-layer (memory + disk) cache, and evicts
@@ -128,7 +128,7 @@ Full release notes: [`RELEASE_NOTES_2.3.md`](RELEASE_NOTES_2.3.md)
 
 An objective look at **24 PDF apps** — paid suites, open-source desktop viewers, self-hosted
 toolkits and web tools — across 11 everyday jobs. Tools are sorted A–Z within each group;
-TorReader is listed in its category, not on a pedestal.
+TorReader PDF is listed in its category, not on a pedestal.
 
 ![Comparison of 24 PDF tools across 11 everyday jobs](docs/screenshots/comparison.png)
 
@@ -136,7 +136,7 @@ TorReader is listed in its category, not on a pedestal.
 
 ## FAQ
 
-**Is TorReader free?** Yes — free and open-source (MIT). No ads, no account, no watermark.
+**Is TorReader PDF free?** Yes — free and open-source (MIT). No ads, no account, no watermark.
 
 **Do I need to install it?** No. It's a portable app: on Windows, unzip and run
 `TorReader.exe`; on Linux, `chmod +x` the AppImage and run it.
@@ -152,7 +152,7 @@ other free tools.
 **What platforms are supported?** Windows 10/11 (x64) and Linux (x86_64, AppImage).
 
 **Is it a free alternative to Adobe Acrobat, PDFsam or Foxit?** For viewing, merging,
-splitting, extracting, inserting, signing and translating PDFs — yes, TorReader
+splitting, extracting, inserting, signing and translating PDFs — yes, TorReader PDF
 covers those jobs in a single lightweight, portable app.
 
 ## Building from source
@@ -203,7 +203,7 @@ See `THIRD_PARTY_NOTICES.md` for the full list of dependencies and their license
 
 ## License
 
-TorReader's own source code is [MIT-licensed](LICENSE). Third-party
+TorReader PDF's own source code is [MIT-licensed](LICENSE). Third-party
 dependencies keep their own licenses — see `THIRD_PARTY_NOTICES.md`.
 
 ## Author

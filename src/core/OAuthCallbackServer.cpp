@@ -46,7 +46,7 @@ void OAuthCallbackServer::handleClient(QTcpSocket* client) {
     static const char* html =
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
         "<h2>&#x2714; Authentication successful</h2>"
-        "<p>You can close this tab and return to TorReader.</p>"
+        "<p>You can close this tab and return to TorReader PDF.</p>"
         "</body></html>";
     QByteArray htmlBytes(html);
     QByteArray resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: "

@@ -55,7 +55,7 @@ struct ChainPtr {
 SignDialog::SignDialog(QWidget* parent)
     : QDialog(parent)
 {
-    setWindowTitle("Sign PDF — TorReader");
+    setWindowTitle("Sign PDF — TorReader PDF");
     setMinimumWidth(460);
 
     auto* form = new QFormLayout;
