@@ -1218,6 +1218,36 @@ void MainWindow::buildVectorLayer(DocTab* t, int pageIndex, bool force) {
     }));
 }
 
+void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
+    if (!t || !t->doc || !t->doc->isOpen() || !m_openDocs.contains(t)) return;
+    if (t->visualsHasForeign.value(pageIndex, false)
+        && !t->fgnBuilding.contains(pageIndex)
+        && !(t->fgnLayer && t->fgnLayer->pageIndex() == pageIndex)) {
+        int pgF = pageIndex;
+        t->fgnBuilding.insert(pgF);
+        auto fl = std::make_shared<ForeignAnnotLayer>();
+        auto* wf = new QFutureWatcher<bool>(this);
+        connect(wf, &QFutureWatcher<bool>::finished, this, [this, wf, t, pgF, fl]{
+            wf->deleteLater();
+            t->fgnBuilding.remove(pgF);
+            if (!m_openDocs.contains(t)) return;
+            if (t->currentPage != pgF) return;
+            if (wf->result()) {
+                t->fgnLayer = fl;
+                if (t->view) t->view->setForeignAnnotLayer(fl);
+            } else {
+                t->fgnLayer.reset();
+                if (t->view) t->view->setForeignAnnotLayer(nullptr);
+            }
+        });
+        FPDF_DOCUMENT df = t->doc->raw();
+        wf->setFuture(QtConcurrent::run([fl, df, pgF]{
+            QMutexLocker lk(&s_pdfiumMutex);
+            return fl->build(df, pgF, PdfRenderer::kFullRenderMaxPx);
+        }));
+    }
+}
+
 bool MainWindow::canFastPath(DocTab* t, int page) const {
     return t->overlayCapablePage.value(page, false);
 }
@@ -1257,6 +1287,7 @@ void MainWindow::refreshAnnotVisuals(DocTab* t, int page) {
     t->renderer->setPageAnnotRender(page, !overlayCapable || hasForeign);
     t->renderer->setPageAnnotOverlay(page, overlayCapable);
     qDebug().noquote() << "[overlay] page=" << page << "overlayCapable=" << overlayCapable << "hasForeign=" << hasForeign << "visuals=" << visuals.size();
+    ensureForeignAnnotLayer(t, page);
     if (overlayCapable) {
         if (t->view) { t->view->setAnnotVisuals(visuals); t->view->clearPendingMarkups(); }
         if (m_continuousMode && m_continuousView)
@@ -3083,33 +3114,7 @@ void MainWindow::onPageChanged(int pageIndex) {
             }));
         }
 
-        // ── Lop annot phan mem khac: chi khi trang CO annot la (hasForeign) ──
-        if (t->visualsHasForeign.value(pageIndex, false)
-            && !t->fgnBuilding.contains(pageIndex)
-            && !(t->fgnLayer && t->fgnLayer->pageIndex() == pageIndex)) {
-            int pgF = pageIndex;
-            t->fgnBuilding.insert(pgF);
-            auto fl = std::make_shared<ForeignAnnotLayer>();
-            auto* wf = new QFutureWatcher<bool>(this);
-            connect(wf, &QFutureWatcher<bool>::finished, this, [this, wf, t, pgF, fl]{
-                wf->deleteLater();
-                t->fgnBuilding.remove(pgF);
-                if (!m_openDocs.contains(t)) return;
-                if (t->currentPage != pgF) return;
-                if (wf->result()) {
-                    t->fgnLayer = fl;
-                    if (t->view) t->view->setForeignAnnotLayer(fl);
-                } else {
-                    t->fgnLayer.reset();
-                    if (t->view) t->view->setForeignAnnotLayer(nullptr);
-                }
-            });
-            FPDF_DOCUMENT df = t->doc->raw();
-            wf->setFuture(QtConcurrent::run([fl, df, pgF]{
-                QMutexLocker lk(&s_pdfiumMutex);
-                return fl->build(df, pgF, PdfRenderer::kFullRenderMaxPx);
-            }));
-        }
+        ensureForeignAnnotLayer(t, pageIndex);
 
         // Show placeholder from cache immediately — NO render wait
         QImage cached = t->renderer->bestCachedForPage(pageIndex);

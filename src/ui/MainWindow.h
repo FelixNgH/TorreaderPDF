@@ -178,6 +178,7 @@ private:
     const QList<AnnotInfo>& annotsForPage(DocTab* t, int page);
     void invalidateAnnotPage(DocTab* t, int page);
     void buildVectorLayer(DocTab* t, int pageIndex, bool force = false);
+    void ensureForeignAnnotLayer(DocTab* t, int pageIndex);
     // annotsForPage returns a reference into the cache — DO NOT retain it
     // across any call that may invalidate the cache (invalidateAnnotPage,
     // removeAnnot, refreshAnnotVisuals, refreshCommentsForPage, etc.).

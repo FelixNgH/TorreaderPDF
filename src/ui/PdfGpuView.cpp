@@ -8,6 +8,7 @@
 #include <QFontDatabase>
 #include <cmath>
 #include <QVector4D>
+#include <QDateTime>
 
 // ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
 // accumulation during pan; farthest-from-viewport tiles evicted when exceeded.
@@ -334,6 +335,16 @@ void PdfGpuView::initializeGL() {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
     glx->glBindVertexArray(0);
+
+    {
+        GLint _maxTex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &_maxTex);
+        const GLubyte* _r = glGetString(GL_RENDERER);
+        const GLubyte* _v = glGetString(GL_VERSION);
+        qDebug().noquote() << "[glinfo] MAX_TEXTURE_SIZE=" << _maxTex
+                           << "renderer=" << (_r ? reinterpret_cast<const char*>(_r) : "?")
+                           << "version=" << (_v ? reinterpret_cast<const char*>(_v) : "?");
+    }
 }
 
 void PdfGpuView::resizeGL(int, int) {
@@ -521,14 +532,36 @@ void PdfGpuView::paintGL() {
         // ── Vector overlay (sharp strokes on top of raster + sharp-region) ──
         if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->pageIndex() == m_pageIndex
             && shouldUseVectorOverlay()) {
-            p.beginNativePainting();
+            // 🔴 Qt 6.2/Linux: MOI net QPainter sau beginNativePainting() deu BI MAT
+            //    (markup, highlight, lop annot -> "select duoc ma khong thay gi").
+            //    Cach chac an: DONG han dot QPainter, chay GL tho, roi MO LAI dot moi.
+            p.end();
             drawVectorOverlay();
-            p.endNativePainting();
+            p.begin(this);
+            p.setRenderHint(QPainter::Antialiasing);
+            { static bool _once=false; if(!_once){ _once=true;
+                qDebug().noquote() << "[paintpath] QPainter mo lai sau drawVectorOverlay OK"; } }
         }
 
         // ── Lop annotation cua phan mem khac ──
         // Chi can khi nen la vector thuan: luc do anh raster (von chua san chu thich cua ho)
         // bi bo hoan toan, xem PdfGpuView.cpp khoi `!pureVector` o tren.
+        {   // DO: vi sao lop annot ve / khong ve
+            static int _fgnSig = -1;
+            const bool hasL = (m_fgnLayer != nullptr);
+            const bool rdy  = hasL && m_fgnLayer->isReady();
+            const bool same = hasL && m_fgnLayer->pageIndex() == m_pageIndex;
+            const bool img  = hasL && !m_fgnLayer->image().isNull();
+            const int sig = (pureVector?1:0) | (hasL?2:0) | (rdy?4:0) | (same?8:0) | (img?16:0);
+            if (sig != _fgnSig) {
+                _fgnSig = sig;
+                qDebug().noquote() << "[fgndraw] pureVector=" << pureVector
+                                   << "hasLayer=" << hasL << "ready=" << rdy
+                                   << "samePage=" << same << "hasImg=" << img
+                                   << "layerPage=" << (hasL ? m_fgnLayer->pageIndex() : -1)
+                                   << "viewPage=" << m_pageIndex;
+            }
+        }
         if (pureVector && m_fgnLayer && m_fgnLayer->isReady()
             && m_fgnLayer->pageIndex() == m_pageIndex && !m_fgnLayer->image().isNull()) {
             p.save();
@@ -708,6 +741,7 @@ void PdfGpuView::paintGL() {
                 ++cntVis;
                 if (av.subtype == FPDF_ANNOT_TEXT) ++cntSticky;
                 if (!av.paintByOverlay) continue;   // FreeText/Note do lop nen ve (dung font nhung)
+                ++cntDrawn;
                 const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && av.uid == m_dragUid;
                 if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
                 QPointF dOrig = orig + QPointF(av.rect.x() * m_zoom, av.rect.y() * m_zoom);
@@ -863,6 +897,27 @@ void PdfGpuView::paintGL() {
         QFont f = p.font(); f.setPointSize(26); f.setBold(true); p.setFont(f);
         p.setPen(QPen(QColor(255, 255, 255), 2));
         p.drawText(rect(), Qt::AlignCenter, "Loading…");
+    }
+
+    // DO: chup khung hinh da dung xong ra PNG (chi khi dat TORREADER_FBDUMP=<thu muc>)
+    {
+        static const QByteArray _fbDir = qgetenv("TORREADER_FBDUMP");
+        if (!_fbDir.isEmpty()) {
+            static qint64 _lastDump = 0;
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (now - _lastDump > 3000) {          // nhieu nhat 1 anh moi 3 giay
+                _lastDump = now;
+                QImage fb = grabFramebuffer();
+                if (!fb.isNull()) {
+                    const QString fn = QString::fromUtf8(_fbDir) + "/fb_p"
+                                     + QString::number(m_pageIndex) + "_"
+                                     + QString::number(now) + ".png";
+                    fb.save(fn);
+                    qDebug().noquote() << "[fbdump] luu" << fn
+                                       << fb.width() << "x" << fb.height();
+                }
+            }
+        }
     }
 
 }
@@ -1984,4 +2039,13 @@ void PdfGpuView::drawVectorOverlay() {
     else               glDisable(GL_SCISSOR_TEST);
 
     if (!blendWasOn) glDisable(GL_BLEND);
+
+    // Tra SACH trang thai GL truoc khi nha lai cho QPainter.
+    glx->glBindVertexArray(0);
+    for (int _i = 0; _i < 8; ++_i) glDisableVertexAttribArray(_i);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
 }
