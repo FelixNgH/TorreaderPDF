@@ -61,6 +61,18 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.3.2" date="2026-08-09">
+      <description>
+        <p>Fixes drawing display for PDFs exported from CAD: black blocks and colour noise on pages with transparency, missing frame lines, markups hidden behind hatching, and a blank page when turning pages on large drawings. Tidies the menu to make room for upcoming features.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.3.2</url>
+    </release>
+    <release version="2.3.1" date="2026-08-07">
+      <description>
+        <p>Fixes markups and comments appearing outside the drawing frame on PDFs whose page box does not start at the origin, and restores annotations made in other PDF software on heavy drawings.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.3.1</url>
+    </release>
     <release version="2.3.0" date="2026-08-03">
       <description>
         <p>GPU vector rendering for heavy CAD drawings: zoom and pan stay sharp instantly, in single-page and continuous scroll. True line weights, dashes, fills and clipping. Text drawn with the document embedded fonts. Popup text on every markup type, editable inline in the Comments list.</p>

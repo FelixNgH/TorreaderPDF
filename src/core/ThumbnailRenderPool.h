@@ -2,7 +2,7 @@
 #include <QObject>
 #include <QImage>
 #include <QMutex>
-#include <QSet>
+#include <QHash>
 #include <QWaitCondition>
 #include <QThread>
 #include <QAtomicInt>
@@ -35,7 +35,7 @@ private:
     TileCacheFile* m_cache;
     quint64        m_epoch = 0;
     std::priority_queue<ThumbRequest, std::vector<ThumbRequest>, std::greater<ThumbRequest>> m_queue;
-    QSet<int>      m_queued;   // pages currently in queue — prevents duplicate entries
+    QHash<int,int> m_queuedPrio; // page -> best priority pending (0=best); lazy-deletion allows upgrade
     QMutex         m_mutex;
     QWaitCondition m_cond;
     bool           m_stop = false;

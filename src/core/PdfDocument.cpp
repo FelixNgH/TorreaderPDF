@@ -243,6 +243,13 @@ QPointF PdfDocument::pageBoxOrigin(int pageIndex) const {
     return org;
 }
 
+QPointF PdfDocument::pageBoxOriginCached(int pageIndex) const {
+    QMutexLocker lk(&m_sizesMutex);
+    if (pageIndex < 0 || pageIndex >= m_pageBoxKnown.size()) return QPointF(0.0, 0.0);
+    if (m_pageBoxKnown[pageIndex]) return m_pageBoxOrigins[pageIndex];
+    return QPointF(0.0, 0.0);
+}
+
 void PdfDocument::updatePageSize(int pageIndex, double w, double h) {
     QMutexLocker lk(&m_sizesMutex);
     if (pageIndex >= 0 && pageIndex < m_pageSizes.size() && w > 0 && h > 0)

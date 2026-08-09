@@ -83,6 +83,7 @@ extern QMutex s_pdfiumMutex;
 #include <QDialogButtonBox>
 #include <QPushButton>
 #include <QCoreApplication>
+#include <QFrame>
 
 namespace {
 struct MarkupDebugWriter {
@@ -986,6 +987,29 @@ void MainWindow::setupActionBar() {
         auto* closeBtn = new QPushButton("Close", &dlg);
         row->addWidget(copyBtn); row->addWidget(openBtn); row->addStretch(); row->addWidget(closeBtn);
         lay->addLayout(row);
+
+        // ── Ung ho du an ──────────────────────────────────────────────
+        auto* line = new QFrame(&dlg);
+        line->setFrameShape(QFrame::HLine);
+        line->setFrameShadow(QFrame::Sunken);
+        lay->addWidget(line);
+
+        lay->addWidget(new QLabel("Support the project:", &dlg));
+        auto* row2 = new QHBoxLayout();
+        auto* xBtn  = new QPushButton("Follow on X", &dlg);
+        auto* ghBtn = new QPushButton("Star on GitHub", &dlg);
+        xBtn->setToolTip("Follow @FelixNgHuy on X (Twitter)");
+        ghBtn->setToolTip("Give the project a star on GitHub — helps others find it");
+        row2->addWidget(xBtn); row2->addWidget(ghBtn); row2->addStretch();
+        lay->addLayout(row2);
+
+        connect(xBtn, &QPushButton::clicked, &dlg, [] {
+            QDesktopServices::openUrl(QUrl(QStringLiteral("https://x.com/FelixNgHuy")));
+        });
+        connect(ghBtn, &QPushButton::clicked, &dlg, [] {
+            QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/FelixNgH/TorreaderPDF")));
+        });
+
         connect(copyBtn, &QPushButton::clicked, &dlg, [this, url, copyBtn] {
             QGuiApplication::clipboard()->setText(url);
             copyBtn->setText("Copied!");
@@ -996,39 +1020,15 @@ void MainWindow::setupActionBar() {
         dlg.exec();
     });
 
-    // Help — all keyboard shortcuts & usage instructions (right of Translate)
-    auto* helpAct = tb->addAction("Help");
-    helpAct->setToolTip("Show all keyboard shortcuts and usage instructions  (F1)");
-    helpAct->setShortcut(QKeySequence("F1"));
-    connect(helpAct, &QAction::triggered, this, [this]() {
-        QMessageBox mb(this);
-        mb.setWindowTitle("Help — Shortcuts & Instructions");
-        mb.setTextFormat(Qt::RichText);
-        mb.setText(
-            "<h3 style='margin-top:0'>Keyboard shortcuts</h3>"
-            "<table cellspacing='6'>"
-            "<tr><td><b>Ctrl+O</b></td><td>Open PDF</td></tr>"
-            "<tr><td><b>Ctrl+S</b> / <b>Ctrl+Shift+S</b></td><td>Save / Save As</td></tr>"
-            "<tr><td><b>Ctrl+M</b></td><td>Merge PDFs</td></tr>"
-            "<tr><td><b>Ctrl+Shift+E</b></td><td>Extract all pages</td></tr>"
-            "<tr><td><b>Ctrl+P</b></td><td>Print</td></tr>"
-            "<tr><td><b>C</b></td><td>Toggle Continuous scroll</td></tr>"
-            "<tr><td><b>Ctrl+Shift+F</b></td><td>Fit page</td></tr>"
-            "<tr><td><b>Ctrl+=</b> / <b>Ctrl+&minus;</b></td><td>Zoom in / out</td></tr>"
-            "<tr><td><b>T</b></td><td>Translate mode</td></tr>"
-            "<tr><td><b>F1</b></td><td>Show this help</td></tr>"
-            "</table>"
-            "<h3>Mouse</h3>"
-            "<table cellspacing='6'>"
-            "<tr><td><b>Ctrl+Scroll</b></td><td>Zoom in / out</td></tr>"
-            "<tr><td><b>Alt+Drag</b></td><td>Select text to translate</td></tr>"
-            "<tr><td><b>Scroll</b></td><td>Flip page</td></tr>"
-            "<tr><td><b>Right-click thumbnail</b></td><td>Page options: Insert / Delete / Extract</td></tr>"
-            "<tr><td><b>Right-click Translate</b></td><td>Reset translation consent</td></tr>"
-            "</table>");
-        mb.setStandardButtons(QMessageBox::Ok);
-        mb.exec();
+    // F1 opens AboutDialog → Shortcuts tab
+    auto* f1Act = new QAction(this);
+    f1Act->setShortcut(QKeySequence("F1"));
+    connect(f1Act, &QAction::triggered, this, [this] {
+        AboutDialog dlg(this);
+        dlg.showShortcutsTab();
+        dlg.exec();
     });
+    addAction(f1Act);
 }
 
 // ── File operations ──────────────────────────────────────────────────────────
@@ -1220,7 +1220,11 @@ void MainWindow::buildVectorLayer(DocTab* t, int pageIndex, bool force) {
 
 void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
     if (!t || !t->doc || !t->doc->isOpen() || !m_openDocs.contains(t)) return;
+    // 🔴 CHI dung lop nay khi trang THUC SU ve bang lop vector. Nen raster von da co san
+    //    chu thich (co FPDF_ANNOT) nen khong can bu. Thieu chot nay => dung lop vo ich,
+    //    ton 9 giay giu khoa pdfium tren trang nang (do that 2026-08-09).
     if (t->visualsHasForeign.value(pageIndex, false)
+        && baseIsVector(t, pageIndex)
         && !t->fgnBuilding.contains(pageIndex)
         && !(t->fgnLayer && t->fgnLayer->pageIndex() == pageIndex)) {
         int pgF = pageIndex;
@@ -2721,7 +2725,7 @@ void MainWindow::openFile(const QString& path) {
                          << "imgSize=" << img.size()
                          << "hasImage=" << tab->view->hasImage();
                 tab->view->setPage(idx, img, tab->doc->pageSize(idx));
-                tab->view->setPageBoxOrigin(tab->doc->pageBoxOrigin(idx));
+                tab->view->setPageBoxOrigin(tab->doc->pageBoxOriginCached(idx));
                 refreshAnnotVisuals(tab, tab->currentPage);
                 if (!m_searchResults.isEmpty())
                     applySearchHighlights(m_searchResults, m_searchCurrentIdx);
@@ -2748,7 +2752,7 @@ void MainWindow::openFile(const QString& path) {
                     m_zoomEdit->setText(QString::number(qRound(tab->zoom * 100)) + "%");
             }
             tab->view->setPendingPage(0, sz);
-            tab->view->setPageBoxOrigin(tab->doc->pageBoxOrigin(0));
+            tab->view->setPageBoxOrigin(tab->doc->pageBoxOriginCached(0));
         }
         refreshAnnotVisuals(tab, 0);
         tab->renderer->requestPage(0, tab->zoom);
@@ -3121,12 +3125,12 @@ void MainWindow::onPageChanged(int pageIndex) {
         QSizeF sz = t->doc->pageSize(pageIndex);
         if (!cached.isNull()) {
             t->view->setPage(pageIndex, cached, sz);
-            t->view->setPageBoxOrigin(t->doc->pageBoxOrigin(pageIndex));
+            t->view->setPageBoxOrigin(t->doc->pageBoxOriginCached(pageIndex));
         } else {
             // Show pending page immediately. Old image is cleared; placeholder thumbnail
             // is shown while full render loads (same pattern as Okular/Acrobat).
             t->view->setPendingPage(pageIndex, sz);
-            t->view->setPageBoxOrigin(t->doc->pageBoxOrigin(pageIndex));
+            t->view->setPageBoxOrigin(t->doc->pageBoxOriginCached(pageIndex));
             QImage thumb = m_thumbPanel->thumbnailForPage(pageIndex);
             if (!thumb.isNull()) {
                 qDebug() << "[perf] placeholder feed thumb page=" << pageIndex;

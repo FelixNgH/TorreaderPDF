@@ -49,15 +49,7 @@ void PdfView::clearHighlights() {
     update();
 }
 
-void PdfView::setAnnotOverlays(const QList<AnnotOverlay>& overlays) {
-    m_annotOverlays = overlays;
-    update();
-}
 
-void PdfView::clearAnnotOverlays() {
-    m_annotOverlays.clear();
-    update();
-}
 
 void PdfView::setSecondPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt) {
     m_pageIndex2  = pageIndex;
@@ -198,34 +190,6 @@ void PdfView::paintEvent(QPaintEvent*) {
             double ww = nr.width()  * m_zoom;
             double wh = nr.height() * m_zoom;
             p.drawRect(QRectF(wx, wy, ww, wh));
-        }
-        p.restore();
-    }
-
-    // Draw note annotation overlays (larger, more visible badges on top of the page).
-    if (!m_annotOverlays.isEmpty() && !m_pixmap.isNull()) {
-        QPointF origin = pageOrigin();
-        double pageH = m_pageSizePt.height();
-        p.save();
-        for (const auto& ov : m_annotOverlays) {
-            if (ov.pageIndex != m_pageIndex) continue;
-            QRectF nr = ov.pdfRect.normalized();
-            double cx = origin.x() + (nr.x() + nr.width()  / 2) * m_zoom;
-            double cy = origin.y() + (pageH - nr.y() - nr.height() / 2) * m_zoom;
-            // Draw 28x28 rounded badge (golden, semi-transparent).
-            QRectF badge(cx - 14, cy - 14, 28, 28);
-            p.setBrush(QColor(245, 158, 11, 220));
-            p.setPen(QColor(180, 100, 0, 200));
-            p.drawRoundedRect(badge, 6, 6);
-            p.setPen(Qt::white);
-            QFont f = p.font(); f.setPointSize(10); f.setBold(true); p.setFont(f);
-            p.drawText(badge, Qt::AlignCenter, "N");
-            // Snippet label below the badge.
-            if (!ov.snippet.isEmpty()) {
-                p.setPen(QColor(50, 50, 50));
-                QFont sf = p.font(); sf.setPointSize(8); sf.setBold(false); p.setFont(sf);
-                p.drawText(QRectF(cx - 60, cy + 16, 120, 20), Qt::AlignCenter, ov.snippet);
-            }
         }
         p.restore();
     }

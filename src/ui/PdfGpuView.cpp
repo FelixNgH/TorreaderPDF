@@ -170,6 +170,8 @@ void PdfGpuView::initializeGL() {
         out vec4 vColor;
         flat out vec4 vClip;
         out vec2 vPagePos;
+        out float vHalfW;
+        out float vDistPx;
         void main() {
             vec4 c0 = uMvp * vec4(aP0, 0.0, 1.0);
             vec4 c1 = uMvp * vec4(aP1, 0.0, 1.0);
@@ -183,11 +185,16 @@ void PdfGpuView::initializeGL() {
             float cov  = 1.0;
             if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, 0.15);
             float wpx  = max(wRaw, 1.0);
-            vec2 p = mix(s0, s1, aCorner.x) + n * (aCorner.y - 0.5) * wpx;
+            // ponytail: chi noi quad de khu rang cua khi net > 1px; net <= 1px da du xu ly bang cov
+            float aaPad = (wRaw > 1.0) ? 1.5 : 0.0;
+            float wAA   = wpx + aaPad;
+            vec2 p = mix(s0, s1, aCorner.x) + n * (aCorner.y - 0.5) * wAA;
             gl_Position = vec4((p / uViewport) * 2.0 - 1.0, aDepth * 2.0 - 1.0, 1.0);
             vColor = vec4(aColor.rgb, aColor.a * cov);
             vClip = uClips[int(aClipIdx)];
             vPagePos = mix(aP0, aP1, aCorner.x);
+            vHalfW  = wpx * 0.5;
+            vDistPx = (aCorner.y - 0.5) * wAA;
         }
     )";
     static const char* vecFsrc = R"(
@@ -195,11 +202,17 @@ void PdfGpuView::initializeGL() {
         in vec4 vColor;
         flat in vec4 vClip;
         in vec2 vPagePos;
+        in float vHalfW;
+        in float vDistPx;
         out vec4 fragColor;
         void main() {
             if (vClip.z > 0.0 && (vPagePos.x < vClip.x || vPagePos.x > vClip.x + vClip.z ||
                                   vPagePos.y < vClip.y || vPagePos.y > vClip.y + vClip.w)) discard;
-            fragColor = vColor;
+            float d = abs(vDistPx);
+            // ponytail: net <= 1px (vHalfW=0.5) giu sac, net > 1px moi lam mem mep
+            float aa = (vHalfW <= 0.5) ? 1.0 : clamp(vHalfW + 0.5 - d, 0.0, 1.0);
+            if (aa <= 0.0) discard;
+            fragColor = vec4(vColor.rgb, vColor.a * aa);
         }
     )";
     m_vecProg = new QOpenGLShaderProgram(this);
@@ -436,55 +449,11 @@ QMatrix4x4 PdfGpuView::vectorTransform() const {
 // ── Paint ─────────────────────────────────────────────────────────────────────
 
 void PdfGpuView::paintGL() {
-    const bool pureVector =
-           m_vecLayer && m_vecLayer->isReady()
-        && m_vecLayer->pageIndex() == m_pageIndex
-        && m_vecLayer->isComplete()
-        && shouldUseVectorOverlay();
+    // shouldUseVectorOverlay() da bao gom: layer san sang + dung trang + du noi dung (isComplete).
+    // Chi co HAI trang thai: lop vector BAT (raster bi bo hoan toan) hoac TAT (chi co raster).
+    const bool pureVector = shouldUseVectorOverlay();
 
-    // Upload pending texture (must happen inside GL context)
-    if (m_textureDirty && !m_pendingImage.isNull()) {
-        uploadTexture(m_pendingImage);
-        m_pendingImage  = {};
-        m_textureDirty  = false;
-    }
-
-    // Clear background
-    QColor bg = m_darkMode ? QColor(30, 30, 30) : QColor(80, 80, 80);
-    glClearColor((float)bg.redF(), (float)bg.greenF(), (float)bg.blueF(), 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    // Draw page texture
-    if (m_hasImage && m_texture && !m_pageSizePt.isEmpty() && !pureVector) {
-        // Drop shadow via filled quad slightly offset (draw under page)
-        // (Drawn via QPainter below to keep GL code minimal)
-
-        m_program->bind();
-        QMatrix4x4 transform = computeTransform();
-        glUniformMatrix4fv(m_uTransform, 1, GL_FALSE, transform.constData());
-        glUniform1i(m_uHasTex, 1);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, m_texture);
-        {
-            QOpenGLVertexArrayObject::Binder binder(&m_vao);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        }
-        m_program->release();
-    } else if (pureVector && !m_pageSizePt.isEmpty()) {
-        // Vector thuan: khong ve raster nhung VAN phai co nen trang trang.
-        // Ve bang GL (quad trang + u_bgColor) vi net QPainter khong song sot qua
-        // beginNativePainting() tren Qt 6.2/Linux -> trang bi trong suot.
-        m_program->bind();
-        QMatrix4x4 transform = computeTransform();
-        glUniformMatrix4fv(m_uTransform, 1, GL_FALSE, transform.constData());
-        glUniform1i(m_uHasTex, 0);
-        glUniform4f(m_uBgColor, 1.0f, 1.0f, 1.0f, 1.0f);
-        {
-            QOpenGLVertexArrayObject::Binder binder(&m_vao);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        }
-        m_program->release();
-    }
+    drawPageBase(pureVector);
 
     // Overlays via QPainter (drawn on top of GL — valid inside paintGL for QOpenGLWidget)
     {
@@ -519,17 +488,10 @@ void PdfGpuView::paintGL() {
         p.fillRect(QRectF(orig.x() + pw, orig.y() + sh, sh, ph), QColor(0, 0, 0, 80));
         p.fillRect(QRectF(orig.x() + sh, orig.y() + ph, pw, sh), QColor(0, 0, 0, 80));
 
-        // ── Draw sharp-region overlay (viewport re-rendered at true zoom) ──
-        if (m_sharpPage == m_pageIndex && qAbs(m_sharpScale - m_zoom) < 1e-6 && !m_sharpImage.isNull() && !pureVector) {
-            p.save();
-            p.setRenderHint(QPainter::Antialiasing, false);
-            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-            p.drawImage(QPoint(qRound(orig.x() + m_sharpRegion.x()),
-                               qRound(orig.y() + m_sharpRegion.y())), m_sharpImage);
-            p.restore();
-        }
+        drawSharpRegion(p, orig, pureVector);
 
-        // ── Vector overlay (sharp strokes on top of raster + sharp-region) ──
+        // -- Lop vector: THAY THE anh raster (khong phai ve de len). Khi lop nay bat,
+        //    khoi ve raster o tren da bi bo qua hoan toan. --
         if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->pageIndex() == m_pageIndex
             && shouldUseVectorOverlay()) {
             // 🔴 Qt 6.2/Linux: MOI net QPainter sau beginNativePainting() deu BI MAT
@@ -543,42 +505,7 @@ void PdfGpuView::paintGL() {
                 qDebug().noquote() << "[paintpath] QPainter mo lai sau drawVectorOverlay OK"; } }
         }
 
-        // ── Lop annotation cua phan mem khac ──
-        // Chi can khi nen la vector thuan: luc do anh raster (von chua san chu thich cua ho)
-        // bi bo hoan toan, xem PdfGpuView.cpp khoi `!pureVector` o tren.
-        {   // DO: vi sao lop annot ve / khong ve
-            static int _fgnSig = -1;
-            const bool hasL = (m_fgnLayer != nullptr);
-            const bool rdy  = hasL && m_fgnLayer->isReady();
-            const bool same = hasL && m_fgnLayer->pageIndex() == m_pageIndex;
-            const bool img  = hasL && !m_fgnLayer->image().isNull();
-            const int sig = (pureVector?1:0) | (hasL?2:0) | (rdy?4:0) | (same?8:0) | (img?16:0);
-            if (sig != _fgnSig) {
-                _fgnSig = sig;
-                qDebug().noquote() << "[fgndraw] pureVector=" << pureVector
-                                   << "hasLayer=" << hasL << "ready=" << rdy
-                                   << "samePage=" << same << "hasImg=" << img
-                                   << "layerPage=" << (hasL ? m_fgnLayer->pageIndex() : -1)
-                                   << "viewPage=" << m_pageIndex;
-            }
-        }
-        if (pureVector && m_fgnLayer && m_fgnLayer->isReady()
-            && m_fgnLayer->pageIndex() == m_pageIndex && !m_fgnLayer->image().isNull()) {
-            p.save();
-            p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-            p.drawImage(QRectF(orig.x(), orig.y(), pw, ph), m_fgnLayer->image());
-            p.restore();
-        }
-
-        // Vung sac net cua lop annot, ve DE LEN lop tho 4000px
-        if (pureVector && m_fgnRegPage == m_pageIndex
-            && qAbs(m_fgnRegScale - m_zoom) < 1e-6 && !m_fgnRegImg.isNull()) {
-            p.save();
-            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-            p.drawImage(QPoint(qRound(orig.x() + m_fgnRegRect.x()),
-                               qRound(orig.y() + m_fgnRegRect.y())), m_fgnRegImg);
-            p.restore();
-        }
+        drawForeignAnnotLayers(p, orig, pw, ph, pureVector);
 
         // Highlights (display coords: Y-down, rotation applied)
         if (!m_highlights.isEmpty()) {
@@ -612,41 +539,7 @@ void PdfGpuView::paintGL() {
             p.drawRect(wr);
         }
 
-        // Annotation overlays (sticky note badges only)
-        if (!m_annotOverlays.isEmpty()) {
-            double pageH = m_pageSizePt.height();
-            p.save();
-            int cntVis = 0, cntSticky = 0, cntDrawn = 0;
-            for (const auto& ov : m_annotOverlays) {
-                if (ov.pageIndex != m_pageIndex) continue;
-                const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && ov.uid == m_dragUid;
-                if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
-                QRectF nr = ov.pdfRect.normalized();
-                double cx = orig.x() + (nr.x() + nr.width()  / 2) * m_zoom;
-                double cy = orig.y() + (pageH - nr.y() - nr.height() / 2) * m_zoom;
-                QRectF badge(cx - 14, cy - 14, 28, 28);
-                p.setBrush(QColor(245, 158, 11, 220));
-                p.setPen(QColor(180, 100, 0, 200));
-                p.drawRoundedRect(badge, 6, 6);
-                p.setPen(Qt::white);
-                QFont f = p.font(); f.setPointSize(10); f.setBold(true); p.setFont(f);
-                p.drawText(badge, Qt::AlignCenter, "N");
-                if (!ov.snippet.isEmpty()) {
-                    p.setPen(QColor(50, 50, 50));
-                    QFont sf = p.font(); sf.setPointSize(8); sf.setBold(false); p.setFont(sf);
-                    p.drawText(QRectF(cx - 60, cy + 16, 120, 20), Qt::AlignCenter, ov.snippet);
-                }
-                if (isDragged) p.restore();
-            }
-            {
-                static int sV = -1, sS = -1, sD = -1;
-                if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
-                    sV = cntVis; sS = cntSticky; sD = cntDrawn;
-                    qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
-                }
-            }
-            p.restore();
-        }
+
 
         // ── Pending markup overlay (instant feedback until the page re-render bakes it in) ──
         if (!m_pendingMarkups.isEmpty()) {
@@ -718,109 +611,7 @@ void PdfGpuView::paintGL() {
             p.restore();
         }
 
-        // ── Annotation overlay (step 1: drawn from model instead of PDFium render) ──
-        if (!m_annotVisuals.isEmpty()) {
-            { static int _lastLogPage = -1, _lastLogSize = -1;
-              bool anyMatch = false;
-              for (const auto& av : m_annotVisuals)
-                  if (av.page == m_pageIndex) { anyMatch = true; break; }
-              if (!anyMatch && (_lastLogPage != m_pageIndex || _lastLogSize != m_annotVisuals.size())) {
-                  _lastLogPage = m_pageIndex;
-                  _lastLogSize = m_annotVisuals.size();
-                  qDebug().noquote() << "[annot] overlay skipped — visualsPage="
-                      << (m_annotVisuals.isEmpty() ? -1 : m_annotVisuals.first().page)
-                      << "viewPage=" << m_pageIndex << "n=" << m_annotVisuals.size();
-              }
-            }
-            p.save();
-            p.setRenderHint(QPainter::Antialiasing, true);
-            QPointF orig = pageOrigin();
-            int cntVis = 0, cntSticky = 0, cntDrawn = 0;
-            for (const AnnotVisual& av : m_annotVisuals) {
-                if (av.page != m_pageIndex) continue;
-                ++cntVis;
-                if (av.subtype == FPDF_ANNOT_TEXT) ++cntSticky;
-                if (!av.paintByOverlay) continue;   // FreeText/Note do lop nen ve (dung font nhung)
-                ++cntDrawn;
-                const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && av.uid == m_dragUid;
-                if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
-                QPointF dOrig = orig + QPointF(av.rect.x() * m_zoom, av.rect.y() * m_zoom);
-                QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
-                QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
-                p.setPen(strokePen);
-                p.setBrush(av.fill.isValid() && av.fill.alpha() > 0 ? QBrush(av.fill) : Qt::NoBrush);
-
-                switch (av.subtype) {
-                    case FPDF_ANNOT_INK: {
-                        for (const auto& stroke : av.ink) {
-                            if (stroke.size() < 2) continue;
-                            QPolygonF poly;
-                            for (const QPointF& pt : stroke)
-                                poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
-                            p.setBrush(Qt::NoBrush);
-                            p.drawPolyline(poly);
-                        }
-                        break;
-                    }
-                    case FPDF_ANNOT_SQUARE:
-                        p.drawRect(dRect);
-                        break;
-                    case FPDF_ANNOT_CIRCLE:
-                        p.drawEllipse(dRect);
-                        break;
-                    case FPDF_ANNOT_HIGHLIGHT: {
-                        if (!av.quads.isEmpty()) {
-                            p.setBrush(QColor(255, 255, 0, 90));
-                            p.setPen(Qt::NoPen);
-                            for (const QRectF& qr : av.quads) {
-                                QPointF qo(orig.x() + qr.x() * m_zoom, orig.y() + qr.y() * m_zoom);
-                                p.drawRect(QRectF(qo, QSizeF(qr.width() * m_zoom, qr.height() * m_zoom)));
-                            }
-                        } else {
-                            p.setBrush(QColor(255, 255, 0, 90));
-                            p.setPen(Qt::NoPen);
-                            p.drawRect(dRect);
-                        }
-                        break;
-                    }
-                    case FPDF_ANNOT_LINE: {
-                        QPointF lA(orig.x() + av.rect.left() * m_zoom, orig.y() + av.rect.top() * m_zoom);
-                        QPointF lB(orig.x() + av.rect.right() * m_zoom, orig.y() + av.rect.bottom() * m_zoom);
-                        p.drawLine(lA, lB);
-                        break;
-                    }
-                    case FPDF_ANNOT_POLYGON: {
-                        // Polygon uses ink strokes as vertex list (first stroke = boundary)
-                        if (!av.ink.isEmpty() && av.ink[0].size() >= 3) {
-                            QPolygonF poly;
-                            for (const QPointF& pt : av.ink[0])
-                                poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
-                            p.drawPolygon(poly);
-                        }
-                        break;
-                    }
-                    case FPDF_ANNOT_FREETEXT: {
-                        double fs = qMax(6.0, av.fontSize * m_zoom);
-                        QFont ft = p.font();
-                        ft.setPointSizeF(fs);
-                        p.setFont(ft);
-                        p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
-                        p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
-                        break;
-                    }
-                    default: break;
-                }
-                if (isDragged) p.restore();
-            }
-            {
-                static int sV = -1, sS = -1, sD = -1;
-                if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
-                    sV = cntVis; sS = cntSticky; sD = cntDrawn;
-                    qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
-                }
-            }
-            p.restore();
-        }
+        drawMarkupOverlay(p, orig, pureVector);
 
     }
 
@@ -873,8 +664,11 @@ void PdfGpuView::paintGL() {
 
     // Show loading indicator on ANY state: even when a partial image exists,
     // keep the "Loading…" overlay so the user knows rendering is in progress.
-    // ponytail: skip "Loading…" when pure vector mode is active (no raster image expected)
-    if (m_loading && !pureVector) {
+    // 🔴 KHONG duoc chan anh mo tam theo pureVector. Luc LAT TRANG thi hasImage=false
+    //    ma pureVector van true => nhanh raster bi bo, neu bo not anh mo tam thi
+    //    man hinh TRANG TRON (do that 2026-08-09: 4 khung 0,0% muc).
+    //    Luat §2.1: moi thao tac phai hien ra thu gi do NGAY, du mo.
+    if (m_loading) {
         if (!m_hasImage) {
             if (!m_placeholder.isNull() && !m_pageSizePt.isEmpty()) {
                 // Draw thumbnail placeholder scaled to page rect
@@ -894,9 +688,12 @@ void PdfGpuView::paintGL() {
                 p.fillRect(rect(), QColor(0, 0, 0, 80));
             }
         }
-        QFont f = p.font(); f.setPointSize(26); f.setBold(true); p.setFont(f);
-        p.setPen(QPen(QColor(255, 255, 255), 2));
-        p.drawText(rect(), Qt::AlignCenter, "Loading…");
+        // "Loading…" chi hien o che do raster; pure vector khong can chu nay
+        if (!pureVector) {
+            QFont f = p.font(); f.setPointSize(26); f.setBold(true); p.setFont(f);
+            p.setPen(QPen(QColor(255, 255, 255), 2));
+            p.drawText(rect(), Qt::AlignCenter, "Loading…");
+        }
     }
 
     // DO: chup khung hinh da dung xong ra PNG (chi khi dat TORREADER_FBDUMP=<thu muc>)
@@ -905,7 +702,9 @@ void PdfGpuView::paintGL() {
         if (!_fbDir.isEmpty()) {
             static qint64 _lastDump = 0;
             const qint64 now = QDateTime::currentMSecsSinceEpoch();
-            if (now - _lastDump > 3000) {          // nhieu nhat 1 anh moi 3 giay
+            static const int _dumpMs = qEnvironmentVariableIntValue("TORREADER_FBDUMP_MS") > 0
+                                     ? qEnvironmentVariableIntValue("TORREADER_FBDUMP_MS") : 3000;
+            if (now - _lastDump > _dumpMs) {
                 _lastDump = now;
                 QImage fb = grabFramebuffer();
                 if (!fb.isNull()) {
@@ -914,7 +713,15 @@ void PdfGpuView::paintGL() {
                                      + QString::number(now) + ".png";
                     fb.save(fn);
                     qDebug().noquote() << "[fbdump] luu" << fn
-                                       << fb.width() << "x" << fb.height();
+                                       << fb.width() << "x" << fb.height()
+                                       << "pureVector=" << pureVector
+                                       << "hasImage=" << m_hasImage
+                                       << "tex=" << (m_texture != 0)
+                                       << "vecReady=" << (m_vecLayer && m_vecLayer->isReady())
+                                       << "vecComplete=" << (m_vecLayer && m_vecLayer->isComplete())
+                                       << "vecPage=" << (m_vecLayer ? m_vecLayer->pageIndex() : -1)
+                                       << "viewPage=" << m_pageIndex
+                                       << "zoom=" << m_zoom;
                 }
             }
         }
@@ -1344,15 +1151,7 @@ void PdfGpuView::clearHighlights() {
     update();
 }
 
-void PdfGpuView::setAnnotOverlays(const QList<AnnotOverlay>& overlays) {
-    m_annotOverlays = overlays;
-    update();
-}
 
-void PdfGpuView::clearAnnotOverlays() {
-    m_annotOverlays.clear();
-    update();
-}
 
 void PdfGpuView::setAnnotVisuals(const QList<AnnotVisual>& visuals) {
     m_annotVisuals = visuals;
@@ -1934,7 +1733,8 @@ void PdfGpuView::drawVectorOverlay() {
         m_fillProg->setUniformValue(m_fillMvpLoc, mvp);
         uploadClips(m_fillProg);
         glx->glBindVertexArray(m_fillVao);
-        glDrawArrays(GL_TRIANGLES, 0, m_vecLayer->fillVerts().size() / 2);
+        const int _opaqueVerts = m_vecLayer->fillOpaqueFloats() / 2;
+        if (_opaqueVerts > 0) glDrawArrays(GL_TRIANGLES, 0, _opaqueVerts);
         glx->glBindVertexArray(0);
         m_fillProg->release();
     }
@@ -2020,6 +1820,11 @@ void PdfGpuView::drawVectorOverlay() {
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
     };
+    // ponytail: tiles (images + text) are semi-transparent composites that must
+    // NOT write depth — a 34%-opaque image tile writing depth would reject later
+    // text tiles via depth test even though the text should show through the gaps.
+    glDepthMask(GL_FALSE);
+
     if (m_tileProg && m_tileVao) {
         m_tileProg->bind();
         glUniformMatrix4fv(m_tileMvpLoc, 1, GL_FALSE, mvp.constData());
@@ -2030,6 +1835,25 @@ void PdfGpuView::drawVectorOverlay() {
         m_tileTexGen = m_vecLayer->tilesGeneration();
         glx->glBindVertexArray(0);
         m_tileProg->release();
+    }
+
+    // Mang to ban trong suot: ve SAU CUNG (dung thu tu tai lieu vi chung la object cuoi),
+    // depth test VAN bat de khong de len thu o TREN, nhung KHONG ghi depth —
+    // neu ghi thi no xoa sach net phia sau thay vi cho hien xuyen qua.
+    {
+        const int _allVerts = m_vecLayer->fillVerts().size() / 2;
+        const int _opaqueVerts = m_vecLayer->fillOpaqueFloats() / 2;
+        const int _alphaVerts = _allVerts - _opaqueVerts;
+        if (_alphaVerts > 0 && m_fillProg && m_fillVao) {
+            glDepthMask(GL_FALSE);
+            m_fillProg->bind();
+            m_fillProg->setUniformValue(m_fillMvpLoc, mvp);
+            uploadClips(m_fillProg);
+            glx->glBindVertexArray(m_fillVao);
+            glDrawArrays(GL_TRIANGLES, _opaqueVerts, _alphaVerts);
+            glx->glBindVertexArray(0);
+            m_fillProg->release();
+        }
     }
 
     glDisable(GL_DEPTH_TEST);
@@ -2048,4 +1872,191 @@ void PdfGpuView::drawVectorOverlay() {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
+}
+
+// ── paintGL sub-helpers (extracted from paintGL) ───────────────────────────
+
+void PdfGpuView::drawPageBase(bool pureVector) {
+    if (m_textureDirty && !m_pendingImage.isNull()) {
+        uploadTexture(m_pendingImage);
+        m_pendingImage  = {};
+        m_textureDirty  = false;
+    }
+
+    QColor bg = m_darkMode ? QColor(30, 30, 30) : QColor(80, 80, 80);
+    glClearColor((float)bg.redF(), (float)bg.greenF(), (float)bg.blueF(), 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (m_hasImage && m_texture && !m_pageSizePt.isEmpty() && !pureVector) {
+        m_program->bind();
+        QMatrix4x4 transform = computeTransform();
+        glUniformMatrix4fv(m_uTransform, 1, GL_FALSE, transform.constData());
+        glUniform1i(m_uHasTex, 1);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_texture);
+        {
+            QOpenGLVertexArrayObject::Binder binder(&m_vao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+        m_program->release();
+    } else if (pureVector && !m_pageSizePt.isEmpty()) {
+        m_program->bind();
+        QMatrix4x4 transform = computeTransform();
+        glUniformMatrix4fv(m_uTransform, 1, GL_FALSE, transform.constData());
+        glUniform1i(m_uHasTex, 0);
+        glUniform4f(m_uBgColor, 1.0f, 1.0f, 1.0f, 1.0f);
+        {
+            QOpenGLVertexArrayObject::Binder binder(&m_vao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+        m_program->release();
+    }
+}
+
+void PdfGpuView::drawSharpRegion(QPainter& p, const QPointF& orig, bool pureVector) {
+    if (m_sharpPage == m_pageIndex && qAbs(m_sharpScale - m_zoom) < 1e-6 && !m_sharpImage.isNull() && !pureVector) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        p.drawImage(QPoint(qRound(orig.x() + m_sharpRegion.x()),
+                            qRound(orig.y() + m_sharpRegion.y())), m_sharpImage);
+        p.restore();
+    }
+}
+
+void PdfGpuView::drawForeignAnnotLayers(QPainter& p, const QPointF& orig, double pw, double ph, bool pureVector) {
+    {
+        static int _fgnSig = -1;
+        const bool hasL = (m_fgnLayer != nullptr);
+        const bool rdy  = hasL && m_fgnLayer->isReady();
+        const bool same = hasL && m_fgnLayer->pageIndex() == m_pageIndex;
+        const bool img  = hasL && !m_fgnLayer->image().isNull();
+        const int sig = (pureVector?1:0) | (hasL?2:0) | (rdy?4:0) | (same?8:0) | (img?16:0);
+        if (sig != _fgnSig) {
+            _fgnSig = sig;
+            qDebug().noquote() << "[fgndraw] pureVector=" << pureVector
+                               << "hasLayer=" << hasL << "ready=" << rdy
+                               << "samePage=" << same << "hasImg=" << img
+                               << "layerPage=" << (hasL ? m_fgnLayer->pageIndex() : -1)
+                               << "viewPage=" << m_pageIndex;
+        }
+    }
+    if (pureVector && m_fgnLayer && m_fgnLayer->isReady()
+        && m_fgnLayer->pageIndex() == m_pageIndex && !m_fgnLayer->image().isNull()) {
+        p.save();
+        p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        p.drawImage(QRectF(orig.x(), orig.y(), pw, ph), m_fgnLayer->image());
+        p.restore();
+    }
+
+    if (pureVector && m_fgnRegPage == m_pageIndex
+        && qAbs(m_fgnRegScale - m_zoom) < 1e-6 && !m_fgnRegImg.isNull()) {
+        p.save();
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        p.drawImage(QPoint(qRound(orig.x() + m_fgnRegRect.x()),
+                            qRound(orig.y() + m_fgnRegRect.y())), m_fgnRegImg);
+        p.restore();
+    }
+}
+
+void PdfGpuView::drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVector) {
+    {
+        static int _lastLogPage = -1, _lastLogSize = -1;
+        bool anyMatch = false;
+        for (const auto& av : m_annotVisuals)
+            if (av.page == m_pageIndex) { anyMatch = true; break; }
+        if (!anyMatch && (_lastLogPage != m_pageIndex || _lastLogSize != m_annotVisuals.size())) {
+            _lastLogPage = m_pageIndex;
+            _lastLogSize = m_annotVisuals.size();
+            qDebug().noquote() << "[annot] overlay skipped — visualsPage="
+                << (m_annotVisuals.isEmpty() ? -1 : m_annotVisuals.first().page)
+                << "viewPage=" << m_pageIndex << "n=" << m_annotVisuals.size();
+        }
+    }
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+    int cntVis = 0, cntSticky = 0, cntDrawn = 0;
+    for (const AnnotVisual& av : m_annotVisuals) {
+        if (av.page != m_pageIndex) continue;
+        ++cntVis;
+        if (av.subtype == FPDF_ANNOT_TEXT) ++cntSticky;
+        if (!av.paintByOverlay) continue;
+        ++cntDrawn;
+        const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty() && av.uid == m_dragUid;
+        if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
+        QPointF dOrig = orig + QPointF(av.rect.x() * m_zoom, av.rect.y() * m_zoom);
+        QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
+        QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
+        p.setPen(strokePen);
+        p.setBrush(av.fill.isValid() && av.fill.alpha() > 0 ? QBrush(av.fill) : Qt::NoBrush);
+
+        switch (av.subtype) {
+            case FPDF_ANNOT_INK: {
+                for (const auto& stroke : av.ink) {
+                    if (stroke.size() < 2) continue;
+                    QPolygonF poly;
+                    for (const QPointF& pt : stroke)
+                        poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
+                    p.setBrush(Qt::NoBrush);
+                    p.drawPolyline(poly);
+                }
+                break;
+            }
+            case FPDF_ANNOT_SQUARE:
+                p.drawRect(dRect);
+                break;
+            case FPDF_ANNOT_CIRCLE:
+                p.drawEllipse(dRect);
+                break;
+            case FPDF_ANNOT_HIGHLIGHT: {
+                if (!av.quads.isEmpty()) {
+                    p.setBrush(QColor(255, 255, 0, 90));
+                    p.setPen(Qt::NoPen);
+                    for (const QRectF& qr : av.quads) {
+                        QPointF qo(orig.x() + qr.x() * m_zoom, orig.y() + qr.y() * m_zoom);
+                        p.drawRect(QRectF(qo, QSizeF(qr.width() * m_zoom, qr.height() * m_zoom)));
+                    }
+                } else {
+                    p.setBrush(QColor(255, 255, 0, 90));
+                    p.setPen(Qt::NoPen);
+                    p.drawRect(dRect);
+                }
+                break;
+            }
+            case FPDF_ANNOT_LINE: {
+                QPointF lA(orig.x() + av.rect.left() * m_zoom, orig.y() + av.rect.top() * m_zoom);
+                QPointF lB(orig.x() + av.rect.right() * m_zoom, orig.y() + av.rect.bottom() * m_zoom);
+                p.drawLine(lA, lB);
+                break;
+            }
+            case FPDF_ANNOT_POLYGON: {
+                if (!av.ink.isEmpty() && av.ink[0].size() >= 3) {
+                    QPolygonF poly;
+                    for (const QPointF& pt : av.ink[0])
+                        poly << QPointF(orig.x() + pt.x() * m_zoom, orig.y() + pt.y() * m_zoom);
+                    p.drawPolygon(poly);
+                }
+                break;
+            }
+            case FPDF_ANNOT_FREETEXT: {
+                double fs = qMax(6.0, av.fontSize * m_zoom);
+                QFont ft = p.font();
+                ft.setPointSizeF(fs);
+                p.setFont(ft);
+                p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
+                p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
+                break;
+            }
+            default: break;
+        }
+        if (isDragged) p.restore();
+    }
+    {
+        static int sV = -1, sS = -1, sD = -1;
+        if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
+            sV = cntVis; sS = cntSticky; sD = cntDrawn;
+            qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
+        }
+    }
+    p.restore();
 }

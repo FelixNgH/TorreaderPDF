@@ -39,6 +39,7 @@ public:
     const QVector<QRectF>&  clips() const { return m_clips; }
     const QVector<float>&   clipIdx() const { return m_clipIdx; }
     const QVector<float>&   fillClipIdx() const { return m_fillClipIdx; }
+    int fillOpaqueFloats() const { return m_fillOpaqueFloats; }
     // Kich thuoc hop crop CHUA xoay (khong gian toa do cua m_verts/rectPt/m_clips)
     QSizeF pageSizePt() const { return m_pageSize; }
     // So vong xoay cua trang: 0=0deg, 1=90, 2=180, 3=270 (theo /Rotate)
@@ -64,6 +65,7 @@ private:
     QVector<QRectF>  m_clips;
     QVector<float>   m_clipIdx;
     QVector<float>   m_fillClipIdx;
+    int m_fillOpaqueFloats = 0;
     quint32 m_tilesGen = 0;
     QVector<int> m_noteObjIdx;
     int m_buildObjCount = 0;

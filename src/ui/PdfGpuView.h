@@ -72,8 +72,7 @@ public:
     void setHighlights(const QList<QRectF>& rects);
     void setHighlights(const QList<QRectF>& all, int currentIdx);
     void clearHighlights();
-    void setAnnotOverlays(const QList<AnnotOverlay>& overlays);
-    void clearAnnotOverlays();
+
     void setAnnotVisuals(const QList<AnnotVisual>& visuals);
     void clearAnnotVisuals();
     void addPendingMarkup(AnnotTool tool, const AnnotStyle& style, QPointF a, QPointF b, const QVector<QPointF>& freehand = {});
@@ -180,6 +179,10 @@ private:
     GLuint m_tileVao = 0;
     bool    shouldUseVectorOverlay() const;
     void    drawVectorOverlay();
+    void    drawPageBase(bool pureVector);
+    void    drawSharpRegion(QPainter& p, const QPointF& orig, bool pureVector);
+    void    drawForeignAnnotLayers(QPainter& p, const QPointF& orig, double pw, double ph, bool pureVector);
+    void    drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVector);
     mutable bool m_vecLastOverlayState = false; // ponytail: tracks last shouldUseVectorOverlay result for logging
     bool    m_vecDrawLogged = false;             // ponytail: log first successful vector draw only
     double  m_lastTileLogZoom = -1;
@@ -252,7 +255,6 @@ private:
     QList<AnnotVisual>      m_annotVisuals;
     QList<QRectF>           m_highlights;
     int                     m_currentHighlightIdx = -1;
-    QList<AnnotOverlay>     m_annotOverlays;
     QVector<PendingMarkup>  m_pendingMarkups;
 
     QTimer* m_zoomTimer     = nullptr;

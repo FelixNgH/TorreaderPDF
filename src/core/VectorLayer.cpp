@@ -38,6 +38,7 @@ void VectorLayer::clear() {
     m_clips.clear();
     m_clipIdx.clear();
     m_fillClipIdx.clear();
+    m_fillOpaqueFloats = 0;
     m_noteObjIdx.clear();
     m_buildObjCount = 0;
 }
@@ -125,13 +126,34 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
         return b > a + 1e-9;
     };
 
+    int dbgSegClipped = 0;
+    int dbgSegRescued = 0;
     auto emitSegRaw = [&](float x0, float y0, float x1, float y1) {
+
         m_verts.append(x0); m_verts.append(y0);
         m_verts.append(x1); m_verts.append(y1);
         m_colors.append(vr); m_colors.append(vg); m_colors.append(vb); m_colors.append(va);
         m_widths.append(curWidth);
         m_depths.append(curDepth);
         m_clipIdx.append(curClip);
+    };
+
+    // ponytail: khoang cach nho nhat giua 2 doan thang — dung de cuu net nam sat mep clip
+    auto segSegDist = [](double ax0,double ay0,double ax1,double ay1,
+                         double bx0,double by0,double bx1,double by1) -> double {
+        auto ptSeg = [](double px,double py,double x0,double y0,double x1,double y1)->double{
+            const double dx=x1-x0, dy=y1-y0;
+            const double L2=dx*dx+dy*dy;
+            double t = (L2>1e-12) ? ((px-x0)*dx + (py-y0)*dy)/L2 : 0.0;
+            t = t<0.0?0.0:(t>1.0?1.0:t);
+            const double qx=x0+t*dx, qy=y0+t*dy;
+            return std::hypot(px-qx, py-qy);
+        };
+        double d = ptSeg(ax0,ay0,bx0,by0,bx1,by1);
+        d = qMin(d, ptSeg(ax1,ay1,bx0,by0,bx1,by1));
+        d = qMin(d, ptSeg(bx0,by0,ax0,ay0,ax1,ay1));
+        d = qMin(d, ptSeg(bx1,by1,ax0,ay0,ax1,ay1));
+        return d;
     };
 
     auto emitSeg = [&](float x0, float y0, float x1, float y1) {
@@ -149,7 +171,30 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                 }
             }
             segs = next;
-            if (segs.isEmpty()) return;
+            if (segs.isEmpty()) {
+                // Net nam sat mep clip: duong tam roi ra ngoai nhung MOT NUA BE RONG net
+                // van phai hien. Do khoang cach toi cac canh tam giac clip; trong pham vi
+                // nua be rong thi giu nguyen doan, con hon vut sach ca net.
+                const double margin = double(curWidth) * 0.5 + 0.05;
+                if (margin > 0.05) {
+                    double best = 1e30;
+                    for (const QVector<QPointF>& tris2 : *curClipTris) {
+                        for (int ti = 0; ti + 2 < tris2.size(); ti += 3) {
+                            const QPointF& p0 = tris2[ti];
+                            const QPointF& p1 = tris2[ti+1];
+                            const QPointF& p2 = tris2[ti+2];
+                            best = qMin(best, segSegDist(x0,y0,x1,y1, p0.x(),p0.y(), p1.x(),p1.y()));
+                            best = qMin(best, segSegDist(x0,y0,x1,y1, p1.x(),p1.y(), p2.x(),p2.y()));
+                            best = qMin(best, segSegDist(x0,y0,x1,y1, p2.x(),p2.y(), p0.x(),p0.y()));
+                            if (best <= margin) break;
+                        }
+                        if (best <= margin) break;
+                    }
+                    if (best <= margin) { ++dbgSegRescued; emitSegRaw(x0, y0, x1, y1); return; }
+                }
+                ++dbgSegClipped;
+                return;
+            }
             if (segs.size() > 512) { emitSegRaw(x0, y0, x1, y1); return; }
         }
         const double dx = double(x1) - double(x0), dy = double(y1) - double(y0);
@@ -206,15 +251,25 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
         }
     };
 
+    QVector<float>   tmpFillVertsA;
+    QVector<uint8_t> tmpFillColorsA;
+    QVector<float>   tmpFillDepthsA;
+    QVector<float>   tmpFillClipIdxA;
+
     auto pushTri = [&](const QPointF& a, const QPointF& b, const QPointF& c,
                        uint8_t r, uint8_t g, uint8_t bl, uint8_t al) {
         if (m_fillVerts.size() > 6'000'000) return;
         const QPointF pts[3] = {a, b, c};
+        // ponytail: fill trong suot di vao buffer tam, duoi cung moi ghep vao mang chinh
+        QVector<float>& dstV = (al < 255) ? tmpFillVertsA : m_fillVerts;
+        QVector<uint8_t>& dstC = (al < 255) ? tmpFillColorsA : m_fillColors;
+        QVector<float>& dstD = (al < 255) ? tmpFillDepthsA : m_fillDepths;
+        QVector<float>& dstI = (al < 255) ? tmpFillClipIdxA : m_fillClipIdx;
         for (const QPointF& q : pts) {
-            m_fillVerts.append(float(q.x())); m_fillVerts.append(float(q.y()));
-            m_fillColors.append(r); m_fillColors.append(g); m_fillColors.append(bl); m_fillColors.append(al);
-            m_fillDepths.append(curDepth);
-            m_fillClipIdx.append(curClip);
+            dstV.append(float(q.x())); dstV.append(float(q.y()));
+            dstC.append(r); dstC.append(g); dstC.append(bl); dstC.append(al);
+            dstD.append(curDepth);
+            dstI.append(curClip);
         }
     };
     // Phan ra vung clip thanh HINH THANG bang quet doc (scanline) theo luat EVEN-ODD, roi cat doi
@@ -330,7 +385,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     int dbgFillTranslucent = 0;
     int dbgFillBlack = 0;
     int dbgBigFillLog = 0;
-    int imgsNative = 0, imgsFallback = 0;
+    int imgsNative = 0, imgsFallback = 0, imgsMasked = 0;
     int dbgTextOpaque = 0;
     int dbgTextAlphaMax255 = 0;
     m_clips.clear();
@@ -340,7 +395,6 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     clipTriCache.reserve(1024);   // bot rehash -> bot rui ro con tro treo
     int dbgClipPolyBuilt = 0, dbgFillClipped = 0, dbgFillClipBail = 0;
     int dbgClipPtr = 0, dbgClipNoGeom = 0, dbgClipTooBig = 0;
-
     for (int oi = 0; oi < nObj; ++oi) {
         curDepth = 1.0f - float(oi + 1) / float(nObj + 1);
         FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, oi);
@@ -502,15 +556,75 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             float l = 0, b = 0, r = 0, tp = 0;
             if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &tp)) continue;
             if (r <= l || tp <= b) continue;
-            FPDF_BITMAP bmp = FPDFImageObj_GetBitmap(obj);
-            bool fromNative = (bmp != nullptr);
-            if (fromNative) ++imgsNative; else ++imgsFallback;
-            if (!bmp) bmp = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+            // ponytail: GetBitmap tra pixel goc, bo qua /SMask -> KHOI DEN cho anh trong suot.
+            //    Thu RenderedBitmap truoc; neu co alpha < 255 thi anh co mat na, dung no.
+            //    Khong thi fallback pixel goc cho sac net.
+            FPDF_BITMAP bmp = nullptr;
+            bool fromNative = false;
+            bool rbUsed = false;
+            {
+                // Do phan giai cua GetRenderedBitmap bam theo ma tran doi tuong (co tren trang).
+                // Anh mat na bi thu nho nhieu lan => alpha loang => chu nhat. Tam phong ma tran
+                // len cho gan do phan giai goc roi TRA LAI NGAY.
+                FPDF_BITMAP rb = nullptr;
+                {
+                    FPDF_IMAGEOBJ_METADATA md{};
+                    unsigned int natW = 0, natH = 0;
+                    if (FPDFImageObj_GetImageMetadata(obj, page, &md)) {
+                        natW = md.width; natH = md.height;
+                    }
+                    FS_MATRIX om{};
+                    const bool haveM = FPDFPageObj_GetMatrix(obj, &om) != 0;
+                    rb = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                    if (rb && haveM && natW > 0 && natH > 0) {
+                        const int rw0 = FPDFBitmap_GetWidth(rb);
+                        const int rh0 = FPDFBitmap_GetHeight(rb);
+                        if (rw0 > 0 && rh0 > 0) {
+                            double k = qMin(double(natW) / double(rw0), double(natH) / double(rh0));
+                            const double kCap = std::sqrt(4000000.0 / double(qMax(1, rw0 * rh0)));
+                            k = qMin(k, kCap);
+                            if (k > 1.2) {
+                                FS_MATRIX big{ float(om.a * k), float(om.b * k),
+                                               float(om.c * k), float(om.d * k), om.e, om.f };
+                                if (FPDFPageObj_SetMatrix(obj, &big)) {
+                                    FPDF_BITMAP rb2 = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                                    FPDFPageObj_SetMatrix(obj, &om);
+                                    if (rb2) { FPDFBitmap_Destroy(rb); rb = rb2; }
+                                }
+                            }
+                        }
+                    }
+                }
+                bool rbHasAlpha = false;
+                if (rb && FPDFBitmap_GetFormat(rb) == FPDFBitmap_BGRA) {
+                    const int rw = FPDFBitmap_GetWidth(rb), rh = FPDFBitmap_GetHeight(rb);
+                    const int rs = FPDFBitmap_GetStride(rb);
+                    const unsigned char* rp = (const unsigned char*)FPDFBitmap_GetBuffer(rb);
+                    if (rp) {
+                        for (int y = 0; y < rh && !rbHasAlpha; y += 3)
+                            for (int x = 0; x < rw; x += 3)
+                                if (rp[y * rs + x * 4 + 3] < 255) { rbHasAlpha = true; break; }
+                    }
+                }
+                if (rbHasAlpha) {
+                    bmp = rb;
+                    rbUsed = true;
+                    ++imgsMasked;
+                } else {
+                    if (rb) FPDFBitmap_Destroy(rb);
+                    bmp = FPDFImageObj_GetBitmap(obj);
+                    fromNative = (bmp != nullptr);
+                    if (fromNative) ++imgsNative; else ++imgsFallback;
+                    if (!bmp) bmp = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                }
+            }
             if (!bmp) continue;
             int bw = FPDFBitmap_GetWidth(bmp), bh = FPDFBitmap_GetHeight(bmp);
             if (bw > 0 && bh > 0) {
                 const int fmt = FPDFBitmap_GetFormat(bmp);
-                QImage::Format qfmt = QImage::Format_ARGB32;
+                // PDFium tra BGRA voi alpha NHAN SAN. Doc bang Format_ARGB32 (alpha roi)
+                // se lam sai mau moi pixel co alpha < 255 -> vien lom dom, "nhieu mau".
+                QImage::Format qfmt = QImage::Format_ARGB32_Premultiplied;
                 if (fmt == FPDFBitmap_BGR)        qfmt = QImage::Format_BGR888;
                 else if (fmt == FPDFBitmap_BGRx)  qfmt = QImage::Format_RGB32;
                 else if (fmt == FPDFBitmap_Gray)  qfmt = QImage::Format_Grayscale8;
@@ -518,6 +632,18 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                             FPDFBitmap_GetStride(bmp), qfmt);
                 TextTile tile;
                 tile.img = view.convertToFormat(QImage::Format_ARGB32);
+                {   // DO: ghi 2 anh dau tien co mat na ra file de doi chieu mau
+                    static int _nd = 0;
+                    static const QByteArray _dd = qgetenv("TORREADER_FBDUMP");
+                    if (rbUsed && _nd < 2 && !_dd.isEmpty()) {
+                        tile.img.save(QString::fromUtf8(_dd) + "/img_masked_"
+                                      + QString::number(_nd) + ".png");
+                        qDebug().noquote() << "[imgdump] mat na #" << _nd
+                                           << "size=" << bw << "x" << bh
+                                           << "fmtPdfium=" << fmt;
+                        ++_nd;
+                    }
+                }
                 tile.rectPt = QRectF(l - originX, topY - tp, r - l, tp - b);
                 tile.depth = curDepth;
                 tile.clipIdx = curClip;
@@ -584,6 +710,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             int segType = FPDFPathSegment_GetType(seg);
             float sx = 0, sy = 0;
             FPDFPathSegment_GetPoint(seg, &sx, &sy);
+
 
             float mx = mat.a * sx + mat.c * sy + mat.e - originX;
             float my = mat.b * sx + mat.d * sy + mat.f;
@@ -739,6 +866,12 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
 
     FPDF_ClosePage(page);
     m_ready = true;
+    m_fillOpaqueFloats = m_fillVerts.size();
+    m_fillVerts   += tmpFillVertsA;
+    m_fillColors  += tmpFillColorsA;
+    m_fillDepths  += tmpFillDepthsA;
+    m_fillClipIdx += tmpFillClipIdxA;
+
     m_complete = complete;
     m_buildObjCount = nObj;
     ++m_tilesGen;
@@ -749,7 +882,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                        << "texts=" << m_texts.size()
                        << "imgs=" << m_images.size()
                        << "imgsNative=" << imgsNative
-                       << "imgsFallback=" << imgsFallback
+                        << "imgsFallback=" << imgsFallback
+                        << "imgsMasked=" << imgsMasked
                        << "fills=" << m_fillVerts.size() / 6
                        << "fillObjs=" << dbgFillMode
                         << "subEmpty=" << dbgSubEmpty
@@ -764,7 +898,9 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                           << "clipTooBig=" << dbgClipTooBig
                           << "clipPoly=" << dbgClipPolyBuilt
                           << "fillClipped=" << dbgFillClipped
-                          << "fillClipBail=" << dbgFillClipBail
+                           << "fillClipBail=" << dbgFillClipBail
+                           << "segClipped=" << dbgSegClipped
+                           << "segRescued=" << dbgSegRescued
                           << "complete=" << (complete ? 1 : 0)
                          << "completeReason=" << completeReason
                        << "ms=" << t.elapsed();

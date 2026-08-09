@@ -473,9 +473,12 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
         for (int i = 0; i < count; ++i) {
             FPDF_ANNOTATION a = FPDFPage_GetAnnot(fpage, i);
             if (!a) continue;
+            // Chi tinh annot THUC SU co hinh de ve (co /AP). Annot khong co /AP
+            // (Link, Widget rong...) khong tao ra pixel nao => dung lop bu la vo ich.
             if (FPDFAnnot_HasKey(a, "TRUID") == 0
                 && !(FPDFAnnot_GetFlags(a) & FPDF_ANNOT_FLAG_HIDDEN)
-                && FPDFAnnot_GetSubtype(a) != FPDF_ANNOT_POPUP)
+                && FPDFAnnot_GetSubtype(a) != FPDF_ANNOT_POPUP
+                && FPDFAnnot_HasKey(a, "AP") != 0)
                 ++foreignCount;
             FPDFPage_CloseAnnot(a);
         }

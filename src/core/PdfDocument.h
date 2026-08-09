@@ -48,6 +48,11 @@ public:
     // Lazy: chi LoadPage lan dau cho moi trang roi cache (LoadPage tren trang CAD ton ~1,3s).
     QPointF pageBoxOrigin(int pageIndex) const;
 
+    // Read cache only — NEVER locks pdfium, NEVER LoadPage.
+    // Returns (0,0) if unknown; render thread fills via updatePageBoxOrigin().
+    // Use THIS on the UI thread — pageBoxOrigin() can block and freeze the GUI.
+    QPointF pageBoxOriginCached(int pageIndex) const;
+
     FPDF_DOCUMENT raw() const { return m_doc; }
     QString filePath() const { return m_filePath; }
 

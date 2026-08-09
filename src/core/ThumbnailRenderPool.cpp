@@ -33,8 +33,11 @@ ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cac
 
 void ThumbnailWorker::enqueue(int pageIndex, int priority) {
     QMutexLocker lock(&m_mutex);
-    if (m_queued.contains(pageIndex)) return;
-    m_queued.insert(pageIndex);
+    // Allow priority upgrade: if page is already queued at worse priority, push a better one.
+    // Old entry stays in heap and is lazily discarded when popped (priority mismatch).
+    auto it = m_queuedPrio.constFind(pageIndex);
+    if (it != m_queuedPrio.constEnd() && *it <= priority) return;
+    m_queuedPrio.insert(pageIndex, priority);
     m_queue.push(ThumbRequest{pageIndex, priority});
     m_cond.wakeOne();
 }
@@ -55,7 +58,11 @@ void ThumbnailWorker::run() {
             if (m_stop && m_queue.empty()) break;
             req = m_queue.top();
             m_queue.pop();
-            m_queued.remove(req.pageIndex);
+            // Lazy deletion: if this entry's priority doesn't match the best known,
+            // it's a stale duplicate from before a priority upgrade -> discard.
+            auto pit = m_queuedPrio.constFind(req.pageIndex);
+            if (pit == m_queuedPrio.constEnd() || *pit != req.priority) { req.pageIndex = -1; }
+            else m_queuedPrio.remove(req.pageIndex);
         }
 
         if (!m_doc || req.pageIndex < 0) continue;
@@ -94,7 +101,7 @@ void ThumbnailWorker::run() {
                     if (req.yieldTries % 10 == 0)
                         qDebug() << "[perf] thumb YIELD page=" << req.pageIndex
                                  << "tries=" << req.yieldTries;
-                    m_queued.insert(req.pageIndex);
+                    m_queuedPrio.insert(req.pageIndex, req.priority);
                     m_queue.push(req);
                     QThread::msleep(20);
                     continue;

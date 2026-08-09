@@ -38,8 +38,7 @@ public:
     void setTool(ViewTool tool);
     void setHighlights(const QList<QRectF>& rects);
     void clearHighlights();
-    void setAnnotOverlays(const QList<AnnotOverlay>& overlays);
-    void clearAnnotOverlays();
+
 
     double   zoom()        const { return m_zoom; }
     int      currentPage() const { return m_pageIndex; }
@@ -86,7 +85,6 @@ private:
     ViewTool     m_tool        = ViewTool::Pan;
     ViewMode     m_viewMode    = ViewMode::Single;
     QList<QRectF>       m_highlights;
-    QList<AnnotOverlay> m_annotOverlays;
 
     // Shape drawing
     bool    m_drawingShape = false;

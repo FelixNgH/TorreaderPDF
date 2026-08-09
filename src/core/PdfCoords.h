@@ -22,9 +22,15 @@ inline QPointF pdfBoxOrigin(FPDF_PAGE page) {
     return QPointF(double(l), double(b));
 }
 
+// 🔴 ox/oy (goc hop trang) KHONG CO GIA TRI MAC DINH — day la CO Y.
+//    Trang xuat tu CAD/Revit co goc hop lay TAM trang lam goc (vd -1191.97,-841.89).
+//    Neu de mac dinh 0 thi quen truyen se chay em ma LECH NUA TRANG (loi that 2026-08-07).
+//    Bo mac dinh => quen truyen la loi bien dich. Dung them lai `= 0.0`.
+//    Lay goc bang pdfBoxOrigin(page).
+
 // Unrotated PDF → display (Y-down, rotation applied).
 inline QPointF pdfToDisp(double xu, double yu, double Wd, double Hd, int rot,
-                         double ox = 0.0, double oy = 0.0) {
+                         double ox, double oy) {
     xu -= ox;
     yu -= oy;
     switch (rot) {
@@ -36,7 +42,7 @@ inline QPointF pdfToDisp(double xu, double yu, double Wd, double Hd, int rot,
 }
 
 inline QRectF pdfRectToDisp(const QRectF& r, double Wd, double Hd, int rot,
-                            double ox = 0.0, double oy = 0.0) {
+                            double ox, double oy) {
     QPointF tl = pdfToDisp(r.left(), r.top(), Wd, Hd, rot, ox, oy);
     QPointF br = pdfToDisp(r.right(), r.bottom(), Wd, Hd, rot, ox, oy);
     return QRectF(tl, br).normalized();
@@ -44,7 +50,7 @@ inline QRectF pdfRectToDisp(const QRectF& r, double Wd, double Hd, int rot,
 
 // Display → unrotated PDF (inverse of pdfToDisp).
 inline QPointF dispToPdf(double xd, double yd, double Wd, double Hd, int rot,
-                         double ox = 0.0, double oy = 0.0) {
+                         double ox, double oy) {
     QPointF p;
     switch (rot) {
         case 1:  p = { yd,       xd };            break;

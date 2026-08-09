@@ -65,6 +65,30 @@ or relinked. TorReader PDF bundles no proprietary or non-open-source code.
 </p>
 )";
 
+static const char* kShortcutText = R"(
+<h3 style='margin-top:0'>Keyboard shortcuts</h3>
+<table cellspacing='6'>
+<tr><td><b>Ctrl+O</b></td><td>Open PDF</td></tr>
+<tr><td><b>Ctrl+S</b> / <b>Ctrl+Shift+S</b></td><td>Save / Save As</td></tr>
+<tr><td><b>Ctrl+M</b></td><td>Merge PDFs</td></tr>
+<tr><td><b>Ctrl+Shift+E</b></td><td>Extract all pages</td></tr>
+<tr><td><b>Ctrl+P</b></td><td>Print</td></tr>
+<tr><td><b>C</b></td><td>Toggle Continuous scroll</td></tr>
+<tr><td><b>Ctrl+Shift+F</b></td><td>Fit page</td></tr>
+<tr><td><b>Ctrl+=</b> / <b>Ctrl+&minus;</b></td><td>Zoom in / out</td></tr>
+<tr><td><b>T</b></td><td>Translate mode</td></tr>
+<tr><td><b>F1</b></td><td>Show this help</td></tr>
+</table>
+<h3>Mouse</h3>
+<table cellspacing='6'>
+<tr><td><b>Ctrl+Scroll</b></td><td>Zoom in / out</td></tr>
+<tr><td><b>Alt+Drag</b></td><td>Select text to translate</td></tr>
+<tr><td><b>Scroll</b></td><td>Flip page</td></tr>
+<tr><td><b>Right-click thumbnail</b></td><td>Page options: Insert / Delete / Extract</td></tr>
+<tr><td><b>Right-click Translate</b></td><td>Reset translation consent</td></tr>
+</table>
+)";
+
 AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     setWindowTitle("About TorReader PDF");
     setFixedSize(500, 400);
@@ -143,6 +167,16 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     aLayout->addStretch();
     tabs->addTab(aboutWidget, "About");
 
+    // ── Tab: Shortcuts ────────────────────────────────────────────────────────
+    auto* shortcutWidget = new QWidget;
+    auto* sLayout = new QVBoxLayout(shortcutWidget);
+    sLayout->setContentsMargins(8, 8, 8, 8);
+    auto* shortcutBrowser = new QTextBrowser;
+    shortcutBrowser->setHtml(kShortcutText);
+    shortcutBrowser->setOpenExternalLinks(false);
+    sLayout->addWidget(shortcutBrowser, 1);
+    tabs->addTab(shortcutWidget, "Shortcuts");
+
     // ── Tab: Licenses ─────────────────────────────────────────────────────────
     auto* licWidget = new QWidget;
     auto* lLayout = new QVBoxLayout(licWidget);
@@ -200,4 +234,10 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     main->addLayout(btnRow);
 
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
+}
+
+void AboutDialog::showShortcutsTab() {
+    // Tab order: About=0, Shortcuts=1, Licenses=2
+    if (auto* tabs = findChild<QTabWidget*>())
+        tabs->setCurrentIndex(1);
 }
