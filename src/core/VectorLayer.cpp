@@ -101,6 +101,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     float   dashRun = 0.0f;
     float   curDepth = 1.0f;
     float   curClip = 0.0f;
+    bool    curStroke = false;
     const QVector<QVector<QPointF>>* curClipTris = nullptr;
 
     // Cat doan [p0,p1] vao TAM GIAC t[0..2] (luon loi). Tra ve true + khoang tham so [a,b] con lai.
@@ -128,6 +129,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
 
     int dbgSegClipped = 0;
     int dbgSegRescued = 0;
+    int dbgStrokeSkipped = 0;
     auto emitSegRaw = [&](float x0, float y0, float x1, float y1) {
 
         m_verts.append(x0); m_verts.append(y0);
@@ -205,6 +207,10 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     };
 
     auto emitStroke = [&](float x0, float y0, float x1, float y1) {
+        // ponytail: path chi-TO khong duoc ve duong bao. PDF spec: khong co toan tu stroke thi khong ve net.
+        // Truoc day emitStroke goi vo dieu kien nen moi mang to bi vien mo bao quanh (Revit dat nen trang sau
+        // moi nhan chu => moi text co 1 o vien).
+        if (!curStroke) { ++dbgStrokeSkipped; return; }
         if (curDash.isEmpty()) { emitSeg(x0, y0, x1, y1); return; }
         float cycle = 0.0f;
         for (float d : curDash) cycle += d;
@@ -661,6 +667,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
         FPDFPath_GetDrawMode(obj, &fillMode, &strokeBool);
         bool hasStroke = (strokeBool != 0);
         if (!hasStroke && fillMode == 0) continue;
+        curStroke = hasStroke;
 
         unsigned int sr = 0, sg = 0, sb = 0, sa = 0;
         if (!FPDFPageObj_GetStrokeColor(obj, &sr, &sg, &sb, &sa)) continue;
@@ -901,6 +908,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                            << "fillClipBail=" << dbgFillClipBail
                            << "segClipped=" << dbgSegClipped
                            << "segRescued=" << dbgSegRescued
+                           << "strokeSkipped=" << dbgStrokeSkipped
                           << "complete=" << (complete ? 1 : 0)
                          << "completeReason=" << completeReason
                        << "ms=" << t.elapsed();
