@@ -1,0 +1,30 @@
+﻿Group,Tool,Tag,Free,Open-source,Portable,Offline,Large/CAD,Merge+Insert,Split+Extract,Sign,Markup,Translate,Win+Linux,OCR
+Commercial,ABBYY FineReader PDF,paid · OCR,X,X,X,✓,◐,✓,✓,✓,✓,X,◐,✓
+Commercial,Adobe Acrobat Pro,paid,X,X,X,✓,◐,✓,✓,✓,✓,X,X,✓
+Commercial,Bluebeam Revu,paid · AEC/CAD,X,X,X,✓,✓,✓,◐,✓,✓,X,X,✓
+Commercial,Foxit PDF Editor,paid,X,X,X,✓,◐,✓,✓,✓,✓,X,◐,✓
+Commercial,Kofax Power PDF,paid,X,X,X,✓,◐,✓,✓,✓,✓,X,◐,✓
+Commercial,Nitro PDF Pro,paid,X,X,X,✓,◐,✓,✓,✓,✓,X,X,✓
+Commercial,PDF-XChange Editor,paid / free tier,◐,X,◐,✓,✓,✓,✓,✓,✓,X,X,✓
+Commercial,Wondershare PDFelement,paid,X,X,X,✓,◐,✓,✓,✓,✓,◐,◐,✓
+Open-source,Evince / GNOME,free · OSS,✓,✓,X,✓,◐,X,X,X,◐,X,◐,X
+Open-source,MuPDF,free · OSS,✓,✓,✓,✓,✓,◐,◐,X,X,X,✓,X
+Open-source,Okular (KDE),free · OSS,✓,✓,◐,✓,◐,X,X,◐,✓,X,✓,X
+Open-source,Qoppa PDF Studio Viewer,free viewer,✓,X,X,✓,◐,X,X,◐,✓,X,✓,X
+Open-source,Sumatra PDF,free · OSS · viewer,✓,✓,✓,✓,✓,X,X,X,X,X,X,X
+Open-source,TorReader PDF,free · OSS,✓,✓,✓,✓,✓,✓,✓,✓,✓,✓,✓,✓
+Open-source,Xodo PDF,freemium,✓,X,X,◐,◐,✓,✓,✓,✓,X,◐,◐
+Self-hosted,PDF Arranger,OSS · pages only,✓,✓,◐,✓,X,✓,✓,X,X,X,◐,X
+Self-hosted,pdfcpu,OSS · CLI/lib,✓,✓,✓,✓,◐,✓,✓,◐,X,X,✓,X
+Self-hosted,PDFsam Basic,OSS · merge/split,✓,✓,◐,✓,◐,✓,✓,X,X,X,✓,X
+Self-hosted,Stirling-PDF,OSS · self-host,✓,✓,◐,✓,◐,✓,✓,✓,◐,X,✓,✓
+Web,Chrome / Edge (PDFium),free · built-in,✓,◐,X,✓,◐,X,X,X,◐,X,✓,X
+Web,iLovePDF,web · freemium,◐,X,X,X,◐,✓,✓,✓,◐,X,✓,◐
+Web,PDF24 Tools,free · web/desktop,✓,X,◐,◐,◐,✓,✓,✓,◐,X,◐,✓
+Web,Sejda,freemium,◐,X,X,◐,◐,✓,✓,✓,✓,X,✓,◐
+Web,Smallpdf,web · freemium,◐,X,X,X,◐,✓,✓,✓,◐,X,✓,◐
+
+Legend,,,,,,,,,,,,,,
+,✓check = full support,,,,,,,,,,,,,
+,"◐ half = partial, limited or paid tier only",,,,,,,,,,,,,
+,X = not available
