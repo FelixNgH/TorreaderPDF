@@ -4,9 +4,7 @@
     <img src="docs/logo_per.png" alt="TorReader PDF" width="140">
   </picture>
 </p>
-
 <h1 align="center">TorReader PDF</h1>
-
 <p align="center">
   <a href="https://github.com/FelixNgH/TorreaderPDF/releases/latest"><img src="https://img.shields.io/github/v/release/FelixNgH/TorreaderPDF" alt="Release"></a>
   <a href="https://github.com/FelixNgH/TorreaderPDF/releases"><img src="https://img.shields.io/github/downloads/FelixNgH/TorreaderPDF/total" alt="Downloads"></a>
