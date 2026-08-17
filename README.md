@@ -103,8 +103,8 @@ TorReader PDF is listed in its category, not on a pedestal.
 <summary><b>Full comparison table — 24 tools × 12 jobs</b> (click to expand)</summary>
 <br>
 
-| Tool | Free | Open-source | Portable | Offline | Large/CAD | Merge+Insert | Split+Extract | Sign | Markup | Translate | Win+Linux | **OCR** |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Tool | Free | OSS | Port | Off | CAD | Merge | Split | Sign | Mark | Tr | Lnx | OCR |
+|:---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | **Commercial** | | | | | | | | | | | | |
 | ABBYY FineReader PDF | ○ | ○ | ○ | ● | ◐ | ● | ● | ● | ● | ○ | ◐ | ● |
 | Adobe Acrobat Pro | ○ | ○ | ○ | ● | ◐ | ● | ● | ● | ● | ○ | ○ | ● |
@@ -118,7 +118,7 @@ TorReader PDF is listed in its category, not on a pedestal.
 | Evince / GNOME | ● | ● | ○ | ● | ◐ | ○ | ○ | ○ | ◐ | ○ | ◐ | ○ |
 | MuPDF | ● | ● | ● | ● | ● | ◐ | ◐ | ○ | ○ | ○ | ● | ○ |
 | Okular (KDE) | ● | ● | ◐ | ● | ◐ | ○ | ○ | ◐ | ● | ○ | ● | ○ |
-| Qoppa PDF Studio Viewer | ● | ○ | ○ | ● | ◐ | ○ | ○ | ◐ | ● | ○ | ● | ○ |
+| Qoppa Studio Viewer | ● | ○ | ○ | ● | ◐ | ○ | ○ | ◐ | ● | ○ | ● | ○ |
 | Sumatra PDF | ● | ● | ● | ● | ● | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
 | **TorReader PDF** | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
 | Xodo PDF | ● | ○ | ○ | ◐ | ◐ | ● | ● | ● | ● | ○ | ◐ | ◐ |
@@ -128,7 +128,7 @@ TorReader PDF is listed in its category, not on a pedestal.
 | PDFsam Basic | ● | ● | ◐ | ● | ◐ | ● | ● | ○ | ○ | ○ | ● | ○ |
 | Stirling-PDF | ● | ● | ◐ | ● | ◐ | ● | ● | ● | ◐ | ○ | ● | ● |
 | **Web** | | | | | | | | | | | | |
-| Chrome / Edge (PDFium) | ● | ◐ | ○ | ● | ◐ | ○ | ○ | ○ | ◐ | ○ | ● | ○ |
+| Chrome / Edge | ● | ◐ | ○ | ● | ◐ | ○ | ○ | ○ | ◐ | ○ | ● | ○ |
 | iLovePDF | ◐ | ○ | ○ | ○ | ◐ | ● | ● | ● | ◐ | ○ | ● | ◐ |
 | PDF24 Tools | ● | ○ | ◐ | ◐ | ◐ | ● | ● | ● | ◐ | ○ | ◐ | ● |
 | Sejda | ◐ | ○ | ○ | ◐ | ◐ | ● | ● | ● | ● | ○ | ● | ◐ |
@@ -136,7 +136,7 @@ TorReader PDF is listed in its category, not on a pedestal.
 
 </details>
 
-<sub>● full · ◐ partial, limited or paid-tier only · ○ not available. Positioning as of 2026 —
+<sub>Port = portable · Off = works offline · CAD = opens large CAD/A0 · Mark = markup · Tr = translate · Lnx = Windows + Linux.<br>● full · ◐ partial, limited or paid-tier only · ○ not available. Positioning as of 2026 —
 feature sets vary by version and licence tier; verify the current release before deciding.
 Source data: [`docs/compare_matrix.csv`](docs/compare_matrix.csv).</sub>
 
