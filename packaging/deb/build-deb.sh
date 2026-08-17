@@ -5,7 +5,7 @@ set -euo pipefail
 # packaging/appimage/repack-metadata.sh (cloud.torreader.TorReader metadata).
 
 APPIMAGE="${1:?Usage: $0 <path-to-AppImage> [version]}"
-VERSION="${2:-2.2.4}"
+VERSION="${2:-2.4.0}"
 PKGNAME="torreader"
 ARCH="amd64"
 DEB="${PKGNAME}_${VERSION}_${ARCH}.deb"

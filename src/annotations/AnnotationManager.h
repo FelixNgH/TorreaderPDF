@@ -58,6 +58,9 @@ struct AnnotVisual {
     QString  text;
     float    fontSize = 11.0f;
     bool     isNote = false;
+    bool     hasColor = false;  // /C co trong annot dict
+    bool     hasFill  = false;  // /IC co trong annot dict
+    bool     hasAP    = false;  // /AP co trong annot dict
     // ponytail: FreeText/Note are drawn as page objects in renderer, not by overlay
     bool     paintByOverlay = true;
 };
@@ -178,8 +181,8 @@ private:
     // ⚠️ _locked: caller must hold s_pdfiumMutex and have `page` open.
     // No lock, no LoadPage/ClosePage, no GenerateContent, no emit.
     int  removeNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId);
-    int  translateNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId,
-                                         double dx, double dy);
+    int  translateNotePageObjects_locked(FPDF_PAGE page, int pageIndex,
+                                         unsigned int noteId, double dx, double dy);
     bool objectHasNoteId(FPDF_PAGEOBJECT obj, unsigned int noteId);
     bool removeAnnot_locked(FPDF_PAGE page, int index, bool* outNeedsGen);
     bool createInlineNote_locked(FPDF_PAGE page, int pageIndex, QRectF rectPdf,
@@ -208,14 +211,12 @@ private:
     unsigned int  m_nextNoteId = 1;
     QString m_lastCreatedUid;
 
-    FPDF_PAGE m_pinPage = nullptr;
-    int       m_pinIndex = -1;
-    FPDF_PAGE m_scratchPage = nullptr;
-    int       m_scratchIndex = -1;
 public:
-    bool isSharedPage(int pageIndex) const {
-        return (m_pinPage && m_pinIndex == pageIndex) || (m_scratchPage && m_scratchIndex == pageIndex);
-    }
+    // BO LOP DEM CŨ (m_pinLru + m_scratchPage) — thay bang PageCache chung
+    // (SPEC_PAGECACHE_CORE_2026-08-16). Nhung phuong thuc nay giu nguyen ten de
+    // MainWindow / harness cũ dung duoc; than noi duoi la PageCache::acquire /
+    // forgetDocument. PageCache la chu so huu duy nhat cua FPDF_PAGE.
+    bool isSharedPage(int pageIndex) const;
     FPDF_PAGE acquireSharedPage(int pageIndex);
     void pinPage(int pageIndex);
     void pinPage_locked(int pageIndex);

@@ -26,3 +26,9 @@ Thumbs.db
 
 # aider
 .aider*
+
+# Ban sao luu cua cay phat trien — khong bao gio len repo cong khai
+*.bak
+*.bak-*
+*.bak.*
+*.CURRENT-*

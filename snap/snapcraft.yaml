@@ -1,5 +1,5 @@
 name: torreader
-version: '2.3.3'
+version: '2.4.0'
 base: core22
 grade: stable
 confinement: strict
@@ -14,6 +14,8 @@ description: |
   • Split by page count or file size, extract or insert pages from other files
   • Free in-app text translation
   • Annotations: freehand, highlight, line/arrow, text, note, rectangle
+  • OCR for scanned documents — 10 languages, bundled and fully offline
+  • Select, find and copy text — in PDFs and in scans (search ignores diacritics)
   • Full-text search (Ctrl+F, result count, sidebar Search tab)
   • Reorder / delete pages, dark mode
   • 100% offline, local — no account, no ads, no watermark
@@ -58,11 +60,15 @@ parts:
       - libqpdf-dev
       - libjpeg-dev
       - libssl-dev
+      - libtesseract-dev
+      - libleptonica-dev
       - python3-pip
       - patchelf
     stage-packages:
       - libqpdf28
       - liblcms2-2
+      - libtesseract4
+      - liblept5
     override-build: |
       set -eux
 
@@ -101,6 +107,13 @@ parts:
       patchelf --set-rpath "\$ORIGIN/../lib:\$ORIGIN/../lib/${TRIPLET}" \
         "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
       patchelf --print-rpath "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
+
+      # Du lieu OCR: 10 ngon ngu, dat canh binary vi OcrEngine::tessdataDir()
+      # tim <thu muc exe>/tessdata truoc khi thu cac duong khac.
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/bin/tessdata"
+      cp "${CRAFT_PART_SRC}"/resources/tessdata/*.traineddata \
+        "${CRAFT_PART_INSTALL}/usr/bin/tessdata/"
+      ls -1 "${CRAFT_PART_INSTALL}/usr/bin/tessdata/" | wc -l   # phai la 10
 
       # libpdfium.so (bundled pre-built binary)
       mkdir -p "${CRAFT_PART_INSTALL}/usr/lib"

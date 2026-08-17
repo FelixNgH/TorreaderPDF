@@ -36,7 +36,7 @@ inline QPointF pdfToDisp(double xu, double yu, double Wd, double Hd, int rot,
     switch (rot) {
         case 1:  return { yu,       xu };
         case 2:  return { Wd - xu,  yu };
-        case 3:  return { Hd - yu,  Wd - xu };
+        case 3:  return { Wd - yu,  Hd - xu };
         default: return { xu,       Hd - yu };
     }
 }

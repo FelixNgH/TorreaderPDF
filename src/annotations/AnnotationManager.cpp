@@ -1,5 +1,6 @@
 #include "AnnotationManager.h"
 #include "../core/PdfCoords.h"
+#include "../core/PageCache.h"
 #include <fpdf_edit.h>
 #include <fpdf_save.h>
 #include <QMutex>
@@ -131,7 +132,10 @@ void AnnotationManager::setDocument(FPDF_DOCUMENT doc, const QString& filePath) 
         QMutexLocker lk(&s_pdfiumMutex);
         const auto pend = m_pendingGen;
         for (int p : pend) flushGenerate_locked(p);
-        releaseSharedPage_locked();
+        if (m_doc && m_doc != doc) {
+            // Tai lieu cu sap bi dong — xoa trang cua no khoi PageCache (con tro chet).
+            PageCache::forgetDocument(m_doc);
+        }
     }
     m_doc  = doc;
     m_path = filePath;
@@ -144,36 +148,23 @@ AnnotationManager::~AnnotationManager() {
         QMutexLocker lk(&s_pdfiumMutex);
         const auto pend = m_pendingGen;
         for (int p : pend) flushGenerate_locked(p);
-        releaseSharedPage_locked();
+        if (m_doc) PageCache::forgetDocument(m_doc);
     }
 }
 
 FPDF_PAGE AnnotationManager::acquireSharedPage(int pageIndex) {
-    if (m_pinPage && m_pinIndex == pageIndex) return m_pinPage;
-    if (m_scratchPage && m_scratchIndex == pageIndex) return m_scratchPage;
-    if (m_scratchPage) { FPDF_ClosePage(m_scratchPage); m_scratchPage = nullptr; m_scratchIndex = -1; }
-    QElapsedTimer t; t.start();
-    m_scratchPage = FPDF_LoadPage(m_doc, pageIndex);
-    m_scratchIndex = m_scratchPage ? pageIndex : -1;
-    qDebug().noquote() << "[perf] sharedPage OPEN(scratch) page=" << pageIndex << "ms=" << t.elapsed();
-    return m_scratchPage;
+    return PageCache::acquire(m_doc, pageIndex);
 }
 
 void AnnotationManager::pinPage_locked(int pageIndex) {
-    if (m_pinPage && m_pinIndex == pageIndex) return;
-    if (m_pinPage) { FPDF_ClosePage(m_pinPage); m_pinPage = nullptr; m_pinIndex = -1; }
-    if (m_scratchPage && m_scratchIndex == pageIndex) {
-        m_pinPage = m_scratchPage; m_pinIndex = pageIndex;
-        m_scratchPage = nullptr;   m_scratchIndex = -1;
-        return;
-    }
-    QElapsedTimer t; t.start();
-    m_pinPage = FPDF_LoadPage(m_doc, pageIndex);
-    m_pinIndex = m_pinPage ? pageIndex : -1;
-    qDebug().noquote() << "[perf] sharedPage PIN page=" << pageIndex << "ms=" << t.elapsed();
+    PageCache::acquire(m_doc, pageIndex);
 }
 
 void AnnotationManager::pinPage(int pageIndex) { QMutexLocker lk(&s_pdfiumMutex); pinPage_locked(pageIndex); }
+
+bool AnnotationManager::isSharedPage(int pageIndex) const {
+    return PageCache::tryAcquire(m_doc, pageIndex) != nullptr;
+}
 
 void AnnotationManager::releaseSharedPage() {
     QMutexLocker lk(&s_pdfiumMutex);
@@ -181,28 +172,17 @@ void AnnotationManager::releaseSharedPage() {
 }
 
 void AnnotationManager::releaseSharedPage_locked() {
-    if (m_pinPage) {
-        flushGenerate_locked(m_pinIndex);
-        FPDF_ClosePage(m_pinPage);
-        m_pinPage = nullptr; m_pinIndex = -1;
-    }
-    if (m_scratchPage) {
-        flushGenerate_locked(m_scratchIndex);
-        FPDF_ClosePage(m_scratchPage);
-        m_scratchPage = nullptr; m_scratchIndex = -1;
-    }
+    if (m_doc) PageCache::forgetDocument(m_doc);
 }
 
 void AnnotationManager::flushGenerate_locked(int pageIndex) {
     if (!m_pendingGen.contains(pageIndex) || !m_doc) return;
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE p = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE p = PageCache::acquire(m_doc, pageIndex);
     if (p) {
         QElapsedTimer _gt; _gt.start();
         setOwnNoteObjectsActive(p, true);
         FPDFPage_GenerateContent(p);
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
-        if (!shared) FPDF_ClosePage(p);
     }
     m_pendingGen.remove(pageIndex);
 }
@@ -212,7 +192,7 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
     if (!m_doc) return result;
 
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return result;
 
     double pageH = FPDF_GetPageHeight(page);
@@ -345,12 +325,14 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     out.page = pageIndex;
     out.subtype = sub;
     out.uid = readAnnotString(annot, "TRUID");
+    out.hasAP = FPDFAnnot_HasKey(annot, "AP") != 0;
 
     FS_RECTF r{};
     if (FPDFAnnot_GetRect(annot, &r))
         out.rect = pdfRectToDisp(QRectF(r.left, r.bottom, r.right - r.left, r.top - r.bottom), Wd, Hd, rot, box.x(), box.y());
 
     unsigned int cr = 0, cg = 0, cb = 0, ca = 255;
+    out.hasColor = FPDFAnnot_HasKey(annot, "C") != 0;
     if (FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &cr, &cg, &cb, &ca)) {
         out.stroke = QColor(cr, cg, cb, ca);
     } else {
@@ -366,6 +348,7 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     }
 
     unsigned int fr = 255, fg = 255, fb = 255, fa = 0;
+    out.hasFill = FPDFAnnot_HasKey(annot, "IC") != 0;
     if (FPDFAnnot_HasKey(annot, "IC") &&
         FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &fr, &fg, &fb, &fa) &&
         fa > 0)
@@ -430,6 +413,14 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     if (sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT)
         out.paintByOverlay = false;
 
+    // AutoCAD sinh /Square annot VO HINH (SHX text): /Border=[0,0,0], khong /C,
+    // /IC, /AP. Theo chuan khong duoc ve gi len trang (Adobe cung khong ve).
+    // Bo qua overlay de khoi bi QPen ep thanh vien 1px do. Phai du CA BON dieu,
+    // thieu mot lai co the giau nham annot that. Annot tu app luon co /C (duoc
+    // FPDFAnnot_SetColor khi tao) nen khong bao gio dinh luat nay.
+    if (!out.hasAP && !out.hasColor && !out.hasFill && out.border == 0.0f)
+        out.paintByOverlay = false;
+
     return true;
 }
 
@@ -441,7 +432,7 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
     _perf.start();
 
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE fpage = acquireSharedPage(page);
+    FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (!fpage) { if (outOverlayCapable) *outOverlayCapable = false; return result; }
 
     int count = FPDFPage_GetAnnotCount(fpage);
@@ -498,8 +489,7 @@ bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
                                          const QString& text, const QString& author) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
     AnnotInfo info;
     bool ok = createPopupNote_locked(page, pageIndex, pointDisp, text, author, &info);
@@ -508,8 +498,10 @@ bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
         QElapsedTimer _gt; _gt.start();
         FPDFPage_GenerateContent(page);
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
+        // Trang da bi sua: bo entry cu (cac he khac khong dung handle cu) roi nap lai cho am.
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
     }
-    if (!shared) FPDF_ClosePage(page);
     lock.unlock();
     if (ok) {
         bumpPageRevision(pageIndex);
@@ -525,8 +517,7 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
     AnnotInfo info;
     bool ok = createInlineNote_locked(page, pageIndex, rectPdf, textIn, author,
@@ -539,7 +530,10 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
         invalidateNoteObjCache_locked(pageIndex);
     }
     int finalAnnotCount = FPDFPage_GetAnnotCount(page);
-    if (!shared) FPDF_ClosePage(page);
+    if (ok) {
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
+    }
     lock.unlock();
     if (ok) {
         bumpPageRevision(pageIndex);
@@ -555,17 +549,16 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     QElapsedTimer _totalT; _totalT.start();
 
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
-    if (!annot) { if (!shared) FPDF_ClosePage(page); return false; }
+    if (!annot) return false;
     if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_FREETEXT) {
-        FPDFPage_CloseAnnot(annot); if (!shared) FPDF_ClosePage(page); return false;
+        FPDFPage_CloseAnnot(annot); return false;
     }
     if (!FPDFAnnot_HasKey(annot, "TRUID") && !FPDFAnnot_HasKey(annot, "TRID")) {
-        FPDFPage_CloseAnnot(annot); if (!shared) FPDF_ClosePage(page); return false;
+        FPDFPage_CloseAnnot(annot); return false;
     }
 
     FS_RECTF r{};
@@ -615,7 +608,8 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     lock.unlock();
     bumpPageRevision(pageIndex);
     emit annotationAdded(pageIndex, info);
@@ -627,11 +621,10 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, index);
-    if (!a) { if (!shared) FPDF_ClosePage(page); return false; }
+    if (!a) return false;
 
     FS_RECTF r{};
     bool ok = FPDFAnnot_GetRect(a, &r);
@@ -646,7 +639,7 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
         // Ink cua phan mem khac co /AP rieng — remove+recreate se lam mat.
         // Khong co API sua InkList tai cho ⇒ TU CHOI di chuyen, khong pha du lieu nguoi khac.
         if (!FPDFAnnot_HasKey(a, "TRUID") && !FPDFAnnot_HasKey(a, "TRID")) {
-            FPDFPage_CloseAnnot(a); if (!shared) FPDF_ClosePage(page);
+            FPDFPage_CloseAnnot(a);
             return false;
         }
         // INK: /InkList la toa do tuyet doi — dich /Rect khong ke net theo.
@@ -682,7 +675,7 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
         s.valid = true;
         FPDFPage_CloseAnnot(a);
 
-        if (!FPDFPage_RemoveAnnot(page, index)) { if (!shared) FPDF_ClosePage(page); return false; }
+        if (!FPDFPage_RemoveAnnot(page, index)) return false;
 
         FPDF_ANNOTATION a2 = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
         if (a2) {
@@ -711,7 +704,8 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
             }
             FPDFPage_CloseAnnot(a2);
         }
-        if (!shared) FPDF_ClosePage(page);
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
         if (a2) bumpPageRevision(pageIndex);
         return a2 != nullptr;
     }
@@ -720,7 +714,7 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
     FPDFPage_CloseAnnot(a);
 
     int moved = 0;
-    if (noteId) moved = translateNotePageObjects_locked(page, noteId, dxU, dyU);
+    if (noteId) moved = translateNotePageObjects_locked(page, pageIndex, noteId, dxU, dyU);
     if (moved > 0) {
         setOwnNoteObjectsActive(page, true);
         QElapsedTimer _gt; _gt.start();
@@ -728,7 +722,10 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     }
 
-    if (!shared) FPDF_ClosePage(page);
+    if (ok) {
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
+    }
     if (ok) bumpPageRevision(pageIndex);
     qDebug().noquote() << "[perf] note moveAnnot total ms=" << _totalT.elapsed();
     return ok;
@@ -737,7 +734,7 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
 int AnnotationManager::annotCount(int pageIndex) {
     if (!m_doc) return 0;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return 0;
     int count = FPDFPage_GetAnnotCount(page);
     return count;
@@ -746,7 +743,7 @@ int AnnotationManager::annotCount(int pageIndex) {
 bool AnnotationManager::isOwnAnnot(int pageIndex, int index) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
@@ -760,19 +757,18 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     QElapsedTimer _totalT; _totalT.start();
 
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
-    if (!annot) { if (!shared) FPDF_ClosePage(page); return false; }
+    if (!annot) return false;
 
     int subtype = FPDFAnnot_GetSubtype(annot);
     if (subtype != FPDF_ANNOT_FREETEXT && subtype != FPDF_ANNOT_TEXT) {
-        FPDFPage_CloseAnnot(annot); if (!shared) FPDF_ClosePage(page); return false;
+        FPDFPage_CloseAnnot(annot); return false;
     }
     if (!FPDFAnnot_HasKey(annot, "TRUID") && !FPDFAnnot_HasKey(annot, "TRID")) {
-        FPDFPage_CloseAnnot(annot); if (!shared) FPDF_ClosePage(page); return false;
+        FPDFPage_CloseAnnot(annot); return false;
     }
 
     FS_RECTF r{};
@@ -839,7 +835,8 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     lock.unlock();
     bumpPageRevision(pageIndex);
     emit annotationAdded(pageIndex, info);
@@ -850,8 +847,7 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
 bool AnnotationManager::removeAnnot(int pageIndex, int index) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     bool needsGen = false;
     bool ok = removeAnnot_locked(page, index, &needsGen);
@@ -862,8 +858,11 @@ bool AnnotationManager::removeAnnot(int pageIndex, int index) {
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
         invalidateNoteObjCache_locked(pageIndex);
     }
-    if (!shared) FPDF_ClosePage(page);
-    if (ok) bumpPageRevision(pageIndex);
+    if (ok) {
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
+        bumpPageRevision(pageIndex);
+    }
     return ok;
 }
 
@@ -896,7 +895,7 @@ AnnotSnapshot AnnotationManager::snapshotAnnot(int pageIndex, int index) {
     AnnotSnapshot s;
     if (!m_doc) return s;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return s;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (annot) {
@@ -962,8 +961,7 @@ AnnotSnapshot AnnotationManager::snapshotAnnot(int pageIndex, int index) {
 bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
     if (!m_doc || !s.valid) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, static_cast<FPDF_ANNOTATION_SUBTYPE>(s.subtype));
     if (annot) {
@@ -995,7 +993,10 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
         // preserved by FPDF_SaveAsCopy without explicit GenerateContent.
     }
     bool ok = (annot != nullptr);
-    if (!shared) FPDF_ClosePage(page);
+    if (ok) {
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
+    }
     if (ok) bumpPageRevision(pageIndex);
     return ok;
 }
@@ -1006,7 +1007,7 @@ bool AnnotationManager::getAnnotEditState(int pageIndex, int index,
                                           bool* outHasFill, int* outFillAlpha) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
@@ -1078,13 +1079,11 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
     if (!m_doc) { m_lastError = "No document"; return false; }
 
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, annotIndex);
     if (!annot) {
-        if (!shared) FPDF_ClosePage(page);
         m_lastError = "Annotation not found";
         return false;
     }
@@ -1097,7 +1096,8 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
     QElapsedTimer _gt; _gt.start();
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     lock.unlock();
 
     bumpPageRevision(pageIndex);
@@ -1110,7 +1110,7 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
 int AnnotationManager::findAnnotIndexByUid(int pageIndex, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return -1;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return -1;
     int count = FPDFPage_GetAnnotCount(page);
     for (int i = 0; i < count; ++i) {
@@ -1134,7 +1134,7 @@ int AnnotationManager::findAnnotIndexByUid(int pageIndex, const QString& uid) {
 int AnnotationManager::findAnnotIndexByAnyUid(int pageIndex, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return -1;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return -1;
     int count = FPDFPage_GetAnnotCount(page);
     for (int i = 0; i < count; ++i) {
@@ -1160,21 +1160,20 @@ int AnnotationManager::findAnnotIndexByAnyUid(int pageIndex, const QString& uid)
 QString AnnotationManager::ensureExternalUid(int pageIndex, int index) {
     if (!m_doc) return {};
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return {};
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
-    if (!annot) { if (!shared) FPDF_ClosePage(page); return {}; }
+    if (!annot) return {};
     QString existing = readAnnotString(annot, "TRXUID");
     if (!existing.isEmpty()) {
         FPDFPage_CloseAnnot(annot);
-        if (!shared) FPDF_ClosePage(page);
         return existing;
     }
     QString newUid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     FPDFAnnot_SetStringValue(annot, "TRXUID", reinterpret_cast<FPDF_WIDESTRING>(newUid.utf16()));
     FPDFPage_CloseAnnot(annot);
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     bumpPageRevision(pageIndex);
     return newUid;
 }
@@ -1182,14 +1181,14 @@ QString AnnotationManager::ensureExternalUid(int pageIndex, int index) {
 bool AnnotationManager::setAnnotUid(int pageIndex, int index, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
-    if (!annot) { if (!shared) FPDF_ClosePage(page); return false; }
+    if (!annot) return false;
     FPDFAnnot_SetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(uid.utf16()));
     FPDFPage_CloseAnnot(annot);
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     bumpPageRevision(pageIndex);
     return true;
 }
@@ -1197,12 +1196,14 @@ bool AnnotationManager::setAnnotUid(int pageIndex, int index, const QString& uid
 bool AnnotationManager::setAnnotContents(int pageIndex, int index, const QString& text) {
     if (!m_doc) return false;
     QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = acquireSharedPage(pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
     FPDFAnnot_SetStringValue(annot, "Contents", reinterpret_cast<FPDF_WIDESTRING>(text.utf16()));
     FPDFPage_CloseAnnot(annot);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     lock.unlock();
     bumpPageRevision(pageIndex);
     return true;
@@ -1221,12 +1222,11 @@ bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const
     if (!m_doc) return false;
 
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
 
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT);
-    if (!annot) { if (!shared) FPDF_ClosePage(page); m_lastError = "Cannot create annotation"; return false; }
+    if (!annot) { m_lastError = "Cannot create annotation"; return false; }
 
     FS_RECTF rect{
         static_cast<float>(rectPt.left()),
@@ -1256,7 +1256,8 @@ bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const
     QElapsedTimer _gt; _gt.start();
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
-    if (!shared) FPDF_ClosePage(page);
+    PageCache::invalidate(m_doc, pageIndex);
+    PageCache::acquire(m_doc, pageIndex);
     lock.unlock();
 
     bumpPageRevision(pageIndex);
@@ -1337,25 +1338,20 @@ bool AnnotationManager::objectHasNoteId(FPDF_PAGEOBJECT obj, unsigned int noteId
     return false;
 }
 
-int AnnotationManager::translateNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId,
+int AnnotationManager::translateNotePageObjects_locked(FPDF_PAGE page, int pageIndex,
+                                                        unsigned int noteId,
                                                         double dx, double dy) {
     QElapsedTimer _t; _t.start();
     int count = FPDFPage_CountObjects(page);
     int translated = 0;
     int objsVisited = 0;
-    int pageIndex = -1;
 
-    auto key = QPair<int,quint32>(-1, noteId);
-    // ponytail: cache keyed by (pageIndex, noteId); caller must supply page, we recover pageIndex via pinIndex/scratchIndex
-    // We don't have pageIndex here — caller passes FPDF_PAGE. Use a trick: scan m_pinIndex/m_scratchIndex.
-    // Simpler: let callers pass pageIndex. But signature is fixed. Instead, we skip cache if we can't find pageIndex.
-    // Actually, we can find it: the page is either the pinned or scratch page.
-    if (m_pinPage == page) pageIndex = m_pinIndex;
-    else if (m_scratchPage == page) pageIndex = m_scratchIndex;
+    // Cache key (pageIndex, noteId). pageIndex do caller truyen truc tiep
+    // (PageCache la chu so huu FPDF_PAGE — khong con quet pin LRU/scratch).
+    auto key = QPair<int,quint32>(pageIndex, noteId);
 
     bool usedCache = false;
     if (pageIndex >= 0) {
-        key.first = pageIndex;
         auto it = m_noteObjIdxCache.constFind(key);
         if (it != m_noteObjIdxCache.constEnd() && !it->isEmpty()) {
             bool cacheOk = true;
@@ -1741,8 +1737,7 @@ QImage AnnotationManager::buildForeignAnnotLayer(int pageIndex, int wPx, int hPx
     QImage plain, withA;
     {
         QMutexLocker lock(&s_pdfiumMutex);
-        const bool shared = isSharedPage(pageIndex);
-        page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+        page = PageCache::acquire(m_doc, pageIndex);
         if (!page) return QImage();
         int foreignCount = 0;
         const int n = FPDFPage_GetAnnotCount(page);
@@ -1768,7 +1763,6 @@ QImage AnnotationManager::buildForeignAnnotLayer(int pageIndex, int wPx, int hPx
                 FPDFAnnot_SetFlags(a, FPDFAnnot_GetFlags(a) & ~FPDF_ANNOT_FLAG_HIDDEN);
                 FPDFPage_CloseAnnot(a);
             }
-            if (!shared) FPDF_ClosePage(page);
             return QImage();
         }
         auto renderTo = [&](int flags) -> QImage {
@@ -1791,7 +1785,6 @@ QImage AnnotationManager::buildForeignAnnotLayer(int pageIndex, int wPx, int hPx
             FPDFAnnot_SetFlags(a, FPDFAnnot_GetFlags(a) & ~FPDF_ANNOT_FLAG_HIDDEN);
             FPDFPage_CloseAnnot(a);
         }
-        if (!shared) FPDF_ClosePage(page);
     }
     QImage layer(wPx, hPx, QImage::Format_ARGB32);
     layer.fill(Qt::transparent);
@@ -1848,8 +1841,7 @@ int AnnotationManager::setOwnNoteObjectsActive(FPDF_PAGE page, bool active) {
 int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId) {
     if (!m_doc) return 0;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(pageIndex);
-    FPDF_PAGE page = shared ? acquireSharedPage(pageIndex) : FPDF_LoadPage(m_doc, pageIndex);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return 0;
     int removed = removeNotePageObjects_locked(page, noteId);
     if (removed > 0) {
@@ -1858,8 +1850,9 @@ int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId)
         FPDFPage_GenerateContent(page);
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
         invalidateNoteObjCache_locked(pageIndex);
+        PageCache::invalidate(m_doc, pageIndex);
+        PageCache::acquire(m_doc, pageIndex);
     }
-    if (!shared) FPDF_ClosePage(page);
     if (removed > 0) bumpPageRevision(pageIndex);
     return removed;
 }
@@ -1867,14 +1860,14 @@ int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId)
 void AnnotationManager::generateContentForPage(int page) {
     if (!m_doc) return;
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(page);
-    FPDF_PAGE fpage = shared ? acquireSharedPage(page) : FPDF_LoadPage(m_doc, page);
+    FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (fpage) {
         setOwnNoteObjectsActive(fpage, true);
         QElapsedTimer _gt; _gt.start();
         FPDFPage_GenerateContent(fpage);
         qDebug().noquote() << "[perf] genContent page=" << page << "ms=" << _gt.elapsed();
-        if (!shared) FPDF_ClosePage(fpage);
+        PageCache::invalidate(m_doc, page);
+        PageCache::acquire(m_doc, page);
         bumpPageRevision(page);
     }
 }
@@ -1885,13 +1878,13 @@ void AnnotationManager::flushPendingGenerate(int page) {
     QElapsedTimer _gt;
     _gt.start();
     QMutexLocker lock(&s_pdfiumMutex);
-    const bool shared = isSharedPage(page);
-    FPDF_PAGE fpage = shared ? acquireSharedPage(page) : FPDF_LoadPage(m_doc, page);
+    FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (fpage) {
         setOwnNoteObjectsActive(fpage, true);
         FPDFPage_GenerateContent(fpage);
         qDebug().noquote() << "[perf] genContent page=" << page << "ms=" << _gt.elapsed();
-        if (!shared) FPDF_ClosePage(fpage);
+        PageCache::invalidate(m_doc, page);
+        PageCache::acquire(m_doc, page);
         bumpPageRevision(page);
     }
     m_pendingGenerate.remove(page);
@@ -1923,7 +1916,8 @@ bool AnnotationManager::saveDocument() {
         const auto pend = m_pendingGen;
         for (int p : pend) flushGenerate_locked(p);
     }
-    releaseSharedPage_locked();
+    // KHONG forgetDocument o day: giu dem am de thao tac sau save khong phai nap lai.
+    // Doc se duoc forget khi dong/mo lai (PdfDocument::close / setDocument).
     bool ok = FPDF_SaveAsCopy(m_doc, &fw.base, FPDF_NO_INCREMENTAL) != 0;
     lock.unlock();
 

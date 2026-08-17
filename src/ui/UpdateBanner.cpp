@@ -6,6 +6,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QGraphicsDropShadowEffect>
+#include <QStringList>
 
 UpdateBanner::UpdateBanner(QWidget* parent) : QFrame(parent) {
     setFixedSize(320, 130);
@@ -53,6 +54,14 @@ UpdateBanner::UpdateBanner(QWidget* parent) : QFrame(parent) {
     m_label->setStyleSheet("font-size:12px;");
     root->addWidget(m_label);
 
+    m_bodyLabel = new QLabel;
+    m_bodyLabel->setObjectName("updateBody");
+    m_bodyLabel->setWordWrap(true);
+    m_bodyLabel->setTextFormat(Qt::RichText);
+    m_bodyLabel->setStyleSheet("font-size:12px;");
+    root->addWidget(m_bodyLabel);
+    m_bodyLabel->hide();
+
     // ── Download button ───────────────────────────────────────────────────
     auto* dlBtn = new QPushButton("\xE2\xAC\x87 Download Now"); // ⬇
     dlBtn->setObjectName("updateDl");
@@ -66,9 +75,30 @@ UpdateBanner::UpdateBanner(QWidget* parent) : QFrame(parent) {
     applyTheme(false);
 }
 
-void UpdateBanner::showUpdate(const QString& version, const QString& downloadUrl) {
+
+void UpdateBanner::showUpdate(const QString& version, const QString& title,
+                              const QString& body, const QString& downloadUrl) {
     m_downloadUrl = downloadUrl;
-    m_label->setText(QString("Version <b>%1</b> is now available.").arg(version));
+
+    QString heading = title.trimmed();
+    if (heading.isEmpty())
+        heading = QStringLiteral("Update Available");
+    if (auto* titleLabel = findChild<QLabel*>("updateTitle"))
+        titleLabel->setText(heading);
+
+    m_label->setText(QStringLiteral("Version <b>%1</b> is now available.").arg(version));
+
+    m_bodyLabel->setTextFormat(Qt::RichText);
+    m_bodyLabel->setWordWrap(true);
+    m_bodyLabel->setOpenExternalLinks(true);
+    if (body.trimmed().isEmpty()) {
+        m_bodyLabel->clear();
+        m_bodyLabel->hide();
+    } else {
+        m_bodyLabel->setText(body);
+        m_bodyLabel->show();
+    }
+
     show();
     raise();
 }
@@ -80,9 +110,10 @@ void UpdateBanner::applyTheme(bool dark) {
             "                     border-radius:12px; }"
             "QLabel#updateTitle { color:#F1F5F9; }"
             "QLabel#updateMsg   { color:#94A3B8; }"
-            "QPushButton#updateDl { background:#2563EB; color:white; border:none;"
+            "QLabel#updateBody { color:#94A3B8; font-size:12px; }"
+            "QPushButton#updateDl { background:#1AEBFF; color:#000000; border:1px solid #1AEBFF;"
             "  border-radius:6px; font-size:12px; font-weight:600; }"
-            "QPushButton#updateDl:hover { background:#1D4ED8; }"
+            "QPushButton#updateDl:hover { border:1px solid #F38518; }"
             "QPushButton#updateClose { background:transparent; color:#64748B;"
             "  border:none; border-radius:4px; font-size:14px; font-weight:bold; }"
             "QPushButton#updateClose:hover { background:#334155; color:#F1F5F9; }"
@@ -93,9 +124,10 @@ void UpdateBanner::applyTheme(bool dark) {
             "                     border-radius:12px; }"
             "QLabel#updateTitle { color:#1E293B; }"
             "QLabel#updateMsg   { color:#64748B; }"
-            "QPushButton#updateDl { background:#2563EB; color:white; border:none;"
+            "QLabel#updateBody { color:#64748B; font-size:12px; }"
+            "QPushButton#updateDl { background:#0F4A85; color:#FFFFFF; border:1px solid #0F4A85;"
             "  border-radius:6px; font-size:12px; font-weight:600; }"
-            "QPushButton#updateDl:hover { background:#1D4ED8; }"
+            "QPushButton#updateDl:hover { border:1px solid #006BB3; }"
             "QPushButton#updateClose { background:transparent; color:#94A3B8;"
             "  border:none; border-radius:4px; font-size:14px; font-weight:bold; }"
             "QPushButton#updateClose:hover { background:#F1F5F9; color:#1E293B; }"

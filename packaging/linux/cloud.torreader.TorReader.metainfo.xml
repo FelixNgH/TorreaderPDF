@@ -68,6 +68,12 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.4.0" date="2026-08-17">
+      <description>
+        <p>New high-contrast interface in light and dark mode. OCR for scanned documents — 10 languages, fully offline, your file is never modified. Select, find (diacritic-insensitive) and copy text in PDFs and scans. Links inside PDFs now work. Opening and flipping pages no longer wait on background work.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.4.0</url>
+    </release>
     <release version="2.3.3" date="2026-08-10">
       <description>
         <p>Fixes drawing display for PDFs exported from CAD: black blocks and colour noise on pages with transparency, missing frame lines, markups hidden behind hatching, and a blank page when turning pages on large drawings. Tidies the menu to make room for upcoming features.</p>

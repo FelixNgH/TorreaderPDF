@@ -22,7 +22,7 @@ public:
     void setCurrentMatch(int index);
 
 signals:
-    void searchRequested(const QString& query, Qt::CaseSensitivity cs);
+    void searchRequested(const QString& query, Qt::CaseSensitivity cs, bool matchDiacritics);
     void navigateNext();
     void navigatePrev();
     void clearSearchHighlights();
@@ -45,12 +45,13 @@ private:
     void updateLabel();
     void triggerSearch();
 
-    QLineEdit*   m_input      = nullptr;
-    QLabel*      m_matchLabel = nullptr;
-    QPushButton* m_prevBtn    = nullptr;
-    QPushButton* m_nextBtn    = nullptr;
-    QCheckBox*   m_matchCase  = nullptr;
-    QPushButton* m_closeBtn   = nullptr;
+    QLineEdit*   m_input             = nullptr;
+    QLabel*      m_matchLabel        = nullptr;
+    QPushButton* m_prevBtn           = nullptr;
+    QPushButton* m_nextBtn           = nullptr;
+    QCheckBox*   m_matchCase         = nullptr;
+    QCheckBox*   m_matchDiacritics   = nullptr;
+    QPushButton* m_closeBtn          = nullptr;
 
     QTimer*      m_debounce   = nullptr;
     int          m_matchCount = 0;

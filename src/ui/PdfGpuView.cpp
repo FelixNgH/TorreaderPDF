@@ -1,10 +1,12 @@
 #include "PdfGpuView.h"
+#include "../core/PdfDocument.h"
 #include <QOpenGLExtraFunctions>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QDebug>
+#include <QApplication>
 #include <QFontDatabase>
 #include <cmath>
 #include <QVector4D>
@@ -93,7 +95,22 @@ PdfGpuView::PdfGpuView(QWidget* parent)
     m_tileTimer->setInterval(120);
     connect(m_tileTimer, &QTimer::timeout, this, &PdfGpuView::requestTiles);
 
+    // Flash khung dich khi nhay link noi bo (SPEC_PDF_LINKS muc 4).
+    m_flashTimer = new QTimer(this);
+    m_flashTimer->setInterval(50);
+    connect(m_flashTimer, &QTimer::timeout, this, [this] {
+        if (m_flashClock.elapsed() >= 1000) {
+            m_flashTimer->stop();
+            m_flashRect = QRectF();
+        }
+        update();
+    });
+
     setFocusPolicy(Qt::StrongFocus);
+
+    // Link tinh xong o background: cap nhat con tro/hover ngay (SPEC_NO_SYNC_PAGELOAD).
+    connect(PdfLinks::notifier(), &PdfLinksNotifier::linksReady, this,
+            [this](quintptr doc, int page) { onLinksReady(doc, page); });
 }
 
 PdfGpuView::~PdfGpuView() {
@@ -528,6 +545,34 @@ void PdfGpuView::paintGL() {
             p.restore();
         }
 
+        // Vung chon chu (SPEC_TEXTSEL_ADOBE): cung duong quy doi hien thi nhu
+        // highlight, mau xanh ban trong suot kieu Adobe, khong vien.
+        if (!m_selRects.isEmpty()) {
+            p.save();
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 102, 204, 89));   // rgba(0,102,204,0.35)
+            for (const QRectF& nr0 : m_selRects) {
+                QRectF nr = nr0.normalized();
+                if (nr.width() < 0.5 || nr.height() < 0.5) continue;
+                p.drawRect(QRectF(orig.x() + nr.x() * m_zoom, orig.y() + nr.y() * m_zoom,
+                                  nr.width() * m_zoom, nr.height() * m_zoom));
+            }
+            p.restore();
+        }
+
+        // Flash khung dich khi nhay link noi bo (SPEC_PDF_LINKS muc 4):
+        // ve vien ~1 giay roi mo dan. rectDisp cung khong gian toa do hien thi.
+        if (!m_flashRect.isEmpty() && m_flashClock.isValid()) {
+            double fade = qBound(0.0, 1.0 - m_flashClock.elapsed() / 1000.0, 1.0);
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(QColor(255, 120, 0, int(255 * fade)), qMax(1.5, 2.0 * m_zoom)));
+            QRectF wr(orig.x() + m_flashRect.x()      * m_zoom,
+                      orig.y() + m_flashRect.y()      * m_zoom,
+                      m_flashRect.width()  * m_zoom,
+                      m_flashRect.height() * m_zoom);
+            p.drawRect(wr);
+        }
+
         // Selection rectangle
         if (m_hasSel) {
             QPointF a = pdfToWidget(m_selRect.topLeft());
@@ -799,6 +844,12 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
         m_panOffset = {};
         m_annotVisuals.clear();
         m_hasSel = false;
+        // Vung chon chu theo chi so ky tu: bo khi doi trang (khong emit — co
+        // the dang o che do lien tuc, trang nay an).
+        m_selAnchorPage = m_selFocusPage = -1;
+        m_selAnchorChar = m_selFocusChar = -1;
+        m_selRects.clear();
+        m_selDragging = false;
         m_tiles.clear();
         m_tilePage = -1;
         m_tileScale = 0.0;
@@ -888,6 +939,10 @@ void PdfGpuView::setPendingPage(int pageIndex, QSizeF pageSizePt) {
         m_currentHighlightIdx = -1;
         qDebug().noquote() << "[find] highlights cleared (page change" << m_pageIndex << "→" << pageIndex << ")";
         m_hasSel     = false;
+        m_selAnchorPage = m_selFocusPage = -1;
+        m_selAnchorChar = m_selFocusChar = -1;
+        m_selRects.clear();
+        m_selDragging = false;
         m_annotVisuals.clear();
         m_tiles.clear();
         m_tilePage = -1;
@@ -1083,8 +1138,126 @@ void PdfGpuView::setTool(ViewTool tool) {
     if (m_sigPickMode) { m_sigPickMode = false; m_sigActive = false; unsetCursor(); }
     m_tool = tool;
     m_hasSel = false;
-    setCursor(tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+    m_selDragging = false;
+    m_selecting = false;   // dung marquee (translate) khi doi cong cu
+    if (tool != ViewTool::SelectText)
+        clearTextSelectionInternal();   // roi Select thi bo vung chon
+    setCursor(tool == ViewTool::SelectText ? Qt::IBeamCursor
+             : (tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor));
     update();
+}
+
+void PdfGpuView::clearTextSelection() {
+    clearTextSelectionInternal();
+    update();
+}
+
+void PdfGpuView::setSelectionRects(const QList<QRectF>& dispRects) {
+    m_selRects = dispRects;
+    update();
+}
+
+void PdfGpuView::clearSelectionRects() {
+    m_selRects.clear();
+    update();
+}
+
+// ── Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE) ──────────────────────────
+
+bool PdfGpuView::resolvePageSpacePos(const QPointF& widgetPos, QPointF* pagePt,
+                                     bool load) const {
+    if (!m_linksDoc || !m_linksDoc->isOpen() || !m_hasImage || m_pageSizePt.isEmpty())
+        return false;
+    // widgetToPdf = toa do hien thi (Y-down, goc trai tren).
+    const QPointF disp = widgetToPdf(widgetPos);
+    // mouseMove chi doc dem (khong nap); press duoc phep nap.
+    const TextSelection::PageInfo info = load
+        ? TextSelection::pageFor(m_linksDoc->raw(), m_pageIndex)
+        : TextSelection::pageForCached(m_linksDoc->raw(), m_pageIndex);
+    if (!info.tp) return false;   // trang chua san — khong xac dinh toa do
+    *pagePt = TextSelection::dispToPagePt(info, disp);
+    return true;
+}
+
+void PdfGpuView::beginTextSelection(const QPointF& widgetPos, int clickCount) {
+    QPointF pagePt;
+    if (!resolvePageSpacePos(widgetPos, &pagePt, /*load=*/true)) {
+        clearTextSelectionInternal();
+        update();
+        return;
+    }
+    const TextSelection::PageInfo info = TextSelection::pageFor(m_linksDoc->raw(), m_pageIndex);
+    const double tolX = 4.0 / m_zoom;
+    const double tolY = 6.0 / m_zoom;
+    int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+    if (idx < 0)
+        idx = TextSelection::nearestCharAt(info.tp, pagePt.x(), pagePt.y(), tolY);
+    if (idx < 0) {
+        clearTextSelectionInternal();
+        m_selDragging = true;   // keo tren vung rong: khong chon duoc gi
+        update();
+        return;
+    }
+    if (clickCount >= 3) {
+        int s = 0, c = 0;
+        TextSelection::lineRange(info.tp, idx, &s, &c);
+        m_selAnchorPage = m_pageIndex; m_selAnchorChar = s;
+        m_selFocusPage  = m_pageIndex; m_selFocusChar  = s + c - 1;
+    } else if (clickCount == 2) {
+        int s = 0, c = 0;
+        TextSelection::wordRange(info.tp, idx, &s, &c);
+        m_selAnchorPage = m_pageIndex; m_selAnchorChar = s;
+        m_selFocusPage  = m_pageIndex; m_selFocusChar  = s + c - 1;
+    } else {
+        m_selAnchorPage = m_pageIndex; m_selAnchorChar = idx;
+        m_selFocusPage  = m_pageIndex; m_selFocusChar  = idx;
+    }
+    m_selClickGesture = (clickCount >= 2);
+    m_selDragging = true;
+    emitSelectionState();
+    update();
+}
+
+void PdfGpuView::updateTextSelectionFocus(const QPointF& widgetPos) {
+    QPointF pagePt;
+    if (!resolvePageSpacePos(widgetPos, &pagePt)) return;
+    const TextSelection::PageInfo info = TextSelection::pageForCached(m_linksDoc->raw(), m_pageIndex);
+    const double tolX = 4.0 / m_zoom;
+    const double tolY = 6.0 / m_zoom;
+    int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+    if (idx < 0)
+        idx = TextSelection::nearestCharAt(info.tp, pagePt.x(), pagePt.y(), tolY);
+    if (idx < 0) return;   // keo qua vung trong: giu focus cu
+    m_selFocusPage = m_pageIndex;
+    m_selFocusChar = idx;
+    emitSelectionState();
+    update();
+}
+
+void PdfGpuView::emitSelectionState() {
+    emit textSelectionChanged(m_selAnchorPage, m_selAnchorChar,
+                              m_selFocusPage, m_selFocusChar);
+}
+
+void PdfGpuView::clearTextSelectionInternal() {
+    m_selAnchorPage = m_selFocusPage = -1;
+    m_selAnchorChar = m_selFocusChar = -1;
+    m_selRects.clear();
+    m_selClickGesture = false;
+    emit textSelectionCleared();
+}
+
+void PdfGpuView::updateSelectCursor(const QPointF& widgetPos) {
+    bool overText = false;
+    QPointF pagePt;
+    if (resolvePageSpacePos(widgetPos, &pagePt)) {
+        const TextSelection::PageInfo info = TextSelection::pageForCached(m_linksDoc->raw(), m_pageIndex);
+        const double tolX = 4.0 / m_zoom;
+        const double tolY = 6.0 / m_zoom;
+        const int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+        overText = idx >= 0;
+    }
+    setCursor(overText ? Qt::IBeamCursor : Qt::ArrowCursor);
 }
 
 void PdfGpuView::beginSignaturePick() {
@@ -1171,6 +1344,13 @@ void PdfGpuView::centerOnPageRect(const QRectF& rectDisp) {
     QPointF c = rectDisp.center();
     m_panOffset = QPointF(pw / 2.0 - c.x() * m_zoom,
                           ph / 2.0 - c.y() * m_zoom);
+    update();
+}
+
+void PdfGpuView::flashRect(const QRectF& rectDisp) {
+    m_flashRect = rectDisp.normalized();
+    m_flashClock.restart();
+    m_flashTimer->start();
     update();
 }
 
@@ -1261,8 +1441,18 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         update();
         return;
     }
+    // Link: chi khi tool la Pan hoac Select, khong bat Ctrl. Bam vao link thi
+    // di theo link truoc khi bat dau pan/chon chu (SPEC_PDF_LINKS muc 3).
+    if ((m_tool == ViewTool::Pan || m_tool == ViewTool::SelectText)
+        && e->button() == Qt::LeftButton && m_hasImage) {
+        if (tryActivateLink(e)) return;
+    }
     if (m_hasImage) {
         if (e->button() == Qt::RightButton) {
+            if (m_tool == ViewTool::SelectText && m_selAnchorChar >= 0) {
+                emit copySelectionRequested(e->globalPosition().toPoint());
+                return;
+            }
             emit annotationContextRequested(m_pageIndex, widgetToPdf(e->position()), e->globalPosition().toPoint());
             return;
         }
@@ -1307,6 +1497,15 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
             m_freehandLastWidgetPt = e->position();
             return;
         }
+    }
+    // Select tool: left drag = select text by CHAR INDEX (no modifier needed).
+    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && m_hasImage) {
+        if (m_clickValid && m_clickClock.elapsed() > QApplication::doubleClickInterval())
+            m_clickValid = false;
+        m_clickClock.restart();
+        m_clickValid = true;
+        beginTextSelection(e->position(), 1);
+        return;
     }
     // Alt+Left drag = text selection for translation
     if ((e->modifiers() & Qt::AltModifier) && e->button() == Qt::LeftButton) {
@@ -1365,6 +1564,10 @@ void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
         update();
         return;
     }
+    if (m_selDragging) {
+        updateTextSelectionFocus(e->position());
+        return;
+    }
     if (m_selecting) {
         m_selEnd = e->position();
         update();
@@ -1374,6 +1577,17 @@ void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
         m_panOffset   += e->position() - m_lastMousePos;
         m_lastMousePos = e->position();
         update();
+        return;
+    }
+    m_lastHoverPos = e->position();
+    updateLinkHover(e->position());
+    // Select: I-beam chi khi roi tren chu; vung trong → mui ten.
+    if (m_tool == ViewTool::SelectText && !m_hoveringLink) {
+        QPointF pagePt;
+        if (resolvePageSpacePos(e->position(), &pagePt))
+            updateSelectCursor(e->position());
+        else
+            setCursor(Qt::ArrowCursor);
     }
 }
 
@@ -1452,6 +1666,16 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         update();
         return;
     }
+    if (m_selDragging && e->button() == Qt::LeftButton) {
+        if (m_selClickGesture)
+            m_selClickGesture = false;   // nhay dup/ba: giu nguyen vung chon
+        else
+            updateTextSelectionFocus(e->position());
+        m_selDragging = false;
+        setCursor(m_tool == ViewTool::SelectText ? Qt::IBeamCursor
+                                                  : Qt::ArrowCursor);
+        return;
+    }
     if (m_selecting && e->button() == Qt::LeftButton) {
         m_selecting = false;
         setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
@@ -1481,6 +1705,8 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
             // QRectF: x=left, y=smaller PDF y (.top()), w, h — matches MainWindow handler
             QRectF pageRect(pdf0.x(), pdfYbot, pdf1.x() - pdf0.x(), pdfYtop - pdfYbot);
             pageRect.translate(m_pageBoxOrigin);
+            // Marquee nay chi con cho translate (Alt+drag); Select da dung
+            // char-index (SPEC_TEXTSEL_ADOBE) nen khong vao day.
             emit textRegionSelected(m_pageIndex, pageRect, e->globalPosition().toPoint());
         }
         return;
@@ -1495,6 +1721,89 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
     }
     setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
     update();
+}
+
+void PdfGpuView::mouseDoubleClickEvent(QMouseEvent* e) {
+    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && m_hasImage) {
+        // Nhay ba = dblclick thu 2 lien tiep trong doubleClickInterval.
+        const bool isTriple = m_clickValid
+            && m_clickClock.elapsed() <= QApplication::doubleClickInterval();
+        m_clickClock.restart();
+        m_clickValid = true;
+        beginTextSelection(e->position(), isTriple ? 3 : 2);
+        return;
+    }
+    QOpenGLWidget::mouseDoubleClickEvent(e);
+}
+
+// ── Link hover / click (SPEC_PDF_LINKS) ──────────────────────────────────────
+
+void PdfGpuView::updateLinkHover(const QPointF& widgetPos) {
+    const bool linkTool = (m_tool == ViewTool::Pan || m_tool == ViewTool::SelectText);
+    QString hoverTxt;
+    if (linkTool && m_linksDoc && m_linksDoc->isOpen() && m_hasImage) {
+        const QPointF dispPt = widgetToPdf(widgetPos);
+        QElapsedTimer _lt; _lt.start();
+        const PdfLinks::CachedPage cp = PdfLinks::cachedForPage(m_linksDoc->raw(), m_pageIndex);
+        qDebug().noquote() << "[links] hover page=" << m_pageIndex
+                           << "cached=" << (cp.ready ? 1 : 0)
+                           << "blockedMs=" << _lt.elapsed();
+        if (!cp.ready) {
+            // Chua tinh link: KHONG chan giao dien, xep viec tinh nen.
+            PdfLinks::requestPage(m_linksDoc->raw(), m_pageIndex);
+        } else {
+            const int li = PdfLinks::linkAt(cp.links, dispPt, cp.info);
+            if (li >= 0) {
+                // Link LAUNCH/REMOTEGOTO khong co uri va dest: khong doi con tro.
+                if (!cp.links[li].uri.isEmpty() || cp.links[li].destPage >= 0)
+                    hoverTxt = cp.links[li].uri.isEmpty()
+                        ? QString("Page %1").arg(cp.links[li].destPage + 1) : cp.links[li].uri;
+            }
+        }
+    }
+
+    if (hoverTxt.isEmpty()) {
+        if (m_hoveringLink) {
+            m_hoveringLink = false;
+            if (m_tool != ViewTool::SelectText)
+                setCursor(m_tool != ViewTool::Pan ? Qt::CrossCursor : Qt::ArrowCursor);
+            emit linkHovered(QString());
+        }
+    } else {
+        if (!m_hoveringLink) {
+            m_hoveringLink = true;
+            setCursor(Qt::PointingHandCursor);
+        }
+        emit linkHovered(hoverTxt);
+    }
+}
+
+// Link tinh xong: neu con tro van dang nam tren widget thi chay lai hover de
+// hien ban tay ngay, khong can re chuot (SPEC_NO_SYNC_PAGELOAD muc 1).
+void PdfGpuView::onLinksReady(quintptr doc, int pageIndex)
+{
+    if (pageIndex != m_pageIndex) return;
+    if (!m_linksDoc || reinterpret_cast<quintptr>(m_linksDoc->raw()) != doc) return;
+    if (!underMouse()) return;
+    updateLinkHover(m_lastHoverPos);
+}
+
+bool PdfGpuView::tryActivateLink(QMouseEvent* e) {
+    if (!m_linksDoc || !m_linksDoc->isOpen()) return false;
+    const QPointF dispPt = widgetToPdf(e->position());
+    const PdfLinks::CachedPage cp = PdfLinks::cachedForPage(m_linksDoc->raw(), m_pageIndex);
+    if (!cp.ready) {
+        // Chua co dem: KHONG tra link, xu ly nhu binh thuong (Pan/Select).
+        // Khong duoc "cho cho co dem roi moi xu ly" — cho la dung hinh.
+        PdfLinks::requestPage(m_linksDoc->raw(), m_pageIndex);
+        return false;
+    }
+    const int li = PdfLinks::linkAt(cp.links, dispPt, cp.info);
+    if (li >= 0) {
+        emit linkActivated(m_pageIndex, cp.links[li]);
+        return true;
+    }
+    return false;
 }
 
 // ── Vector overlay ──────────────────────────────────────────────────────────

@@ -1,4 +1,6 @@
 #include "PdfDocument.h"
+#include "OcrTextLayer.h"
+#include "PageCache.h"
 #include <QMutex>
 #include <QDebug>
 #include <fpdf_text.h>
@@ -176,6 +178,10 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
 void PdfDocument::close() {
     QMutexLocker lock(&s_pdfiumMutex);
     if (m_doc) {
+        OcrTextLayer::forgetDocument(m_doc);
+        // 🔴 PageCache giu FPDF_PAGE cua doc — phai xoa TRUOC FPDF_CloseDocument
+        //    neu khong con tro chet (SPEC_PAGECACHE_CORE muc 2).
+        PageCache::forgetDocument(m_doc);
         FPDF_CloseDocument(m_doc);
         m_doc = nullptr;
         m_filePath.clear();

@@ -23,6 +23,11 @@
 #include "annotations/AnnotationManager.h"
 #include "core/VectorLayer.h"
 #include "core/ForeignAnnotLayer.h"
+#include "core/PdfLinks.h"
+#include "core/TextSelection.h"
+
+class PdfDocument;
+class QMouseEvent;
 
 // GPU-accelerated PDF page viewer with viewport tiling.
 // Renders the page as a low-res full-page background texture plus a grid of
@@ -30,7 +35,7 @@
 class PdfGpuView : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
-    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText, Freehand, Highlight };
+    enum class ViewTool { Pan, PlaceNote, Line, Arrow, Rectangle, Ellipse, Cloud, FreeText, Freehand, Highlight, SelectText };
     enum class ViewMode { Single, Double };
 
     struct AnnotOverlay {
@@ -113,6 +118,19 @@ public:
     QRectF  pdfRectToWidget(const QRectF& r) const;
     void    centerOnPageRect(const QRectF& rectDisp);
 
+    // Tai lieu dung de doc link (set tu MainWindow luc tao tab). Khong so huu.
+    void setLinksDocument(PdfDocument* doc) { m_linksDoc = doc; }
+
+    // Nhay link noi bo xong: ve vien khung dich ~1 giay roi mo dan
+    // (SPEC_PDF_LINKS muc 4). rectDisp o toa do hien thi cua trang hien tai.
+    void flashRect(const QRectF& rectDisp);
+
+    // Xoa lua chon chu (goi khi doi trang / doi tool).
+    void    clearTextSelection();
+    // Rect chon chu (toa do hien thi) push tu MainWindow (SPEC_TEXTSEL_ADOBE).
+    void setSelectionRects(const QList<QRectF>& dispRects);
+    void clearSelectionRects();
+
 signals:
     void zoomChanged(double scale);
     void scrolledToPage(int pageIndex);
@@ -126,8 +144,19 @@ signals:
     void annotationMoveRequested(int pageIndex, double dx, double dy);
     void signatureRectPicked(int pageIndex, QRectF rectPt);
     void freehandCommitRequested(int pageIndex, const QVector<QPointF>& points);
+    // Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE). MainWindow ghi vao
+    // DocTab::textSel va day rect ve lai.
+    void textSelectionChanged(int anchorPage, int anchorChar,
+                              int focusPage, int focusChar);
+    void textSelectionCleared();
+    // Chuot phai dang co vung chon → menu "Copy text" (SPEC_TEXTSEL_ADOBE).
+    void copySelectionRequested(QPoint globalPos);
     // Emitted after debounce (~120ms) when pan/zoom changes the visible region.
     void tilesNeeded(int page, double scale, QRect viewportPx);
+    // Roi chuot qua link (SPEC_PDF_LINKS): chuoi rong = roi khoi link.
+    void linkHovered(const QString& text);
+    // Bam chuot trai vao link (chi khi tool la Pan/Select): tra ve link that.
+    void linkActivated(int pageIndex, const PdfLink& link);
 
 protected:
     void initializeGL() override;
@@ -137,6 +166,7 @@ protected:
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
+    void mouseDoubleClickEvent(QMouseEvent*) override;
     void keyPressEvent(QKeyEvent*) override;
 
 private:
@@ -223,15 +253,48 @@ private:
     QPointF m_selStart;
     QPointF m_selEnd;
 
-    // Selection
+    // Annotation selection rect (markup move/resize)
     QRectF m_selRect;
     bool   m_hasSel = false;
+
+    // ── Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE) ────────────────────
+    bool    m_selDragging   = false;
+    int     m_selAnchorPage = -1;
+    int     m_selAnchorChar = -1;
+    int     m_selFocusPage  = -1;
+    int     m_selFocusChar  = -1;
+    QList<QRectF> m_selRects;      // toa do hien thi de ve (mau xanh Adobe)
+    QElapsedTimer m_clickClock;    // dem dblclick lien tiep (2=dup, 3=ba)
+    bool m_clickValid = false;
+    // Vung chon do nhay dup/ba tao ra: nha chuot phai GIU NGUYEN (khong mo rong).
+    bool m_selClickGesture = false;
+
+    // load=false (mac dinh): chi doc dem PageCache — mouseMove khong duoc nap.
+    // load=true: duoc phep nap (mousePress / bat dau chon chu).
+    bool resolvePageSpacePos(const QPointF& widgetPos, QPointF* pagePt,
+                             bool load = false) const;
+    void beginTextSelection(const QPointF& widgetPos, int clickCount);
+    void updateTextSelectionFocus(const QPointF& widgetPos);
+    void emitSelectionState();
+    void clearTextSelectionInternal();
+    void updateSelectCursor(const QPointF& widgetPos);
 
     // Signature pick mode
     bool    m_sigPickMode = false;
     bool    m_sigActive   = false;
     QPointF m_sigStart;
     QPointF m_sigEnd;
+
+    // ── Link (SPEC_PDF_LINKS) ──────────────────────────────────────────────
+    PdfDocument* m_linksDoc = nullptr;
+    bool m_hoveringLink = false;
+    void updateLinkHover(const QPointF& widgetPos);
+    void onLinksReady(quintptr doc, int pageIndex);
+    bool tryActivateLink(QMouseEvent* e);
+    QPointF m_lastHoverPos;   // vi tri con tro lan mouseMove cuoi (de linksReady cap nhat)
+    QTimer* m_flashTimer = nullptr;
+    QElapsedTimer m_flashClock;
+    QRectF  m_flashRect;
 
     // Drag-to-move annotation
     bool    m_draggingAnnot = false;

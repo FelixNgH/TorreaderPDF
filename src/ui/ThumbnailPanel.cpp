@@ -1,5 +1,6 @@
 #include "ThumbnailPanel.h"
 #include "SearchPanel.h"
+#include "ThemeTokens.h"
 #include <QDebug>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -32,6 +33,13 @@
 #include <vector>
 
 extern QMutex s_pdfiumMutex;
+
+// Mau chu tuong phan voi mau nen markup nguoi dung chon (WCAG relative
+// luminance): nen sang thi chu den, nen toi thi chu trang.
+static QString textColorOn(const QColor& bg) {
+    const double lum = 0.2126 * bg.redF() + 0.7152 * bg.greenF() + 0.0722 * bg.blueF();
+    return lum > 0.5 ? "#000000" : "#FFFFFF";
+}
 
 // Qt6 QListWidget with InternalMove does NOT reliably emit rowsMoved
 // (it does rowsRemoved+rowsInserted).  Use onDropped callback instead.
@@ -226,6 +234,11 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     // ── Search panel (hidden, kept for future version) ────────────────────
     m_searchPanel = new SearchPanel(this);
 
+    // ── OCR panel (tab id 5, SPEC_OCR_TAB_AND_SELECT phan 1) ─────────────
+    // File rieng OcrPanel.{h,cpp}: doc hon vi ThumbnailPanel.cpp da 1100+ dong
+    // va panel OCR co logic rieng (trang thai/tien do) khong thuoc ve thumbnail.
+    m_ocrPanel = new OcrPanel(this);
+
     // ── 2×2 tab-button grid + stacked content ────────────────────────────
     auto makeTabBtn = [](const QString& text) {
         auto* btn = new QPushButton(text);
@@ -241,6 +254,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     auto* contBtn  = makeTabBtn("Comments");
     auto* propBtn  = makeTabBtn("Properties");
     auto* searchBtn = makeTabBtn("Search");
+    auto* ocrBtn   = makeTabBtn("OCR");
     thumbBtn->setChecked(true);
 
     m_tabGroup = new QButtonGroup(this);
@@ -250,8 +264,10 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     m_tabGroup->addButton(contBtn,  2);
     m_tabGroup->addButton(propBtn,  3);
     m_tabGroup->addButton(searchBtn, 4);
+    m_tabGroup->addButton(ocrBtn,   5);
 
     auto* tabGrid = new QWidget;
+    tabGrid->setObjectName("sidebarTabGrid");
     auto* gl      = new QGridLayout(tabGrid);
     gl->setContentsMargins(0, 0, 0, 0);
     gl->setSpacing(1);
@@ -261,7 +277,8 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     gl->addWidget(booksBtn,  0, 1);
     gl->addWidget(contBtn,   1, 0);
     gl->addWidget(propBtn,   1, 1);
-    gl->addWidget(searchBtn, 2, 0, 1, 2);
+    gl->addWidget(searchBtn, 2, 0);
+    gl->addWidget(ocrBtn,    2, 1);
 
     // Comments panel (idx 2): markup tools on top + list of PDF comments below
     m_commentsPanel = new QWidget;
@@ -274,16 +291,24 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         tgl->setContentsMargins(0, 0, 0, 0);
         tgl->setSpacing(2);
         struct ToolDef { const char* label; int id; };
+        // Pick = id 0 (ViewTool::Pan): chon/keo markup co san, dat dau luoi vi
+        // la trang thai mac dinh (SPEC_FIX_PICK_TOOL). Chon chu chi con o nut
+        // Select tren toolbar (id 10) — KHONG dua id 10 vao luoi nay nua.
         const ToolDef tools[] = {
-            {"Select", 0}, {"Line", 2}, {"Arrow", 3}, {"Rect", 4},
+            {"Pick", 0}, {"Line", 2}, {"Arrow", 3}, {"Rect", 4},
             {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7}, {"Note", 1},
             {"Freehand", 8}, {"Highlight", 9}
         };
         int r = 0, c = 0;
         for (const auto& td : tools) {
             auto* b = new QPushButton(QString::fromUtf8(td.label));
+            // Ten de bo do giao dien tim duoc bang findChildren (chi doc, khong
+            // co quy tac QSS nao dung ten nay nen khong doi ve ngoai).
+            b->setObjectName(QStringLiteral("markupTool"));
             b->setFixedHeight(24);
             const int id = td.id;
+            if (id == 0)
+                b->setToolTip(QStringLiteral("Select and move existing markup"));
             m_toolButtons.insert(id, b);
             connect(b, &QPushButton::clicked, this, [this, id]{ setActiveToolButton(id); updateSizeComboForTool(id); emit annotToolSelected(id); });
             tgl->addWidget(b, r, c);
@@ -300,7 +325,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
                                 "8 px", "10 px", "12 px", "16 px", "20 px", "24 px" });
         m_sizeCombo->setCurrentIndex(1);
         m_colorBtn = new QPushButton;
-        m_colorBtn->setStyleSheet("background:red; color:white;");
+        updateColorBtnStyle();
         auto* fillChk = new QCheckBox("Fill");
         auto* fillOpacityCombo = new QComboBox;
         fillOpacityCombo->addItems({"25%","50%","75%","100%"});
@@ -326,7 +351,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
             QColor c = QColorDialog::getColor(m_annColor, this, "Markup color");
             if (c.isValid()) {
                 m_annColor = c;
-                m_colorBtn->setStyleSheet(QString("background:%1; color:white;").arg(c.name()));
+                updateColorBtnStyle();
                 emitStyle();
             }
         });
@@ -343,13 +368,18 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         }
         auto* sep = new QFrame;
         sep->setFrameShape(QFrame::HLine);
-        sep->setFrameShadow(QFrame::Sunken);
+        sep->setFrameShadow(QFrame::Plain);
+        sep->setObjectName("sidebarSep");
+        sep->setStyleSheet(
+            QStringLiteral("color:%1;").arg(m_dark ? darkHC().border : lightHC().border));
+        m_commentsSep = sep;
         cpLay->addWidget(sep);
-        auto* m_commentsHint = new QLabel(QStringLiteral("Editing comments \u2014 single-page view only"));
+        m_commentsHint = new QLabel(QStringLiteral("Editing comments \u2014 single-page view only"));
         QFont hintFont = m_commentsHint->font();
         hintFont.setPointSizeF(hintFont.pointSizeF() - 1);
         m_commentsHint->setFont(hintFont);
-        m_commentsHint->setStyleSheet("color:#888;");
+        m_commentsHint->setStyleSheet(
+            QStringLiteral("color:%1;").arg(m_dark ? darkHC().fgDim : lightHC().fgDim));
         cpLay->addWidget(m_commentsHint);
         m_commentsList = new QListWidget;
         connect(m_commentsList, &QListWidget::itemClicked, this, [this](QListWidgetItem* it){
@@ -359,11 +389,13 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     }
 
     m_stack = new QStackedWidget;
+    m_stack->setFrameShape(QFrame::NoFrame);
     m_stack->addWidget(m_list);           // idx 0 — Thumbnails
     m_stack->addWidget(m_outline);        // idx 1 — Bookmarks
     m_stack->addWidget(m_commentsPanel);  // idx 2 — Comments
     m_stack->addWidget(m_propertiesTree); // idx 3 — Properties
     m_stack->addWidget(m_searchPanel);    // idx 4 — Search
+    m_stack->addWidget(m_ocrPanel);       // idx 5 — OCR
 
     connect(m_tabGroup, &QButtonGroup::idClicked, m_stack, &QStackedWidget::setCurrentIndex);
     connect(m_tabGroup, &QButtonGroup::idClicked, this, [this](int id) {
@@ -375,6 +407,8 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
             emit requestComments();
         if (id == 4)
             m_searchPanel->focusInput();
+        if (id == 5)
+            m_ocrPanel->refresh();
     });
     // Relay search signals from SearchPanel out through ThumbnailPanel
     connect(m_searchPanel, &SearchPanel::searchRequested,
@@ -478,7 +512,7 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
     if (m_thumbPool) disconnect(m_thumbPoolConn);
     m_renderer  = renderer;
     m_thumbPool = pool;
-    if (m_thumbPool) {
+    if (m_ocrPanel) m_ocrPanel->setDocument(doc);    if (m_thumbPool) {
         m_thumbPoolConn = connect(m_thumbPool, &ThumbnailRenderPool::thumbnailReady,
                                   this, &ThumbnailPanel::onPageReady);
         if (!m_thumbPoolConn)
@@ -584,11 +618,21 @@ void ThumbnailPanel::setCurrentPage(int pageIndex) {
     m_currentPage = pageIndex;
     if (pageIndex >= 0 && pageIndex < m_list->count()) {
         auto* item = m_list->item(pageIndex);
-        item->setBackground(QColor(37, 99, 235, 90));
+        item->setBackground(currentPageHighlight());
         m_list->scrollToItem(item, QAbstractItemView::PositionAtCenter);
         QTimer::singleShot(0, this, [this]() { requestVisibleThumbnails(); });
     }
     syncBookmarkToPage(pageIndex);
+    if (m_ocrPanel) m_ocrPanel->setCurrentPage(pageIndex);
+}
+
+// Chuyen tab sidebar theo id (dung cho probe --uiprobe va dieu khien tu ma).
+void ThumbnailPanel::selectTab(int id) {
+    if (m_tabGroup) {
+        if (auto* b = m_tabGroup->button(id)) b->setChecked(true);
+    }
+    if (m_stack) m_stack->setCurrentIndex(id);
+    if (id == 5 && m_ocrPanel) m_ocrPanel->refresh();
 }
 
 // ── thumbnailForPage ──────────────────────────────────────────────────────────
@@ -623,6 +667,8 @@ void ThumbnailPanel::clearThumbnails() {
     m_annotPages = 0;
     setCommentsLoading(false);
     setComments({});
+    // Panel OCR phai ve trang thai "khong co tai lieu" ngay (SPEC_OCRPANEL_POLISH).
+    if (m_ocrPanel) m_ocrPanel->setDocument(nullptr);
 }
 
 // ── Search helpers (kept as no-ops; panel hidden) ─────────────────────────────
@@ -630,6 +676,13 @@ void ThumbnailPanel::addSearchResult(const SearchResult& result) {
     m_searchPanel->addResult(result);
 }
 void ThumbnailPanel::clearSearchResults() { m_searchPanel->clearResults(); }
+void ThumbnailPanel::resetSearch() { m_searchPanel->reset(); }
+void ThumbnailPanel::setSearchResults(const QString& query, const QList<SearchResult>& results) {
+    m_searchPanel->reset();
+    m_searchPanel->setQuery(query);
+    for (const SearchResult& r : results)
+        m_searchPanel->addResult(r);
+}
 void ThumbnailPanel::setSearchProgress(int pagesScanned, int totalPages) {
     m_searchPanel->setSearchProgress(pagesScanned, totalPages);
 }
@@ -643,12 +696,37 @@ void ThumbnailPanel::activateSearch() {
 
 // ── setActiveToolButton ────────────────────────────────────────────────────────
 void ThumbnailPanel::setActiveToolButton(int id) {
+    m_activeTool = id;
+    applyToolButtonStyles();
+}
+
+// ── activateToolFromGrid ───────────────────────────────────────────────────────
+void ThumbnailPanel::activateToolFromGrid(int id) {
+    setActiveToolButton(id);
+    updateSizeComboForTool(id);
+    emit annotToolSelected(id);
+}
+
+// ── applyToolButtonStyles ──────────────────────────────────────────────────────
+void ThumbnailPanel::applyToolButtonStyles() {
+    const ThemeTokens& t = m_dark ? darkHC() : lightHC();
     for (auto it = m_toolButtons.constBegin(); it != m_toolButtons.constEnd(); ++it) {
-        if (it.key() == id)
-            it.value()->setStyleSheet("background:#2d7dd2; color:white; font-weight:bold;");
+        if (it.key() == m_activeTool)
+            it.value()->setStyleSheet(
+                QStringLiteral("background:%1; color:%2; border:1px solid %3; font-weight:bold;")
+                    .arg(t.selBg, t.selFg, t.focus));
         else
             it.value()->setStyleSheet("");
     }
+}
+
+// ── updateColorBtnStyle ────────────────────────────────────────────────────────
+void ThumbnailPanel::updateColorBtnStyle() {
+    if (!m_colorBtn) return;
+    // Nen = mau markup nguoi dung chon (du lieu), chu = tu tinh theo do choi
+    // cua nen de luon tuong phan.
+    m_colorBtn->setStyleSheet(
+        QStringLiteral("background:%1; color:%2;").arg(m_annColor.name(), textColorOn(m_annColor)));
 }
 
 // ── updateSizeComboForTool ─────────────────────────────────────────────────────
@@ -680,7 +758,26 @@ void ThumbnailPanel::updateSizeComboForTool(int toolId) {
 }
 
 // ── setDarkMode ───────────────────────────────────────────────────────────────
-void ThumbnailPanel::setDarkMode(bool dark) { Q_UNUSED(dark) }
+void ThumbnailPanel::setDarkMode(bool dark) {
+    m_dark = dark;
+    if (m_commentsHint)
+        m_commentsHint->setStyleSheet(
+            QStringLiteral("color:%1;").arg(dark ? darkHC().fgDim : lightHC().fgDim));
+    if (m_commentsSep)
+        m_commentsSep->setStyleSheet(
+            QStringLiteral("color:%1;").arg(dark ? darkHC().border : lightHC().border));
+    applyToolButtonStyles();
+    if (m_ocrPanel) m_ocrPanel->setDarkMode(dark);
+    if (m_currentPage >= 0 && m_currentPage < m_list->count())
+        m_list->item(m_currentPage)->setBackground(currentPageHighlight());
+}
+
+// ── currentPageHighlight ───────────────────────────────────────────────────────
+QColor ThumbnailPanel::currentPageHighlight() const {
+    QColor c(m_dark ? darkHC().accent : lightHC().accent);
+    c.setAlpha(90);
+    return c;
+}
 
 // ── onPageReady ───────────────────────────────────────────────────────────────
 void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epoch) {

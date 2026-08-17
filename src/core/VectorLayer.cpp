@@ -1,4 +1,5 @@
 #include "VectorLayer.h"
+#include "PageCache.h"
 #include <fpdf_edit.h>
 #include <fpdf_transformpage.h>
 #include <fpdfview.h>
@@ -66,7 +67,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     clear();
     QElapsedTimer t;
     t.start();
-    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+    // Trang muon TU PageCache (chu so huu duy nhat) — khong tu Close. Caller giu s_pdfiumMutex.
+    FPDF_PAGE page = PageCache::acquire(doc, pageIndex);
     if (!page) return false;
 
     // FPDF_GetPageWidth/Height DA ap /Rotate -> day la co HIEN THI, KHONG phai co hop crop.
@@ -376,7 +378,6 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     int nObj = FPDFPage_CountObjects(page);
     constexpr int kHeavyThreshold = 2000; // ponytail: nguong THAP (2000 object) — do thuc te: 308k object build het 332ms, 137k het ~150ms; trang duoi nguong nay dung raster nen la du.
     if (nObj <= kHeavyThreshold) {
-        FPDF_ClosePage(page);
         qDebug().noquote() << "[vector] bo qua page=" << pageIndex
                            << "objects=" << nObj << "(trang nhe)";
         return false;
@@ -523,6 +524,14 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             float l = 0, b = 0, r = 0, tp = 0;
             if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &tp)) continue;
             if (r <= l || tp <= b) continue;
+            // Chu OCR vo hinh (render mode INVISIBLE hoac fill alpha=0) khong duoc
+            // ve — lop OCR chi ton tai de search/tim kiem, ve ra thanh chu den
+            // tren anh scan (loi da gap: OCR dat INVISIBLE + alpha=0 van hien).
+            {
+                unsigned int cR = 0, cG = 0, cB = 0, cA = 0;
+                if (FPDFTextObj_GetTextRenderMode(obj) == FPDF_TEXTRENDERMODE_INVISIBLE) continue;
+                if (FPDFPageObj_GetFillColor(obj, &cR, &cG, &cB, &cA) && cA == 0) continue;
+            }
             unsigned int tr=0,tg=0,tb=0,ta=0;
             FPDF_BITMAP bmp = FPDFTextObj_GetRenderedBitmap(doc, page, obj, kTextScale);
             if (!bmp) continue;
@@ -871,7 +880,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
         qDebug().noquote() << "[vector] fill CAP";
     }
 
-    FPDF_ClosePage(page);
+    // Trang la cua PageCache — khong FPDF_ClosePage o day.
     m_ready = true;
     m_fillOpaqueFloats = m_fillVerts.size();
     m_fillVerts   += tmpFillVertsA;

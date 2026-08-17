@@ -1,4 +1,5 @@
 #include "FindBar.h"
+#include "KeylogProbe.h"
 #include <QHBoxLayout>
 #include <QLineEdit>
 #include <QLabel>
@@ -14,10 +15,12 @@ FindBar::FindBar(QWidget* parent)
     setAutoFillBackground(true);
 
     m_input     = new QLineEdit(this);
+    installKeylogProbe(m_input);
     m_matchLabel = new QLabel("0 / 0", this);
     m_prevBtn   = new QPushButton(this);
     m_nextBtn   = new QPushButton(this);
     m_matchCase = new QCheckBox("Aa", this);
+    m_matchDiacritics = new QCheckBox("Match diacritics", this);
     m_closeBtn  = new QPushButton(this);
 
     m_prevBtn->setIcon(style()->standardIcon(QStyle::SP_ArrowUp));
@@ -37,6 +40,8 @@ FindBar::FindBar(QWidget* parent)
     m_prevBtn->setFixedSize(28, 24);
     m_nextBtn->setFixedSize(28, 24);
     m_matchCase->setToolTip("Match case");
+    m_matchDiacritics->setToolTip(
+        "When off, search ignores Vietnamese diacritics (MAT finds MẶT)");
     m_closeBtn->setFixedSize(28, 24);
 
     auto* lay = new QHBoxLayout(this);
@@ -47,6 +52,7 @@ FindBar::FindBar(QWidget* parent)
     lay->addWidget(m_prevBtn);
     lay->addWidget(m_nextBtn);
     lay->addWidget(m_matchCase);
+    lay->addWidget(m_matchDiacritics);
     lay->addWidget(m_closeBtn);
 
     connect(m_input, &QLineEdit::returnPressed, this, &FindBar::onReturnPressed);
@@ -55,6 +61,10 @@ FindBar::FindBar(QWidget* parent)
     connect(m_nextBtn, &QPushButton::clicked, this, &FindBar::onNextClicked);
     connect(m_closeBtn, &QPushButton::clicked, this, &FindBar::closeBar);
     connect(m_matchCase, &QCheckBox::toggled, this, [this]() {
+        if (!m_input->text().isEmpty())
+            onTextChanged(m_input->text());
+    });
+    connect(m_matchDiacritics, &QCheckBox::toggled, this, [this]() {
         if (!m_input->text().isEmpty())
             onTextChanged(m_input->text());
     });
@@ -131,7 +141,8 @@ void FindBar::triggerSearch() {
     m_matchCount = 0;
     m_matchCurrent = 0;
     updateLabel();
-    emit searchRequested(q, m_matchCase->isChecked() ? Qt::CaseSensitive : Qt::CaseInsensitive);
+    emit searchRequested(q, m_matchCase->isChecked() ? Qt::CaseSensitive : Qt::CaseInsensitive,
+                         m_matchDiacritics->isChecked());
 }
 
 void FindBar::onReturnPressed() {

@@ -2,13 +2,14 @@
 // App manifest and version info
 
 #include <windows.h>
+#include "torreader_version.h"
 
 // Exe icon (Explorer + taskbar). Restored 2026-07-04 from torreader.cloud favicon04.ico.
 IDI_ICON1 ICON "icons/TorReader.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 2,2,0,0
-PRODUCTVERSION 2,2,0,0
+FILEVERSION TR_VER_NUM
+PRODUCTVERSION TR_VER_NUM
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -21,12 +22,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "B&B Creations"
             VALUE "FileDescription", "TorReader PDF Viewer"
-            VALUE "FileVersion", "2.2.0.0"
+            VALUE "FileVersion", TR_VER_STR
             VALUE "InternalName", "TorReader"
             VALUE "LegalCopyright", "Copyright 2024-2026 B&B Creations"
             VALUE "OriginalFilename", "TorReader.exe"
             VALUE "ProductName", "TorReader"
-            VALUE "ProductVersion", "2.2.0.0"
+            VALUE "ProductVersion", TR_VER_STR
         END
     END
     BLOCK "VarFileInfo"

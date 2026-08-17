@@ -17,7 +17,7 @@ NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent, bo
         "  border-radius:3px; padding:4px; }"
         "QDialogButtonBox QPushButton { background:#3C3F41; color:#D4D4D4; padding:4px 14px;"
         "  border:1px solid #555; border-radius:3px; }"
-        "QDialogButtonBox QPushButton:hover { background:#007ACC; }"
+        "QDialogButtonBox QPushButton:hover { border:1px solid #F38518; }"
     );
 
     auto* layout = new QVBoxLayout(this);

@@ -11,4 +11,4 @@ MimeType=application/pdf;
 Keywords=pdf;viewer;editor;reader;merge;split;sign;annotate;markup;comment;cad;acrobat;
 StartupWMClass=TorReader
 StartupNotify=true
-X-AppImage-Version=2.3.3
+X-AppImage-Version=2.4.0

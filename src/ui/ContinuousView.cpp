@@ -1,6 +1,10 @@
 #include "ContinuousView.h"
+#include "ThemeTokens.h"
 #include "../core/PdfDocument.h"
 #include "../core/PdfRenderer.h"
+#include "../core/PdfCoords.h"
+#include <fpdfview.h>
+#include <fpdf_edit.h>
 #include "../annotations/AnnotationManager.h"
 #include "../core/VectorGpuRenderer.h"
 
@@ -25,7 +29,6 @@
 #include <QOpenGLFunctions>
 
 extern QMutex s_pdfiumMutex;
-
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
 ContinuousView::ContinuousView(QWidget* parent)
@@ -34,7 +37,16 @@ ContinuousView::ContinuousView(QWidget* parent)
     setFrameShape(QFrame::NoFrame);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    // QAbstractScrollArea mac dinh ve corner mau palette o goc phai-duoi khi
+    // ca 2 scrollbar hien ra — dat corner widget rieng de to mau theo token.
+    auto* corner = new QWidget(this);
+    corner->setObjectName("contCorner");
+    setCornerWidget(corner);
     viewport()->setMouseTracking(true);
+
+    // Link tinh xong o background: cap nhat con tro/hover ngay (SPEC_NO_SYNC_PAGELOAD).
+    connect(PdfLinks::notifier(), &PdfLinksNotifier::linksReady, this,
+            [this](quintptr doc, int page) { onLinksReady(doc, page); });
 
     // Zoom debounce: emit zoomChanged after 150 ms of no further scroll
     m_zoomTimer = new QTimer(this);
@@ -128,6 +140,38 @@ ContinuousView::ContinuousView(QWidget* parent)
         emit regionNeeded(pg, m_zoom, regionPx);
     });
 
+    // ── Flash link dich (SPEC_PDF_LINKS muc 4): ve lai lien tuc ~1 giay ────
+    m_flashTimer = new QTimer(this);
+    m_flashTimer->setInterval(50);
+    connect(m_flashTimer, &QTimer::timeout, this, [this] {
+        if (m_flashClock.elapsed() >= 1000) {
+            m_flashTimer->stop();
+            m_flashPage = -1;
+            m_flashRect = QRectF();
+        }
+        viewport()->update();
+    });
+
+    // Tu cuon khi keo chon chu toi mep tren/duoi vung nhin (SPEC_TEXTSEL_ADOBE).
+    m_autoScrollTimer = new QTimer(this);
+    m_autoScrollTimer->setInterval(30);
+    connect(m_autoScrollTimer, &QTimer::timeout, this, [this]{
+        if (!m_selDragging) { stopAutoScroll(); return; }
+        const int scrollY = verticalScrollBar()->value();
+        const int vpH     = viewport()->height();
+        const int zone    = 48;
+        int delta = 0;
+        if (m_autoScrollMousePos.y() < zone)
+            delta = -std::max(8, (zone - m_autoScrollMousePos.y()) * 2);
+        else if (m_autoScrollMousePos.y() > vpH - zone)
+            delta = std::max(8, (m_autoScrollMousePos.y() - (vpH - zone)) * 2);
+        if (delta != 0) {
+            verticalScrollBar()->setValue(scrollY + delta);
+            viewport()->update();
+            updateTextSelectionFocus(m_autoScrollMousePos);
+        }
+    });
+
     setViewport(new QOpenGLWidget(this));
 }
 
@@ -150,6 +194,18 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
     // Clear any text selection when document changes
     m_selecting = false;
     m_selStart  = m_selEnd = QPoint();
+    m_selDragging = false;
+    stopAutoScroll();
+    clearTextSelectionInternal();
+
+    // Clear markup selection/drag state (SPEC_CONTINUOUS_MARKUP_EDIT).
+    m_hasSel = false;
+    m_selPage = -1;
+    m_draggingAnnot = false;
+    clearDragTarget();
+    m_dragPixelDelta = QPointF();
+    m_dragNoteRect = QRectF();
+    m_dragNoteOffsetPt = QPointF();
 
     // Disconnect old renderer
     if (m_renderer) {
@@ -388,6 +444,53 @@ void ContinuousView::scrollToPage(int pageIndex)
     pageIndex = qBound(0, pageIndex, m_pageCount - 1);
     int targetY = pageTopY(pageIndex);
     verticalScrollBar()->setValue(targetY);
+}
+
+void ContinuousView::scrollToPageRect(int page, const QRectF& rectPdf)
+{
+    if (m_pageCount == 0) return;
+    page = qBound(0, page, m_pageCount - 1);
+    const QRectF nr = rectPdf.normalized();
+    if (nr.width() < 0.5 || nr.height() < 0.5) {
+        scrollToPage(page);
+        return;
+    }
+    // Dung lai DUNG phep quy doi paintEvent dang dung de ve highlight:
+    // display point -> canvas pixel (linear theo pageW/pageH tren pageSizePt).
+    double pw   = pageW(page);
+    double ph   = pageH(page);
+    double pwPt = m_pageSizePt[page].width();
+    double phPt = m_pageSizePt[page].height();
+    double rectCx = pageLeftX(page) + (nr.x() + nr.width()  / 2.0) / (pwPt > 0 ? pwPt : 1.0) * pw;
+    double rectCy = pageTopY(page) + (nr.y() + nr.height() / 2.0) / (phPt > 0 ? phPt : 1.0) * ph;
+    int vpW = viewport()->width();
+    int vpH = viewport()->height();
+    // Tam rect vao GIUA vung nhin (goc cuon = tam - nua vung nhin), khong doi zoom.
+    horizontalScrollBar()->setValue(qMax(0, static_cast<int>(rectCx - vpW / 2.0)));
+    verticalScrollBar()->setValue(qMax(0, static_cast<int>(rectCy - vpH / 2.0)));
+}
+
+QPointF ContinuousView::probeRectCenterInViewport(int page, const QRectF& rectPdf) const
+{
+    if (page < 0 || page >= m_pageCount) return QPointF(1e9, 1e9);
+    const QRectF nr = rectPdf.normalized();
+    double pw   = pageW(page);
+    double ph   = pageH(page);
+    double pwPt = m_pageSizePt[page].width();
+    double phPt = m_pageSizePt[page].height();
+    double rectCx = pageLeftX(page) + (nr.x() + nr.width()  / 2.0) / (pwPt > 0 ? pwPt : 1.0) * pw;
+    double rectCy = pageTopY(page) + (nr.y() + nr.height() / 2.0) / (phPt > 0 ? phPt : 1.0) * ph;
+    return QPointF(rectCx - horizontalScrollBar()->value(),
+                   rectCy - verticalScrollBar()->value());
+}
+
+void ContinuousView::flashPageRect(int page, const QRectF& rectDisp)
+{
+    m_flashPage = qBound(0, page, qMax(0, m_pageCount - 1));
+    m_flashRect = rectDisp.normalized();
+    m_flashClock.restart();
+    m_flashTimer->start();
+    viewport()->update();
 }
 
 int ContinuousView::currentPage() const
@@ -656,7 +759,7 @@ void ContinuousView::ensureVectorLayers()
             qDebug().noquote() << "[cont] vecLayer" << (w->result() ? "READY" : "SKIP")
                                << "page=" << pg << "cached=" << m_vecLayers.size();
             if (w->result() && !m_pageAnnotVisuals.contains(pg))
-                emit needAnnotVisuals(pg);
+                needAnnotVisuals(pg);
             viewport()->update();
         });
         FPDF_DOCUMENT d = m_doc->raw();
@@ -677,29 +780,37 @@ void ContinuousView::ensureVectorLayers()
     }
 }
 
-void ContinuousView::setSelectedAnnotRect(const QRectF& rectPdf) {
-    m_selRect = rectPdf;
-    m_hasSel = true;
+void ContinuousView::setTool(PdfGpuView::ViewTool tool) {
+    m_tool = tool;
+    m_selecting = false;   // huy vung chon dang keo khi doi cong cu
+    m_selDragging = false;
+    stopAutoScroll();
+    if (tool != PdfGpuView::ViewTool::SelectText)
+        clearTextSelectionInternal();
+    // Chon markup: roi Pan thi bo chon (giong PdfGpuView doi tool xoa chon).
+    if (tool != PdfGpuView::ViewTool::Pan) {
+        m_hasSel = false;
+        m_selPage = -1;
+        clearDragTarget();
+    }
+    viewport()->setCursor(tool == PdfGpuView::ViewTool::SelectText
+                              ? Qt::IBeamCursor : Qt::ArrowCursor);
+}
+
+void ContinuousView::setAllHighlights(const QHash<int, QList<QRectF>>& byPage,
+                                      int currentPage, int currentIdxInPage) {
+    m_highlightsByPage = byPage;
+    m_highlightCurrentPage = currentPage;
+    m_highlightCurrentIdx  = currentIdxInPage;
+    qDebug().noquote() << QString("[find] paint highlights pages=%1 current=%2/%3")
+        .arg(byPage.size()).arg(currentPage).arg(currentIdxInPage);
     viewport()->update();
 }
 
-void ContinuousView::clearSelectedAnnotRect() {
-    m_hasSel = false;
-    viewport()->update();
-}
-
-void ContinuousView::setHighlights(int page, const QList<QRectF>& rects, int currentIdx) {
-    m_highlightPage = page;
-    m_highlights = rects;
-    m_highlightCurrentIdx = currentIdx;
-    qDebug().noquote() << QString("[find] paint highlights page=%1 n=%2").arg(page).arg(rects.size());
-    viewport()->update();
-}
-
-void ContinuousView::clearHighlights() {
-    m_highlightPage = -1;
-    m_highlights.clear();
-    m_highlightCurrentIdx = -1;
+void ContinuousView::clearAllHighlights() {
+    m_highlightsByPage.clear();
+    m_highlightCurrentPage = -1;
+    m_highlightCurrentIdx  = -1;
     viewport()->update();
 }
 
@@ -714,6 +825,95 @@ void ContinuousView::invalidatePage(int pageIndex) {
     m_continuousRequested.remove(pageIndex);
     m_pageAnnotVisuals.remove(pageIndex);
     qDebug() << "[markup] invalidatePage page=" << pageIndex;
+}
+
+// ── Chon/keo markup (SPEC_CONTINUOUS_MARKUP_EDIT_2026-08-16) ────────────────
+// rectPdf o TOA DO HIEN THI (Y-down, da ap /Rotate + pageBoxOrigin) — cung
+// khong gian voi AnnotInfo.rect nen ve thang khong can quy doi lai.
+
+void ContinuousView::setSelectedAnnot(int page, const QRectF& rectPdf) {
+    m_dragPixelDelta = QPointF();
+    m_selPage  = page;
+    m_selRect  = rectPdf;
+    m_hasSel   = true;
+    viewport()->update();
+}
+
+void ContinuousView::clearSelectedAnnot() {
+    m_hasSel = false;
+    m_selPage = -1;
+    clearDragTarget();
+    viewport()->update();
+}
+
+void ContinuousView::setDragTarget(const QString& uid, const QString& ghostText,
+                                   float fontSizePt, const QColor& ghostColor) {
+    m_dragUid = uid;
+    Q_UNUSED(ghostText); Q_UNUSED(fontSizePt); Q_UNUSED(ghostColor);
+}
+
+void ContinuousView::clearDragTarget() {
+    m_dragUid.clear();
+}
+
+void ContinuousView::setDragNote(const QRectF& rPt) {
+    m_dragNoteRect = rPt;
+    m_dragNoteOffsetPt = QPointF();
+    viewport()->update();
+}
+
+void ContinuousView::clearDragState() {
+    m_dragPixelDelta = QPointF();
+    m_dragNoteRect = QRectF();
+    m_dragNoteOffsetPt = QPointF();
+    m_dragUid.clear();
+    m_draggingAnnot = false;
+    viewport()->update();
+}
+
+bool ContinuousView::resolvePageDisplayPos(const QPoint& widgetPos, int* page, QPointF* dispPt) const {
+    if (!m_doc || !m_doc->isOpen() || m_pageCount == 0) return false;
+    const QPoint canvasPos = widgetPos
+        + QPoint(horizontalScrollBar()->value(), verticalScrollBar()->value());
+    for (int i = 0; i < m_pageCount; ++i) {
+        const int left = pageLeftX(i), top = pageTopY(i);
+        const int right = left + pageW(i), bottom = top + pageH(i);
+        if (canvasPos.x() < left || canvasPos.x() >= right
+            || canvasPos.y() < top || canvasPos.y() >= bottom) continue;
+        *page   = i;
+        *dispPt = QPointF((canvasPos.x() - left) / m_zoom,
+                          (canvasPos.y() - top) / m_zoom);
+        return true;
+    }
+    return false;
+}
+
+void ContinuousView::probeSimulatePickDrag(int page, const QPointF& pressDisp, const QPointF& dragDisp) {
+    if (page < 0 || page >= m_pageCount) return;
+    int scrollX = horizontalScrollBar()->value();
+    int scrollY = verticalScrollBar()->value();
+    const QPointF pressW(pageLeftX(page) + pressDisp.x() * m_zoom - scrollX,
+                         pageTopY(page) + pressDisp.y() * m_zoom - scrollY);
+    const QPointF relW(pressW.x() + dragDisp.x() * m_zoom,
+                       pressW.y() + dragDisp.y() * m_zoom);
+    // Nhan chuot trai → pick (MainWindow handler chay dong bo, dat m_hasSel).
+    {
+        QMouseEvent pe(QEvent::MouseButtonPress, pressW, pressW,
+                       Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        mousePressEvent(&pe);
+    }
+    // Keo → cap nhat khung chon.
+    {
+        QMouseEvent me(QEvent::MouseMove, relW, relW,
+                       Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        mouseMoveEvent(&me);
+    }
+    // Tha → emit annotationMoveRequested.
+    {
+        QMouseEvent re(QEvent::MouseButtonRelease, relW, relW,
+                       Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        mouseReleaseEvent(&re);
+    }
 }
 
 // ── QAbstractScrollArea overrides ─────────────────────────────────────────────
@@ -754,7 +954,8 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
     // Background
-    QColor bg = m_darkMode ? QColor(30, 30, 30) : QColor(50, 50, 50);
+    // Mau nen ban (sau to giay) theo theme HC: dark => #000000, light => bgAlt.
+    QColor bg = m_darkMode ? QColor(darkHC().deskBg) : QColor(lightHC().deskBg);
     p.fillRect(viewport()->rect(), bg);
 
     if (m_pageCount == 0) {
@@ -772,6 +973,13 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
     int scrollY = verticalScrollBar()->value();
     int vpW     = viewport()->width();
     int vpH     = viewport()->height();
+
+    // Nghiem thu bang so (SPEC_SEARCH_STATE_R3): dem highlight duoc ve.
+    int hlTotalPages = 0;
+    int hlVisiblePages = 0;
+    int hlDrawnRects = 0;
+    for (auto it = m_highlightsByPage.constBegin(); it != m_highlightsByPage.constEnd(); ++it)
+        if (!it->isEmpty()) ++hlTotalPages;
 
     for (int i = 0; i < m_pageCount; ++i) {
         // Canvas rect of this page
@@ -882,6 +1090,73 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
                 p.fillRect(vx, vy, cw, ch, m_darkMode ? QColor(45, 45, 45) : Qt::white);
             }
         }
+
+        // Search highlights cua trang nay — chi ve trang dang trong vung nhin.
+        auto hit = m_highlightsByPage.constFind(i);
+        if (hit != m_highlightsByPage.constEnd() && !hit->isEmpty()) {
+            const QList<QRectF>& hls = *hit;
+            double pwPt = m_pageSizePt[i].width();
+            double phPt = m_pageSizePt[i].height();
+            for (int hi = 0; hi < hls.size(); ++hi) {
+                QRectF nr = hls[hi].normalized();
+                if (nr.width() < 0.5 || nr.height() < 0.5) continue;
+                double hx = vx + nr.x() / pwPt * cw;
+                double hy = vy + nr.y() / phPt * ch;
+                double hw = nr.width() / pwPt * cw;
+                double hh = nr.height() / phPt * ch;
+                if (i == m_highlightCurrentPage && hi == m_highlightCurrentIdx) {
+                    p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 140, 0, 220));
+                    p.setPen(QPen(QColor(200, 80, 0, 240), 2.0));
+                    p.drawRect(QRectF(hx, hy, hw, hh));
+                } else {
+                    p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 220, 0, 90));
+                }
+                ++hlDrawnRects;
+            }
+            ++hlVisiblePages;
+        }
+
+        // Vung chon chu (SPEC_TEXTSEL_ADOBE): cung DUONG quy doi hien thi nhu
+        // highlight search, mau xanh ban trong suot kieu Adobe, khong vien.
+        auto sit = m_selRectsByPage.constFind(i);
+        if (sit != m_selRectsByPage.constEnd() && !sit->isEmpty()) {
+            double pwPt = m_pageSizePt[i].width();
+            double phPt = m_pageSizePt[i].height();
+            for (const QRectF& nr0 : *sit) {
+                QRectF nr = nr0.normalized();
+                if (nr.width() < 0.5 || nr.height() < 0.5) continue;
+                double hx = vx + nr.x() / pwPt * cw;
+                double hy = vy + nr.y() / phPt * ch;
+                double hw = nr.width() / pwPt * cw;
+                double hh = nr.height() / phPt * ch;
+                p.fillRect(QRectF(hx, hy, hw, hh), QColor(0, 102, 204, 89));  // rgba(0,102,204,0.35)
+            }
+        }
+
+        // Flash khung dich khi nhay link noi bo (SPEC_PDF_LINKS muc 4):
+        // ve vien ~1 giay roi mo dan. rectDisp cung khong gian toa do hien thi.
+        if (i == m_flashPage && !m_flashRect.isEmpty() && m_flashClock.isValid()) {
+            double pwPt = m_pageSizePt[i].width();
+            double phPt = m_pageSizePt[i].height();
+            double fx = vx + m_flashRect.x() / (pwPt > 0 ? pwPt : 1.0) * cw;
+            double fy = vy + m_flashRect.y() / (phPt > 0 ? phPt : 1.0) * ch;
+            double fw = m_flashRect.width()  / (pwPt > 0 ? pwPt : 1.0) * cw;
+            double fh = m_flashRect.height() / (phPt > 0 ? phPt : 1.0) * ch;
+            double fade = qBound(0.0, 1.0 - m_flashClock.elapsed() / 1000.0, 1.0);
+            p.setPen(QPen(QColor(255, 120, 0, int(255 * fade)),
+                          qMax(1.5, 2.0 * m_zoom)));
+            p.setBrush(Qt::NoBrush);
+            p.drawRect(QRectF(fx, fy, fw, fh));
+        }
+    }
+
+    {
+        static int lastHlP = -1, lastHlV = -1, lastHlD = -1;
+        if (hlTotalPages != lastHlP || hlVisiblePages != lastHlV || hlDrawnRects != lastHlD) {
+            qInfo().noquote() << QString("[hl] pages=%1 visiblePages=%2 drawn=%3")
+                .arg(hlTotalPages).arg(hlVisiblePages).arg(hlDrawnRects);
+            lastHlP = hlTotalPages; lastHlV = hlVisiblePages; lastHlD = hlDrawnRects;
+        }
     }
 
     {
@@ -903,32 +1178,6 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
         }
     }
 
-    // Search highlights (display coords per page)
-    if (!m_highlights.isEmpty() && m_highlightPage >= 0 && m_highlightPage < m_pageCount) {
-        int pg = m_highlightPage;
-        for (int hi = 0; hi < m_highlights.size(); ++hi) {
-            QRectF nr = m_highlights[hi].normalized();
-            if (nr.width() < 0.5 || nr.height() < 0.5) continue;
-            int vx = pageLeftX(pg) - horizontalScrollBar()->value();
-            int vy = pageTopY(pg) - verticalScrollBar()->value();
-            double pw = pageW(pg);
-            double ph = pageH(pg);
-            double pwPt = m_pageSizePt[pg].width();
-            double phPt = m_pageSizePt[pg].height();
-            double hx = vx + nr.x() / pwPt * pw;
-            double hy = vy + nr.y() / phPt * ph;
-            double hw = nr.width() / pwPt * pw;
-            double hh = nr.height() / phPt * ph;
-            if (hi == m_highlightCurrentIdx) {
-                p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 140, 0, 220));
-                p.setPen(QPen(QColor(200, 80, 0, 240), 2.0));
-                p.drawRect(QRectF(hx, hy, hw, hh));
-            } else {
-                p.fillRect(QRectF(hx, hy, hw, hh), QColor(255, 220, 0, 90));
-            }
-        }
-    }
-
     // ── Annotation overlay visuals ────────────────────────────────────────────
     if (!m_pageAnnotVisuals.isEmpty()) {
         p.setRenderHint(QPainter::Antialiasing, true);
@@ -942,6 +1191,9 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
             for (const AnnotVisual& av : *vit) {
                 // FreeText/Note are page objects in the renderer — overlay skips them to avoid double-draw
                 if (!av.paintByOverlay) continue;
+                const bool isDragged = m_draggingAnnot && !m_dragUid.isEmpty()
+                    && av.page == m_selPage && av.uid == m_dragUid;
+                if (isDragged) { p.save(); p.translate(m_dragPixelDelta); }
                 QPointF dOrig(vx + av.rect.x() * m_zoom, vy + av.rect.y() * m_zoom);
                 QRectF dRect(dOrig, QSizeF(av.rect.width() * m_zoom, av.rect.height() * m_zoom));
                 QPen strokePen(av.stroke.isValid() ? av.stroke : QColor(Qt::red), qMax(1.0, av.border * m_zoom));
@@ -1017,8 +1269,23 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
                     }
                     default: break;
                 }
+                if (isDragged) p.restore();
             }
         }
+    }
+
+    // Khung chon markup (SPEC_CONTINUOUS_MARKUP_EDIT): giong PdfGpuView —
+    // vien gach, toa do hien thi cua m_selPage, adjusted(-3,-3,3,3).
+    if (m_hasSel && m_selPage >= 0 && m_selPage < m_pageCount) {
+        int sx = pageLeftX(m_selPage) - scrollX;
+        int sy = pageTopY(m_selPage) - scrollY;
+        QRectF wr(sx + m_selRect.x() * m_zoom, sy + m_selRect.y() * m_zoom,
+                  m_selRect.width() * m_zoom, m_selRect.height() * m_zoom);
+        wr = wr.adjusted(-3, -3, 3, 3);
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(0, 120, 215), 1.5, Qt::DashLine));
+        p.drawRect(wr);
     }
 
     // Draw Alt+drag selection rect on top of all pages
@@ -1080,7 +1347,7 @@ void ContinuousView::wheelEvent(QWheelEvent* event)
 
 void ContinuousView::mousePressEvent(QMouseEvent* event)
 {
-    // Ctrl+Left drag = text selection for translation
+    // Ctrl+Left drag = text selection for translation (giu nguyen, SPEC phan 2).
     if ((event->modifiers() & Qt::ControlModifier)
         && event->button() == Qt::LeftButton)
     {
@@ -1093,19 +1360,94 @@ void ContinuousView::mousePressEvent(QMouseEvent* event)
         return;
     }
 
-    // ── Pan ──────────────────────────────────────────────────────────────
-    if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton) {
+    if (event->button() == Qt::LeftButton) {
+        // Link: chi khi tool la Pan hoac Select, khong bat Ctrl. Bam vao link
+        // thi di theo link truoc khi bat dau pan/chon chu (SPEC_PDF_LINKS muc 3).
+        if (m_tool == PdfGpuView::ViewTool::Pan
+            || m_tool == PdfGpuView::ViewTool::SelectText) {
+            if (tryActivateLink(event)) {
+                event->accept();
+                return;
+            }
+        }
+        if (m_tool == PdfGpuView::ViewTool::SelectText) {
+            // Cong cu Select: nhan chuot = chon chu theo CHI SO KY TU (Adobe),
+            // khong con quet hinh chu nhat.
+            if (m_clickValid && m_clickClock.elapsed() > QApplication::doubleClickInterval())
+                m_clickValid = false;
+            m_clickClock.restart();
+            m_clickValid = true;
+            beginTextSelection(event->pos(), 1);
+            event->accept();
+            return;
+        }
+        if (m_tool == PdfGpuView::ViewTool::Pan) {
+            // Chon/keo markup (SPEC_CONTINUOUS_MARKUP_EDIT): bam vao khung chon
+            // da co → bat dau keo; nguoc lai → pick de MainWindow hit-test.
+            if (m_hasSel && m_selPage >= 0) {
+                int scrollX = horizontalScrollBar()->value();
+                int scrollY = verticalScrollBar()->value();
+                QRectF wr(pageLeftX(m_selPage) + m_selRect.x() * m_zoom - scrollX,
+                          pageTopY(m_selPage) + m_selRect.y() * m_zoom - scrollY,
+                          m_selRect.width()  * m_zoom,
+                          m_selRect.height() * m_zoom);
+                if (wr.adjusted(-3, -3, 3, 3).contains(event->pos())) {
+                    m_draggingAnnot = true;
+                    m_dragStart = event->pos();
+                    m_dragOrigRect = m_selRect;
+                    m_dragPixelDelta = QPointF(0, 0);
+                    m_dragNoteRect = m_dragOrigRect;
+                    m_dragNoteOffsetPt = QPointF();
+                    event->accept();
+                    return;
+                }
+            }
+            int page = -1;
+            QPointF dispPt;
+            if (resolvePageDisplayPos(event->pos(), &page, &dispPt)) {
+                emit annotationPickRequested(page, dispPt);
+                event->accept();
+                return;
+            }
+        }
+        // Pan (mac dinh): keo chuot trai = keo trang.
         m_panning      = true;
         m_lastMousePos = event->pos();
         viewport()->setCursor(Qt::ClosedHandCursor);
         event->accept();
-    } else {
-        QAbstractScrollArea::mousePressEvent(event);
+        return;
     }
+    if (event->button() == Qt::MiddleButton) {
+        m_panning      = true;
+        m_lastMousePos = event->pos();
+        viewport()->setCursor(Qt::ClosedHandCursor);
+        event->accept();
+        return;
+    }
+    QAbstractScrollArea::mousePressEvent(event);
 }
 
 void ContinuousView::mouseMoveEvent(QMouseEvent* event)
 {
+    if (m_draggingAnnot) {
+        // Keo khung chon theo con tro (display space, Y-down nhu m_selRect).
+        QPointF d = (QPointF(event->pos()) - QPointF(m_dragStart)) / m_zoom;
+        m_selRect = m_dragOrigRect.translated(d);
+        m_dragPixelDelta = event->pos() - m_dragStart;
+        m_dragNoteOffsetPt = d;
+        viewport()->update();
+        event->accept();
+        return;
+    }
+
+    if (m_selDragging) {
+        m_autoScrollMousePos = event->pos();
+        startAutoScrollIfNeeded(event->pos());
+        updateTextSelectionFocus(event->pos());
+        event->accept();
+        return;
+    }
+
     if (m_selecting) {
         m_selEnd = event->pos();
         viewport()->update();
@@ -1123,15 +1465,45 @@ void ContinuousView::mouseMoveEvent(QMouseEvent* event)
         horizontalScrollBar()->setValue(newV);
         event->accept();
     } else {
+        m_lastHoverPos = event->pos();
+        updateLinkHover(event->pos());
+        // Select: con tro I-beam chi khi roi tren chu; vung trong → mui ten.
+        if (m_tool == PdfGpuView::ViewTool::SelectText && !m_hoveringLink)
+            updateSelectCursor(event->pos());
         QAbstractScrollArea::mouseMoveEvent(event);
     }
 }
 
 void ContinuousView::mouseReleaseEvent(QMouseEvent* event)
 {
+    if (m_draggingAnnot && event->button() == Qt::LeftButton) {
+        m_draggingAnnot = false;
+        m_dragPixelDelta = QPointF();
+        m_dragNoteRect = QRectF();
+        m_dragNoteOffsetPt = QPointF();
+        viewport()->update();
+        // Cung dinh dang PdfGpuView: dx,dy o he display (Y up) — MainWindow se
+        // xoay nguoc theo /Rotate truoc khi goi AnnotationManager (dung duong san co).
+        double dx = (event->pos().x() - m_dragStart.x()) / m_zoom;
+        double dy = -(event->pos().y() - m_dragStart.y()) / m_zoom;
+        if (qAbs(dx) > 1.0 || qAbs(dy) > 1.0)
+            emit annotationMoveRequested(m_selPage, dx, dy);
+        event->accept();
+        return;
+    }
+    if (m_selDragging && event->button() == Qt::LeftButton) {
+        if (m_selClickGesture)
+            m_selClickGesture = false;   // nhay dup/ba: giu nguyen vung chon
+        else
+            updateTextSelectionFocus(event->pos());
+        finishTextSelection();
+        event->accept();
+        return;
+    }
     if (m_selecting && event->button() == Qt::LeftButton) {
         m_selecting = false;
-        viewport()->setCursor(Qt::ArrowCursor);
+        viewport()->setCursor(m_tool == PdfGpuView::ViewTool::SelectText
+                                  ? Qt::IBeamCursor : Qt::ArrowCursor);
 
         int scrollX = horizontalScrollBar()->value();
         int scrollY = verticalScrollBar()->value();
@@ -1159,15 +1531,35 @@ void ContinuousView::mouseReleaseEvent(QMouseEvent* event)
         }
 
         if (foundPage >= 0 && m_zoom > 0.0) {
-            double left   = (cx0 - pageLeftX(foundPage)) / m_zoom;
-            double right  = (cx1 - pageLeftX(foundPage)) / m_zoom;
-            double top_s  = (cy0 - pageTopY(foundPage))  / m_zoom;
-            double bot_s  = (cy1 - pageTopY(foundPage))  / m_zoom;
+            // Canvas pixel -> diem hien thi (Y-down, goc trai tren). Day la
+            // CUNG khong gian ma scrollToPageRect / highlight ve dang dung:
+            // pageW/pageH da la kich thuoc hien thi (render thread sua theo
+            // /Rotate), nen buoc nay khong can biet rotation.
+            double xd0 = (cx0 - pageLeftX(foundPage)) / m_zoom;
+            double xd1 = (cx1 - pageLeftX(foundPage)) / m_zoom;
+            double yd0 = (cy0 - pageTopY(foundPage))  / m_zoom;
+            double yd1 = (cy1 - pageTopY(foundPage))  / m_zoom;
+            const QRectF disp = QRectF(QPointF(xd0, yd0), QPointF(xd1, yd1)).normalized();
+            const QSizeF dsp  = m_pageSizePt[foundPage];
 
-            // Convert to PDF coords (PDF origin is bottom-left)
-            double pageH_pts = m_pageSizePt[foundPage].height();
-            QRectF pageRect(left, pageH_pts - bot_s, right - left, bot_s - top_s);
-            if (m_doc) pageRect.translate(m_doc->pageBoxOrigin(foundPage));
+            // Lay /Rotate + goc hop trang de nghich dao qua dispToPdf — DUNG LAI
+            // dung phep quy doi cua PdfCoords (search/scrollToPageRect dung de ra
+            // toa do hien thi), khong viet ban thu hai (SPEC phan 2 muc 4).
+            int rot = 0;
+            QPointF box(0.0, 0.0);
+            if (m_doc && m_doc->raw()) {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE pg = FPDF_LoadPage(m_doc->raw(), foundPage);
+                if (pg) {
+                    rot = FPDFPage_GetRotation(pg) & 3;
+                    box = pdfBoxOrigin(pg);
+                    FPDF_ClosePage(pg);
+                }
+            }
+            const double Wd = dsp.width(), Hd = dsp.height();
+            const QPointF tl = dispToPdf(disp.left(),  disp.top(),    Wd, Hd, rot, box.x(), box.y());
+            const QPointF br = dispToPdf(disp.right(), disp.bottom(), Wd, Hd, rot, box.x(), box.y());
+            const QRectF pageRect = QRectF(tl, br).normalized();
             emit textRegionSelected(foundPage, pageRect,
                                     event->globalPosition().toPoint());
         }
@@ -1189,7 +1581,31 @@ void ContinuousView::mouseReleaseEvent(QMouseEvent* event)
 
 void ContinuousView::mouseDoubleClickEvent(QMouseEvent* event)
 {
+    if (m_tool == PdfGpuView::ViewTool::SelectText && event->button() == Qt::LeftButton) {
+        // Nhay ba = dblclick thu 2 lien tiep trong doubleClickInterval.
+        const bool isTriple = m_clickValid && m_clickClock.elapsed() <= QApplication::doubleClickInterval();
+        m_clickClock.restart();
+        m_clickValid = true;
+        beginTextSelection(event->pos(), isTriple ? 3 : 2);
+        event->accept();
+        return;
+    }
     QAbstractScrollArea::mouseDoubleClickEvent(event);
+}
+
+void ContinuousView::contextMenuEvent(QContextMenuEvent* event)
+{
+    // Tim trang duoi con tro chuot (tinh theo vi tri cuon). Bam phai len annot
+    // → annotationContextRequested (MainWindow hien menu Edit/Properties/Delete nhu
+    // PdfGpuView — SPEC_CONTINUOUS_MARKUP_EDIT muc 4). Chuot phai vung trong → van
+    // la menu OCR page (handler cung xu ly miss).
+    int page = -1;
+    QPointF dispPt;
+    if (resolvePageDisplayPos(event->pos(), &page, &dispPt)) {
+        emit annotationContextRequested(page, dispPt, event->globalPos());
+        return;
+    }
+    QAbstractScrollArea::contextMenuEvent(event);
 }
 
 void ContinuousView::drawSelection(QPainter& p)
@@ -1202,4 +1618,247 @@ void ContinuousView::drawSelection(QPainter& p)
     p.fillRect(x, y, w, h, QColor(0, 120, 255, 50));
     p.setPen(QPen(QColor(0, 100, 220, 200), 1));
     p.drawRect(x, y, w, h);
+}
+
+// ── Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE) ──────────────────────────
+
+void ContinuousView::setSelectionRects(const QHash<int, QList<QRectF>>& byPage) {
+    m_selRectsByPage = byPage;
+    viewport()->update();
+}
+
+void ContinuousView::clearSelectionRects() {
+    m_selRectsByPage.clear();
+    viewport()->update();
+}
+
+bool ContinuousView::resolvePageSpacePos(const QPoint& widgetPos, int* page, QPointF* pagePt,
+                                         bool load) const {
+    if (!m_doc || !m_doc->isOpen() || m_pageCount == 0) return false;
+    const QPoint canvasPos = widgetPos
+        + QPoint(horizontalScrollBar()->value(), verticalScrollBar()->value());
+    for (int i = 0; i < m_pageCount; ++i) {
+        const int left = pageLeftX(i), top = pageTopY(i);
+        const int right = left + pageW(i), bottom = top + pageH(i);
+        if (canvasPos.x() < left || canvasPos.x() >= right
+            || canvasPos.y() < top || canvasPos.y() >= bottom) continue;
+        // Diem hien thi (Y-down, goc trai tren, da ap /Rotate + CropBox) —
+        // cung khong gian voi highlight search.
+        const QPointF disp((canvasPos.x() - left) / m_zoom,
+                           (canvasPos.y() - top) / m_zoom);
+        // mouseMove chi doc dem (khong nap); press duoc phep nap.
+        const TextSelection::PageInfo info = load
+            ? TextSelection::pageFor(m_doc->raw(), i)
+            : TextSelection::pageForCached(m_doc->raw(), i);
+        if (!info.tp) return false;   // trang chua san — khong xac dinh toa do
+        *page   = i;
+        *pagePt = TextSelection::dispToPagePt(info, disp);
+        return true;
+    }
+    return false;
+}
+
+void ContinuousView::beginTextSelection(const QPoint& widgetPos, int clickCount) {
+    int page = -1;
+    QPointF pagePt;
+    if (!resolvePageSpacePos(widgetPos, &page, &pagePt, /*load=*/true)) {
+        clearTextSelectionInternal();
+        viewport()->update();
+        return;
+    }
+    const TextSelection::PageInfo info = TextSelection::pageFor(m_doc->raw(), page);
+    const double tolX = 4.0 / m_zoom;
+    const double tolY = 6.0 / m_zoom;
+    int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+    if (idx < 0)
+        idx = TextSelection::nearestCharAt(info.tp, pagePt.x(), pagePt.y(), tolY);
+    if (idx < 0) {
+        // Khong co ky tu/dong nao gan: vung chon RONG, khong ve gi.
+        clearTextSelectionInternal();
+        m_selDragging = true;
+        viewport()->update();
+        return;
+    }
+    if (clickCount >= 3) {
+        int s = 0, c = 0;
+        TextSelection::lineRange(info.tp, idx, &s, &c);
+        m_selAnchorPage = page; m_selAnchorChar = s;
+        m_selFocusPage  = page; m_selFocusChar  = s + c - 1;
+    } else if (clickCount == 2) {
+        int s = 0, c = 0;
+        TextSelection::wordRange(info.tp, idx, &s, &c);
+        m_selAnchorPage = page; m_selAnchorChar = s;
+        m_selFocusPage  = page; m_selFocusChar  = s + c - 1;
+    } else {
+        m_selAnchorPage = page; m_selAnchorChar = idx;
+        m_selFocusPage  = page; m_selFocusChar  = idx;
+    }
+    m_selClickGesture = (clickCount >= 2);
+    m_selDragging = true;
+    emitSelectionState();
+    viewport()->update();
+}
+
+void ContinuousView::updateTextSelectionFocus(const QPoint& widgetPos) {
+    int page = -1;
+    QPointF pagePt;
+    if (!resolvePageSpacePos(widgetPos, &page, &pagePt)) return;
+    const TextSelection::PageInfo info = TextSelection::pageForCached(m_doc->raw(), page);
+    const double tolX = 4.0 / m_zoom;
+    const double tolY = 6.0 / m_zoom;
+    int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+    if (idx < 0)
+        idx = TextSelection::nearestCharAt(info.tp, pagePt.x(), pagePt.y(), tolY);
+    if (idx < 0) return;   // keo qua vung trong: giu focus cu
+    m_selFocusPage = page;
+    m_selFocusChar = idx;
+    emitSelectionState();
+    viewport()->update();
+}
+
+void ContinuousView::finishTextSelection() {
+    m_selDragging = false;
+    stopAutoScroll();
+    viewport()->setCursor(m_tool == PdfGpuView::ViewTool::SelectText
+                              ? Qt::IBeamCursor : Qt::ArrowCursor);
+}
+
+void ContinuousView::emitSelectionState() {
+    emit textSelectionChanged(m_selAnchorPage, m_selAnchorChar,
+                              m_selFocusPage, m_selFocusChar);
+}
+
+void ContinuousView::clearTextSelectionInternal() {
+    m_selAnchorPage = m_selFocusPage = -1;
+    m_selAnchorChar = m_selFocusChar = -1;
+    m_selRectsByPage.clear();
+    m_selClickGesture = false;
+    emit textSelectionCleared();
+}
+
+void ContinuousView::updateSelectCursor(const QPoint& widgetPos) {
+    int page = -1;
+    QPointF pagePt;
+    bool overText = false;
+    if (resolvePageSpacePos(widgetPos, &page, &pagePt)) {
+        const TextSelection::PageInfo info = TextSelection::pageForCached(m_doc->raw(), page);
+        const double tolX = 4.0 / m_zoom;
+        const double tolY = 6.0 / m_zoom;
+        const int idx = TextSelection::charIndexAt(info.tp, pagePt.x(), pagePt.y(), tolX, tolY);
+        overText = idx >= 0;
+    }
+    viewport()->setCursor(overText ? Qt::IBeamCursor : Qt::ArrowCursor);
+}
+
+void ContinuousView::startAutoScrollIfNeeded(const QPoint& widgetPos) {
+    const int vpH = viewport()->height();
+    const int zone = 48;
+    const bool atEdge = (widgetPos.y() < zone || widgetPos.y() > vpH - zone);
+    if (atEdge && !m_autoScrollTimer->isActive())
+        m_autoScrollTimer->start();
+    else if (!atEdge && m_autoScrollTimer->isActive())
+        m_autoScrollTimer->stop();
+}
+
+void ContinuousView::stopAutoScroll() {
+    if (m_autoScrollTimer && m_autoScrollTimer->isActive())
+        m_autoScrollTimer->stop();
+}
+
+// ── Link hover / click (SPEC_PDF_LINKS) ──────────────────────────────────────
+
+void ContinuousView::updateLinkHover(const QPoint& widgetPos)
+{
+    const bool linkTool = (m_tool == PdfGpuView::ViewTool::Pan
+                           || m_tool == PdfGpuView::ViewTool::SelectText);
+    const QString hoverTxt = [&]() -> QString {
+        if (!linkTool || !m_doc || !m_doc->isOpen() || m_pageCount == 0)
+            return QString();
+        const QPoint canvasPos = widgetPos
+            + QPoint(horizontalScrollBar()->value(), verticalScrollBar()->value());
+        for (int i = 0; i < m_pageCount; ++i) {
+            int left = pageLeftX(i), top = pageTopY(i);
+            int right = left + pageW(i), bottom = top + pageH(i);
+            if (canvasPos.x() < left || canvasPos.x() >= right
+                || canvasPos.y() < top || canvasPos.y() >= bottom) continue;
+
+            const QPointF dispPt((canvasPos.x() - left) / m_zoom,
+                                 (canvasPos.y() - top) / m_zoom);
+            QElapsedTimer _lt; _lt.start();
+            const PdfLinks::CachedPage cp = PdfLinks::cachedForPage(m_doc->raw(), i);
+            qDebug().noquote() << "[links] hover page=" << i
+                               << "cached=" << (cp.ready ? 1 : 0)
+                               << "blockedMs=" << _lt.elapsed();
+            if (!cp.ready) {
+                // Chua tinh link: KHONG chan giao dien. Con tro giu mui ten,
+                // xep viec tinh nen; xong thi notifier bao ve lai (lan re sau
+                // cung co ban tay).
+                PdfLinks::requestPage(m_doc->raw(), i);
+                return QString();
+            }
+            const int li = PdfLinks::linkAt(cp.links, dispPt, cp.info);
+            if (li >= 0) {
+                // Link LAUNCH/REMOTEGOTO khong co uri va dest: khong doi con tro.
+                if (cp.links[li].uri.isEmpty() && cp.links[li].destPage < 0) return QString();
+                return cp.links[li].uri.isEmpty()
+                    ? QString("Page %1").arg(cp.links[li].destPage + 1) : cp.links[li].uri;
+            }
+            return QString();
+        }
+        return QString();
+    }();
+
+    if (hoverTxt.isEmpty()) {
+        if (m_hoveringLink) {
+            m_hoveringLink = false;
+            if (m_tool != PdfGpuView::ViewTool::SelectText)
+                viewport()->setCursor(Qt::ArrowCursor);
+            emit linkHovered(QString());
+        }
+    } else {
+        if (!m_hoveringLink) {
+            m_hoveringLink = true;
+            viewport()->setCursor(Qt::PointingHandCursor);
+        }
+        emit linkHovered(hoverTxt);
+    }
+}
+
+// Link tinh xong: neu con tro van dang nam tren widget thi chay lai hover de
+// hien ban tay / boi to ngay, khong can re chuot (SPEC_NO_SYNC_PAGELOAD muc 1).
+void ContinuousView::onLinksReady(quintptr /*doc*/, int pageIndex)
+{
+    if (!viewport()->underMouse()) return;
+    if (pageIndex < 0 || pageIndex >= m_pageCount) return;
+    updateLinkHover(m_lastHoverPos);
+}
+
+bool ContinuousView::tryActivateLink(QMouseEvent* event)
+{
+    if (!m_doc || !m_doc->isOpen() || m_pageCount == 0) return false;
+    const QPoint canvasPos = event->pos()
+        + QPoint(horizontalScrollBar()->value(), verticalScrollBar()->value());
+    for (int i = 0; i < m_pageCount; ++i) {
+        int left = pageLeftX(i), top = pageTopY(i);
+        int right = left + pageW(i), bottom = top + pageH(i);
+        if (canvasPos.x() < left || canvasPos.x() >= right
+            || canvasPos.y() < top || canvasPos.y() >= bottom) continue;
+
+        const QPointF dispPt((canvasPos.x() - left) / m_zoom,
+                             (canvasPos.y() - top) / m_zoom);
+        const PdfLinks::CachedPage cp = PdfLinks::cachedForPage(m_doc->raw(), i);
+        if (!cp.ready) {
+            // Chua co dem: KHONG tra link, xu ly nhu binh thuong (Pan/Select).
+            // Khong duoc "cho cho co dem roi moi xu ly" — cho la dung hinh.
+            PdfLinks::requestPage(m_doc->raw(), i);
+            return false;
+        }
+        const int li = PdfLinks::linkAt(cp.links, dispPt, cp.info);
+        if (li >= 0) {
+            emit linkActivated(i, cp.links[li]);
+            return true;
+        }
+        return false;
+    }
+    return false;
 }

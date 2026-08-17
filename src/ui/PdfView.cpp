@@ -1,4 +1,5 @@
 #include "PdfView.h"
+#include "ThemeTokens.h"
 #include <QPainter>
 #include <QPen>
 #include <QMouseEvent>
@@ -144,7 +145,8 @@ void PdfView::paintEvent(QPaintEvent*) {
     p.setClipRect(rect());
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    QColor bg = m_darkMode ? QColor(30, 30, 30) : QColor(80, 80, 80);
+    // Mau nen ban (sau to giay) theo theme HC: dark => #000000, light => bgAlt.
+    QColor bg = m_darkMode ? QColor(darkHC().bg) : QColor(lightHC().bgAlt);
     p.setCompositionMode(QPainter::CompositionMode_Source);
     p.fillRect(rect(), bg);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);

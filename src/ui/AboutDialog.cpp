@@ -1,4 +1,5 @@
 #include "AboutDialog.h"
+#include "ThemeTokens.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QTabWidget>
@@ -54,11 +55,8 @@ Copyright &copy; Mesa 3D contributors.<br>
 Software OpenGL renderer (opengl32sw.dll) — fallback GPU.<br><br>
 
 
-<b>yaml-cpp</b> — MIT License<br>
-Copyright &copy; 2008-2015 Jesse Beder.<br>
-YAML configuration file parsing.<br><br>
 
-<p style='color:#6B7280; font-size:11px;'>
+<p style='color:%1; font-size:11px;'>
 All third-party libraries are used in compliance with their respective licenses.
 Qt is used under the LGPL v3 via dynamic linking, so the Qt libraries can be replaced
 or relinked. TorReader PDF bundles no proprietary or non-open-source code.
@@ -73,10 +71,10 @@ static const char* kShortcutText = R"(
 <tr><td><b>Ctrl+M</b></td><td>Merge PDFs</td></tr>
 <tr><td><b>Ctrl+Shift+E</b></td><td>Extract all pages</td></tr>
 <tr><td><b>Ctrl+P</b></td><td>Print</td></tr>
-<tr><td><b>C</b></td><td>Toggle Continuous scroll</td></tr>
+<tr><td><b>Ctrl+Shift+C</b></td><td>Toggle Continuous scroll</td></tr>
 <tr><td><b>Ctrl+Shift+F</b></td><td>Fit page</td></tr>
 <tr><td><b>Ctrl+=</b> / <b>Ctrl+&minus;</b></td><td>Zoom in / out</td></tr>
-<tr><td><b>T</b></td><td>Translate mode</td></tr>
+<tr><td><b>Ctrl+Shift+T</b></td><td>Translate mode</td></tr>
 <tr><td><b>F1</b></td><td>Show this help</td></tr>
 </table>
 <h3>Mouse</h3>
@@ -89,7 +87,8 @@ static const char* kShortcutText = R"(
 </table>
 )";
 
-AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
+AboutDialog::AboutDialog(bool dark, QWidget* parent) : QDialog(parent) {
+    const ThemeTokens& t = dark ? darkHC() : lightHC();
     setWindowTitle("About TorReader PDF");
     setFixedSize(500, 400);
 
@@ -101,30 +100,34 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     aLayout->setSpacing(10);
     aLayout->setContentsMargins(24, 20, 24, 20);
 
-    // Logo — always shown on white card so edge pixels blend correctly in any theme
+    // Logo card dung mau nen phu cua theme (den o Dark, trang o Light) — khong
+    // con mang trang choi giua nen den. Da kiem resources/icons: KHONG co bien
+    // the logo toi, nen chi doi nen card, khong tu lat mau anh bang code.
     auto* logoCard = new QLabel;
     logoCard->setAlignment(Qt::AlignCenter);
     logoCard->setStyleSheet(
-        "background: white; border-radius: 10px; padding: 10px 20px;");
-    QPixmap logo(":/icons/Logo_rectangle.png");
+        QStringLiteral("background: %1; border-radius: 10px; padding: 10px 20px;")
+            .arg(t.bgAlt));
+    QPixmap logo(":/icons/TorReader.ico");
     if (!logo.isNull())
-        logoCard->setPixmap(logo.scaledToWidth(200, Qt::SmoothTransformation));
+        logoCard->setPixmap(logo.scaledToHeight(80, Qt::SmoothTransformation));
     else {
         logoCard->setText("TorReader PDF");
         logoCard->setStyleSheet(logoCard->styleSheet() +
-            "font-size: 20px; font-weight: bold; color: #2563EB;");
+            QStringLiteral("font-size: 20px; font-weight: bold; color: %1;")
+                .arg(t.accent));
     }
     aLayout->addWidget(logoCard);
 
     auto* versionLabel = new QLabel(QStringLiteral("TorReader PDF — Version %1").arg(QStringLiteral(FELIXPDF_VERSION)));
     versionLabel->setAlignment(Qt::AlignCenter);
-    versionLabel->setStyleSheet("color: #6B7280; font-size: 11px;");
+    versionLabel->setStyleSheet(QStringLiteral("color: %1; font-size: 11px;").arg(t.fgDim));
     aLayout->addWidget(versionLabel);
 
     auto* authorLabel = new QLabel("By <b>FelixNgH</b> (Loc Nguyen Huy)");
     authorLabel->setAlignment(Qt::AlignCenter);
     authorLabel->setTextFormat(Qt::RichText);
-    authorLabel->setStyleSheet("color: #4B5563; font-size: 11px; margin-top: 2px;");
+    authorLabel->setStyleSheet(QStringLiteral("color: %1; font-size: 11px; margin-top: 2px;").arg(t.fgDim));
     aLayout->addWidget(authorLabel);
 
     auto* descLabel = new QLabel(
@@ -133,14 +136,15 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
         "with no installation required.");
     descLabel->setAlignment(Qt::AlignCenter);
     descLabel->setWordWrap(true);
-    descLabel->setStyleSheet("color: #374151; margin-top: 6px;");
+    descLabel->setStyleSheet(QStringLiteral("color: %1; margin-top: 6px;").arg(t.fg));
     aLayout->addWidget(descLabel);
 
     aLayout->addSpacing(8);
 
     auto* sponsorLabel = new QLabel(
-        "<span style='color:#6B7280; font-size:11px;'>Sponsored by</span> "
-        "<a href='https://bimserver.cloud'><b>BIMServer.cloud</b></a>");
+        QStringLiteral("<span style='color:%1; font-size:11px;'>Sponsored by</span> "
+                       "<a href='https://bimserver.cloud'><b>BIMServer.cloud</b></a>")
+            .arg(t.fgDim));
     sponsorLabel->setAlignment(Qt::AlignCenter);
     sponsorLabel->setOpenExternalLinks(true);
     sponsorLabel->setTextFormat(Qt::RichText);
@@ -172,7 +176,7 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     auto* sLayout = new QVBoxLayout(shortcutWidget);
     sLayout->setContentsMargins(8, 8, 8, 8);
     auto* shortcutBrowser = new QTextBrowser;
-    shortcutBrowser->setHtml(kShortcutText);
+    shortcutBrowser->setHtml(QString::fromUtf8(kShortcutText));
     shortcutBrowser->setOpenExternalLinks(false);
     sLayout->addWidget(shortcutBrowser, 1);
     tabs->addTab(shortcutWidget, "Shortcuts");
@@ -182,7 +186,7 @@ AboutDialog::AboutDialog(QWidget* parent) : QDialog(parent) {
     auto* lLayout = new QVBoxLayout(licWidget);
     lLayout->setContentsMargins(8, 8, 8, 8);
     auto* licBrowser = new QTextBrowser;
-    licBrowser->setHtml(kLicenseText);
+    licBrowser->setHtml(QString::fromUtf8(kLicenseText).arg(t.fgDim));
     licBrowser->setOpenExternalLinks(true);
     lLayout->addWidget(licBrowser, 1);
     auto* fullBtn = new QPushButton("Open full notices\u2026");

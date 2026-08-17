@@ -16,16 +16,25 @@
 #include <QCryptographicHash>
 #include <QStringList>
 #include <algorithm>
+#include <cmath>
 #include <functional>
+#include <limits>
 #ifndef TORREADER_NO_PDFIUM
 #include "ui/MainWindow.h"
+#include "ui/AboutDialog.h"
+#include "ui/ThemeTokens.h"
 #include "ui/ThumbnailPanel.h"
 #include "core/PdfEditor.h"
 #include "core/PdfDocument.h"
 #include "core/PdfRenderer.h"
 #include "core/PdfSigner.h"
 #include "core/TextSearch.h"
+#include "core/TextSelection.h"
+#include "core/OcrEngine.h"
+#include "core/OcrTextLayer.h"
+#include "core/VectorLayer.h"
 #include "core/PdfCoords.h"
+#include "core/PdfLinks.h"
 #include "annotations/AnnotationManager.h"
 #include "annotations/AnnotationLayer.h"
 #include "annotations/AnnotationTypes.h"
@@ -38,16 +47,11 @@
 #include <fpdf_progressive.h>
 #include <fpdf_text.h>
 #include <fpdf_formfill.h>
+#include <QPdfWriter>
+#include <QPainter>
+#include <QPageLayout>
+#include <QPageSize>
 extern QMutex s_pdfiumMutex;
-#endif
-#ifdef _WIN32
-#include "dwf/DWFLoader.h"
-#include "viewer/DWFViewer.h"
-#include "viewer/DWFMainWindow.h"
-#include "viewer/DWFParse.h"
-#include "rules/RuleEngine.h"
-#include "core/Reporter.h"
-#include "ai/AICopilot.h"
 #endif
 #ifdef _WIN32
 #include <psapi.h>
@@ -56,10 +60,12 @@ extern QMutex s_pdfiumMutex;
 #include <QEventLoop>
 #include <QDir>
 #include <QImage>
+#include <QPixmap>
 #include <QMap>
 #include <QFileDialog>
 #include <QListWidget>
 #include <QPushButton>
+#include <QLabel>
 #include <QTextBrowser>
 #include <QAction>
 #include <QElapsedTimer>
@@ -72,6 +78,7 @@ extern QMutex s_pdfiumMutex;
 #include <QInputDialog>
 #include <QTimer>
 #include <QToolBar>
+#include <QSettings>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
@@ -87,21 +94,60 @@ static inline void trHashAdd(QCryptographicHash& h, const char* d, qsizetype n) 
 #endif
 }
 
+// ── Text log: hung TAT CA qDebug/qInfo/qWarning ra file ─────────────────────
+// (SPEC_PROBE_LOG_SNAPSHOT 2026-08-16 muc 1). App Windows la GUI khong co
+// console nen moi dong qDebug bi vut di — tu day tat ca chui vao
+// %TEMP%\torreader.log. Handler chay tu NHIEU LUONG (OCR o QtConcurrent) nen
+// phai khoa bang QMutex tinh.
 static QFile   g_logFile;
 static QMutex  g_logMutex;
-static bool    g_logAll = false;
 
 static void logHandler(QtMsgType type, const QMessageLogContext&, const QString& msg) {
-    if (!g_logAll && !msg.startsWith("[")) return;
-    QMutexLocker lk(&g_logMutex);
-    if (!g_logFile.isOpen()) return;
-    const char* level = (type == QtWarningMsg) ? "WARN"
-                      : (type == QtCriticalMsg) ? "CRIT"
-                      : (type == QtFatalMsg)    ? "FATAL" : "DBG";
-    QTextStream ts(&g_logFile);
-    ts << QDateTime::currentDateTime().toString("hh:mm:ss.zzz")
-       << " [" << level << "] " << msg << "\n";
-    g_logFile.flush();
+    const char level = (type == QtInfoMsg)     ? 'I'
+                     : (type == QtWarningMsg)  ? 'W'
+                     : (type == QtCriticalMsg) ? 'C'
+                     : (type == QtFatalMsg)    ? 'C' : 'D';
+    {
+        QMutexLocker lk(&g_logMutex);
+        if (g_logFile.isOpen()) {
+            QByteArray line = QDateTime::currentDateTime().toString("hh:mm:ss.zzz").toUtf8();
+            line += " [";
+            line += level;
+            line += "] ";
+            line += msg.toUtf8();
+            line += '\n';
+            g_logFile.write(line);
+            g_logFile.flush();      // KHONG dem: app treo/crash van con log
+        }
+    }
+    // Van goi tiep handler mac dinh: ban Linux chay terminal khong mat log.
+    fprintf(stderr, "%s\n", msg.toLocal8Bit().constData());
+}
+
+// Mo file log kieu Append + ghi dong phan cach cho lan chay nay. Goi NGAY SAU
+// khi tao QApplication (can applicationVersion/applicationFilePath) va TRUOC
+// khi tao MainWindow. Qua 10 MB thi doi ten thanh torreader.log.1 (ghi de).
+static void installTextLog() {
+    QString path = QString::fromLocal8Bit(qgetenv("TORREADER_LOG"));
+    if (path.isEmpty()) path = QDir::tempPath() + QLatin1String("/torreader.log");
+    const QFileInfo fi(path);
+    if (fi.exists() && fi.size() > 10 * 1024 * 1024) {
+        const QString rotated = path + QLatin1String(".1");
+        QFile::remove(rotated);
+        QFile::rename(path, rotated);
+    }
+    g_logFile.setFileName(path);
+    const bool opened = g_logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
+    qInstallMessageHandler(logHandler);
+    if (opened) {
+        const QString sep = QStringLiteral("=== TorReader %1 | %2 | pid=%3 | %4 ===")
+                                .arg(QCoreApplication::applicationVersion(),
+                                     QDateTime::currentDateTime().toString(Qt::ISODate))
+                                .arg(QCoreApplication::applicationPid())
+                                .arg(QCoreApplication::applicationFilePath());
+        g_logFile.write(sep.toUtf8() + '\n');
+        g_logFile.flush();
+    }
 }
 
 #ifndef TORREADER_NO_PDFIUM
@@ -117,788 +163,18 @@ struct TRFileWriter {
 #endif
 
 int main(int argc, char* argv[]) {
-    QByteArray logEnv = qgetenv("TORREADER_LOG");
-    if (!logEnv.isEmpty()) {
-        g_logAll = true;
-        g_logFile.setFileName(QString::fromLocal8Bit(logEnv));
-        g_logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
-    } else {
-        g_logFile.setFileName("/tmp/torreader_debug.txt");
-        g_logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate);
-    }
-    qInstallMessageHandler(logHandler);
     QApplication::setHighDpiScaleFactorRoundingPolicy(
         Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
 
     QApplication app(argc, argv);
     app.setApplicationName("TorReader PDF");
     app.setApplicationVersion(FELIXPDF_VERSION);
-    qDebug() << "[gate] app version =" << FELIXPDF_VERSION;
     app.setOrganizationName("Loc Nguyen Huy");
     app.setOrganizationDomain("torreader.cloud");
 
-#ifdef _WIN32
-    // DWF AI headless CLI mode
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-info") {
-        QTextStream out(stdout);
-        DWFLoader loader;
-        bool ok = loader.loadFile(QString::fromLocal8Bit(argv[2]));
-        if (ok) {
-            auto meta = loader.getMetadata();
-            qDebug() << "DWF loaded:" << argv[2];
-            qDebug() << "  ObjectID:" << meta.objectId;
-            qDebug() << "  Version:" << meta.version;
-            qDebug() << "  Sections:" << meta.sectionCount;
-            qDebug() << "  Title:" << meta.projectName;
-            qDebug() << "  Author:" << meta.author;
-            qDebug() << "DWF_INFO_OK";
-            out << "DWF loaded: " << argv[2] << "\n";
-            out << "  ObjectID: " << meta.objectId << "\n";
-            out << "  Version: " << meta.version << "\n";
-            out << "  Sections: " << meta.sectionCount << "\n";
-            out << "  Title: " << meta.projectName << "\n";
-            out << "  Author: " << meta.author << "\n";
-            // parse W2D geometry → print for headless verification
-            {
-                DWFParse geoParser;
-                if (geoParser.loadDWF(QString::fromLocal8Bit(argv[2]))) {
-                    auto w2d = geoParser.parseW2DGeometry();
-                    int n = w2d.totalObjects;
-                    if (n > 0) {
-                        int x0 = (int)w2d.bbox.left();
-                        int y0 = (int)w2d.bbox.top();
-                        int x1 = (int)w2d.bbox.right();
-                        int y1 = (int)w2d.bbox.bottom();
-                        out << "  Geometry: sheets=" << w2d.sheets.size()
-                            << " objects=" << n
-                            << " total=" << w2d.totalPrimitives
-                            << " bbox=" << x0 << "," << y0 << "," << x1 << "," << y1 << "\n";
-                        int limit = qMin(w2d.sheets.size(), 60);
-                        for (int i = 0; i < limit; ++i) {
-                            const auto& s = w2d.sheets[i];
-                            int sx0 = (int)s.bbox.left();
-                            int sy0 = (int)s.bbox.top();
-                            int sx1 = (int)s.bbox.right();
-                            int sy1 = (int)s.bbox.bottom();
-                            int imgCount = 0;
-                            for (const auto& o : s.objects)
-                                if (o.type == QStringLiteral("image")) ++imgCount;
-                            out << "  Sheet " << s.sectionIndex << " \"" << s.name
-                                << "\": objects=" << s.objects.size()
-                                << " total=" << s.totalPrimitives
-                                << " images=" << imgCount
-                                << " bbox=" << sx0 << "," << sy0 << "," << sx1 << "," << sy1 << "\n";
-                            if (s.sectionIndex < 6) {
-                                for (const auto& o : s.objects)
-                                    if (o.type == QStringLiteral("image"))
-                                        out << "      IMG fmt=" << o.imageFormat
-                                            << " " << o.imageCols << "x" << o.imageRows << "\n";
-                            }
-                        }
-                    } else {
-                        out << "  Geometry: sheets=0 objects=0\n";
-                    }
-                }
-            }
-            out << "DWF_INFO_OK\n";
-            out.flush();
-        } else {
-            qWarning() << "DWF_INFO_FAIL";
-            out << "DWF_INFO_FAIL\n";
-            out.flush();
-        }
-        return ok ? 0 : 1;
-    }
-#endif
-
-#ifdef _WIN32
-    // usage: --dwf-uitest <file.dwf> [out.png]  (bấm THỬ MỌI control GUI, kiểm hiệu ứng, ghi PASS/FAIL từng nút)
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-uitest")) {
-        QString dwf = QString::fromLocal8Bit(argv[2]);
-        QString outPng = (argc >= 4) ? QString::fromLocal8Bit(argv[3]) : QString();
-        auto* win = new DWFMainWindow(dwf);
-        win->setAttribute(Qt::WA_DontShowOnScreen, true);
-        win->resize(1500, 950);
-        win->show();
-        auto pump = [](int n){ for (int i=0;i<n;++i){ QCoreApplication::processEvents(); QThread::msleep(30);} };
-        pump(30);
-
-        QFile rf(QCoreApplication::applicationDirPath() + QStringLiteral("/uitest_report.txt"));
-        QTextStream rep(&rf);
-        if (rf.open(QIODevice::WriteOnly | QIODevice::Text)) rep.setEncoding(QStringConverter::Utf8);
-        int pass = 0, total = 0;
-        auto CHECK = [&](const QString& name, bool ok){ ++total; if (ok) ++pass;
-            if (rf.isOpen()) { rep << (ok?"PASS ":"FAIL ") << name << "\n"; rep.flush(); } };
-        auto findAction = [&](const QString& sub)->QAction*{
-            for (QAction* a : win->findChildren<QAction*>()) if (a->text().contains(sub)) return a; return nullptr; };
-        auto findButton = [&](const QString& sub)->QPushButton*{
-            for (QPushButton* b : win->findChildren<QPushButton*>()) if (b->text().contains(sub)) return b; return nullptr; };
-
-        DWFViewer*   vw   = win->findChild<DWFViewer*>();
-        DWFRenderer* rd   = vw ? vw->renderer() : nullptr;
-        QListWidget* list = win->findChild<QListWidget*>();
-        QComboBox*   combo= win->findChild<QComboBox*>();
-        QDockWidget* dock = win->findChild<QDockWidget*>();
-        QTextBrowser* out = win->findChild<QTextBrowser*>();
-        CHECK(QStringLiteral("widgets-found"), vw && rd && list && combo && dock && out);
-
-        // --- Markup tool buttons (Select/Cloud/Line/Arrow/Rect/Text) ---
-        if (rd) {
-            struct TT { const char* lbl; Tool tool; };
-            TT tools[] = {{"Cloud",Tool::Cloud},{"Line",Tool::Line},{"Arrow",Tool::Arrow},
-                          {"Rect",Tool::Rect},{"Text",Tool::Text},{"Select",Tool::Select}};
-            for (auto& t : tools) {
-                QAction* a = findAction(QString::fromLatin1(t.lbl));
-                bool ok = a && (a->trigger(), pump(2), rd->currentTool()==t.tool);
-                CHECK(QStringLiteral("tool-")+QString::fromLatin1(t.lbl), ok);
-            }
-        }
-        // --- Zoom In / Out / Fit ---
-        if (rd) {
-            rd->fitView(); pump(3); double zf = rd->zoom();
-            QAction* zi = findAction(QStringLiteral("Zoom In"));
-            CHECK(QStringLiteral("zoom-in"), zi && (zi->trigger(), pump(3), rd->zoom() > zf));
-            double z1 = rd->zoom();
-            QAction* zo = findAction(QStringLiteral("Zoom Out"));
-            CHECK(QStringLiteral("zoom-out"), zo && (zo->trigger(), pump(3), rd->zoom() < z1));
-            rd->setZoom(rd->zoom()*3.0); pump(2); double zbig = rd->zoom();
-            QAction* ft = findAction(QStringLiteral("Fit"));
-            CHECK(QStringLiteral("fit"), ft && (ft->trigger(), pump(3), rd->zoom() != zbig));
-        }
-        // --- Sheet navigation Next / Prev / combo ---
-        if (vw) {
-            int s0 = vw->currentSheetIndex();
-            QAction* nx = findAction(QStringLiteral("Next"));
-            CHECK(QStringLiteral("next-sheet"), nx && (nx->trigger(), pump(6), vw->currentSheetIndex()!=s0));
-            int s1 = vw->currentSheetIndex();
-            QAction* pv = findAction(QStringLiteral("Prev"));
-            CHECK(QStringLiteral("prev-sheet"), pv && (pv->trigger(), pump(6), vw->currentSheetIndex()!=s1));
-            if (combo && combo->count() > 6) {
-                int target = (vw->currentSheetIndex() + 5) % combo->count();
-                combo->setCurrentIndex(target); pump(6);
-                CHECK(QStringLiteral("sheet-combo"), vw->currentSheetIndex()==target);
-            } else CHECK(QStringLiteral("sheet-combo"), false);
-        }
-        // --- AI Check → issues + dock ---
-        QAction* aic = findAction(QStringLiteral("Check"));
-        if (aic) { aic->trigger(); pump(15); }
-        CHECK(QStringLiteral("ai-check-issues"), list && list->count() > 0);
-        CHECK(QStringLiteral("ai-check-dock-visible"), dock && dock->isVisible());
-        // --- Markup Undo / Clear (AI Check vẽ mây) ---
-        if (rd) {
-            int mc = rd->markupCount();
-            CHECK(QStringLiteral("markups-added"), mc > 0);
-            QAction* un = findAction(QStringLiteral("Undo"));
-            CHECK(QStringLiteral("undo"), un && mc>0 && (un->trigger(), pump(3), rd->markupCount() < mc));
-            QAction* cl = findAction(QStringLiteral("Clear"));
-            CHECK(QStringLiteral("clear"), cl && (cl->trigger(), pump(3), rd->markupCount()==0));
-        }
-        // --- AI Panel toggle (ẩn/hiện dock) ---
-        if (dock) {
-            QAction* pan = findAction(QStringLiteral("Panel"));
-            bool v0 = dock->isVisible();
-            bool ok = false;
-            if (pan) { pan->trigger(); pump(3); bool v1=dock->isVisible();
-                       pan->trigger(); pump(3); bool v2=dock->isVisible();
-                       ok = (v1!=v0) && (v2!=v1); }
-            CHECK(QStringLiteral("ai-panel-toggle"), ok);
-        }
-        // --- Panel: Giải thích (AI) đơn (chờ Gemini; lỗi cũng tính là phản hồi) ---
-        if (list && list->count() > 0 && out) {
-            list->setCurrentRow(0); pump(2);
-            QPushButton* ex = findButton(QStringLiteral("(AI)"));
-            QString cur = out->toPlainText();
-            int aiBefore = cur.count(QStringLiteral("AI:"));
-            bool got = false;
-            bool isErr = false;
-            if (ex) { ex->click();
-                QElapsedTimer t; t.start();
-                while (t.elapsed() < 30000) { pump(3);
-                    cur = out->toPlainText();
-                    if (cur.contains(QStringLiteral("Lỗi AI")) || cur.contains(QStringLiteral("Chưa cấu hình"))) {
-                        isErr = true; break;
-                    }
-                    if (cur.count(QStringLiteral("AI:")) > aiBefore) { got = true; break; }
-                }
-            }
-            if (isErr) {
-                CHECK(QStringLiteral("panel-explain"), false);
-                if (rf.isOpen()) rep << "panel-explain: AI ERROR (no key or API fail), not a real bug\n";
-            } else {
-                CHECK(QStringLiteral("panel-explain"), got);
-            }
-        }
-        // --- Panel: chat Gửi ---
-        if (out) {
-            QLineEdit* chat = win->findChild<QLineEdit*>();
-            QPushButton* send = findButton(QStringLiteral("Gửi"));
-            QString cur = out->toPlainText();
-            int aiBefore = cur.count(QStringLiteral("AI:"));
-            bool got = false;
-            bool isErr = false;
-            if (chat && send) { chat->setText(QStringLiteral("Bản vẽ này nói về gì?")); send->click();
-                QElapsedTimer t; t.start();
-                while (t.elapsed() < 30000) { pump(3);
-                    cur = out->toPlainText();
-                    if (cur.contains(QStringLiteral("Lỗi AI")) || cur.contains(QStringLiteral("Chưa cấu hình"))) {
-                        isErr = true; break;
-                    }
-                    if (cur.count(QStringLiteral("AI:")) > aiBefore) { got = true; break; }
-                }
-            }
-            if (isErr) {
-                CHECK(QStringLiteral("panel-chat"), false);
-                if (rf.isOpen()) rep << "panel-chat: AI ERROR (no key or API fail), not a real bug\n";
-            } else {
-                CHECK(QStringLiteral("panel-chat"), got);
-            }
-        }
-        // --- Panel: Giải thích tất cả (kiểm khởi động queue) ---
-        if (list && list->count() > 0 && out) {
-            QPushButton* all = findButton(QStringLiteral("tất cả"));
-            bool ok = false;
-            if (all) { all->click(); pump(6); ok = out->toPlainText().contains(QStringLiteral("[1/")); }
-            CHECK(QStringLiteral("panel-explain-all"), ok);
-        }
-        // --- Nút mở dialog (không tự bấm vì modal): kiểm tồn tại + enabled ---
-        { QPushButton* exp = findButton(QStringLiteral(".md"));
-          CHECK(QStringLiteral("export-btn-present"), exp != nullptr);
-          QAction* op = findAction(QStringLiteral("Open"));
-          CHECK(QStringLiteral("open-action-enabled"), op && op->isEnabled()); }
-        // --- (a) Text markup thật: auto-answer QInputDialog modal ---
-        if (rd) {
-            QAction* textAct = findAction(QStringLiteral("Text"));
-            int mcBefore = rd->markupCount();
-            bool textCreated = false;
-            if (textAct) {
-                textAct->trigger(); pump(2);
-                QTimer::singleShot(150, [&](){
-                    for (QWidget* w : QApplication::topLevelWidgets()) {
-                        QInputDialog* dlg = qobject_cast<QInputDialog*>(w);
-                        if (dlg) { dlg->setTextValue(QStringLiteral("uitest-text")); dlg->accept(); break; }
-                    }
-                });
-                QPoint cp = rd->rect().center();
-                QMouseEvent press(QEvent::MouseButtonPress, cp, rd->mapToGlobal(cp), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &press);
-                QMouseEvent rel(QEvent::MouseButtonRelease, cp, rd->mapToGlobal(cp), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &rel);
-                pump(10);
-                textCreated = rd->markupCount() == mcBefore + 1;
-            }
-            CHECK(QStringLiteral("text-markup-created"), textCreated);
-        }
-        // --- (b) Select tool: pick + Delete xoá ---
-        if (rd && vw) {
-            QAction* rectAct = findAction(QStringLiteral("Rect"));
-            bool selectDelOk = false;
-            if (rectAct) {
-                rectAct->trigger(); pump(2);
-                QPoint p1 = rd->rect().center() - QPoint(40, 40);
-                QPoint p2 = p1 + QPoint(80, 80);
-                QMouseEvent rPress(QEvent::MouseButtonPress, p1, rd->mapToGlobal(p1), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &rPress);
-                QMouseEvent rMove(QEvent::MouseMove, p2, rd->mapToGlobal(p2), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &rMove);
-                QMouseEvent rRel(QEvent::MouseButtonRelease, p2, rd->mapToGlobal(p2), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &rRel);
-                pump(5);
-                int mc1 = rd->markupCount();
-                QAction* selAct = findAction(QStringLiteral("Select"));
-                if (selAct) {
-                    selAct->trigger(); pump(2);
-                    QMouseEvent sPress(QEvent::MouseButtonPress, p1, rd->mapToGlobal(p1), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                    QApplication::sendEvent(rd, &sPress);
-                    QMouseEvent sRel(QEvent::MouseButtonRelease, p1, rd->mapToGlobal(p1), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                    QApplication::sendEvent(rd, &sRel);
-                    QKeyEvent keyEv(QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
-                    QApplication::sendEvent(vw, &keyEv);
-                    pump(3);
-                    selectDelOk = rd->markupCount() == mc1 - 1;
-                }
-            }
-            CHECK(QStringLiteral("select-pick-delete"), selectDelOk);
-        }
-        // --- (c) Click chuột THẬT (không trigger()) ---
-        if (rd) {
-            QToolBar* tb = win->findChild<QToolBar*>();
-            auto realClick = [&](QWidget* w){
-                if (!w) return;
-                QPoint c = w->rect().center();
-                QMouseEvent press(QEvent::MouseButtonPress, c, w->mapToGlobal(c), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(w, &press);
-                QMouseEvent rel(QEvent::MouseButtonRelease, c, w->mapToGlobal(c), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(w, &rel);
-            };
-            QAction* cloudAct = findAction(QStringLiteral("Cloud"));
-            QWidget* cloudBtn = tb && cloudAct ? tb->widgetForAction(cloudAct) : nullptr;
-            int startCount = rd->markupCount();
-            for (int i = 0; i < 2; ++i) {
-                realClick(cloudBtn);
-                pump(2);
-                CHECK(QStringLiteral("real-click-cloud-tool-iter%1").arg(i), rd->currentTool() == Tool::Cloud);
-                QPoint pA = rd->rect().center() + QPoint(-50 + i * 30, -50);
-                QPoint pB = rd->rect().center() + QPoint(50 + i * 30, 50);
-                QMouseEvent cPress(QEvent::MouseButtonPress, pA, rd->mapToGlobal(pA), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &cPress);
-                QMouseEvent cRel(QEvent::MouseButtonRelease, pA, rd->mapToGlobal(pA), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &cRel);
-                pump(1);
-                QMouseEvent cPress2(QEvent::MouseButtonPress, pB, rd->mapToGlobal(pB), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &cPress2);
-                QMouseEvent cRel2(QEvent::MouseButtonRelease, pB, rd->mapToGlobal(pB), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &cRel2);
-                pump(1);
-                QMouseEvent dbl(QEvent::MouseButtonDblClick, pB, rd->mapToGlobal(pB), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(rd, &dbl);
-                pump(3);
-            }
-            CHECK(QStringLiteral("real-click-repeat-registers"), rd->markupCount() == startCount + 2);
-        }
-
-        if (rf.isOpen()) { rep << "UITEST " << pass << "/" << total << " passed\n"; rep.flush(); }
-        if (!outPng.isEmpty()) win->grab().save(outPng, "PNG");
-        fprintf(stderr, "UITEST %d/%d\n", pass, total);
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // usage: --dwf-objects <file.dwf>  (verify: trích object BIM từ ObjectDefinition, dump objects_report.txt)
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-objects")) {
-        DWFParse parser;
-        if (!parser.loadDWF(QString::fromLocal8Bit(argv[2]))) { fprintf(stderr, "OBJECTS_FAIL load\n"); return 1; }
-        auto sheets = parser.enumerateSheets();
-        QFile rf(QCoreApplication::applicationDirPath() + QStringLiteral("/objects_report.txt"));
-        QTextStream rep(&rf);
-        int grandTotal = 0, bimLike = 0;
-        if (rf.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            rep.setEncoding(QStringConverter::Utf8);
-            int shownSections = 0;
-            for (const auto& sh : sheets.sheets) {
-                auto objs = parser.extractObjects(sh.sectionIndex);
-                grandTotal += objs.size();
-                for (const auto& o : objs)
-                    for (auto it = o.props.constBegin(); it != o.props.constEnd(); ++it)
-                        if (it.key().contains(QStringLiteral("width"), Qt::CaseInsensitive)
-                            || it.key().contains(QStringLiteral("area"), Qt::CaseInsensitive)
-                            || it.key().contains(QStringLiteral("height"), Qt::CaseInsensitive)) { ++bimLike; break; }
-                if (!objs.isEmpty() && shownSections < 3) {
-                    rep << "=== SECTION " << sh.sectionIndex << " : objects=" << objs.size() << " ===\n";
-                    int shownObj = 0;
-                    for (const auto& o : objs) {
-                        rep << "  [" << o.kind << "] id=" << o.id << "\n";
-                        for (auto it = o.props.constBegin(); it != o.props.constEnd(); ++it)
-                            rep << "      " << it.key() << " = " << it.value().toString() << "\n";
-                        if (++shownObj >= 3) { rep << "  ... (còn " << (objs.size()-shownObj) << " object)\n"; break; }
-                    }
-                    ++shownSections;
-                }
-            }
-            rep << "OBJECTS_OK total_objects=" << grandTotal << " bim_like_props=" << bimLike << "\n";
-            rep.flush();
-        }
-        fprintf(stderr, "OBJECTS_OK total=%d bim_like=%d\n", grandTotal, bimLike);
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // usage: --dwf-props <file.dwf>  (probe: dump property tờ thật từ descriptor ra props_report.txt cạnh exe)
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-props")) {
-        DWFParse parser;
-        if (!parser.loadDWF(QString::fromLocal8Bit(argv[2]))) { fprintf(stderr, "PROPS_FAIL load\n"); return 1; }
-        auto sheets = parser.extractSheetProperties();
-        QFile rf(QCoreApplication::applicationDirPath() + QStringLiteral("/props_report.txt"));
-        QTextStream rep(&rf);
-        int totalProps = 0;
-        if (rf.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            rep.setEncoding(QStringConverter::Utf8);
-            int shown = 0;
-            for (const auto& m : sheets) {
-                rep << "=== SECTION " << m.value(QStringLiteral("__index__")).toInt()
-                    << " : " << m.value(QStringLiteral("__section__")).toString() << " ===\n";
-                for (auto it = m.constBegin(); it != m.constEnd(); ++it) {
-                    if (it.key().startsWith(QStringLiteral("__"))) continue;
-                    rep << "  " << it.key() << " = " << it.value().toString() << "\n";
-                    ++totalProps;
-                }
-                if (++shown >= 4) { rep << "... (còn " << (sheets.size() - shown) << " section)\n"; break; }
-            }
-            rep << "PROPS_OK sections=" << sheets.size() << " props_total=" << totalProps << "\n";
-            rep.flush();
-        }
-        fprintf(stderr, "PROPS_OK sections=%d\n", (int)sheets.size());
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // usage: --dwf-guitest <file.dwf> [out.png]  (tự lái GUI: AI Check → chọn issue → Giải thích → chờ Gemini)
-    // Test end-to-end wiring của AICopilotPanel headless (offscreen). Ghi guitest_report.txt cạnh exe.
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-guitest")) {
-        QString dwf = QString::fromLocal8Bit(argv[2]);
-        QString outPng = (argc >= 4) ? QString::fromLocal8Bit(argv[3]) : QString();
-        auto* win = new DWFMainWindow(dwf);
-        win->setAttribute(Qt::WA_DontShowOnScreen, true);
-        win->resize(1500, 950);
-        win->show();
-        for (int i = 0; i < 30; ++i) { QCoreApplication::processEvents(); QThread::msleep(40); }
-
-        QFile rf(QCoreApplication::applicationDirPath() + QStringLiteral("/guitest_report.txt"));
-        QTextStream rep(&rf);
-        if (rf.open(QIODevice::WriteOnly | QIODevice::Text)) rep.setEncoding(QStringConverter::Utf8);
-
-        // 1) Trigger action "AI Check"
-        QAction* aiCheck = nullptr;
-        for (QAction* a : win->findChildren<QAction*>())
-            if (a->text() == QLatin1String("AI Check")) { aiCheck = a; break; }
-        if (!aiCheck) { if (rf.isOpen()) rep << "GUITEST_FAIL no-aicheck-action\n"; rep.flush();
-                        fprintf(stderr, "GUITEST_FAIL no-aicheck-action\n"); return 1; }
-        aiCheck->trigger();
-        for (int i = 0; i < 20; ++i) { QCoreApplication::processEvents(); QThread::msleep(40); }
-
-        // 2) Issue list populated?
-        QListWidget* list = win->findChild<QListWidget*>();
-        int issueCount = list ? list->count() : -1;
-        if (rf.isOpen()) rep << "issues_in_panel=" << issueCount << "\n";
-        if (!list || issueCount <= 0) { if (rf.isOpen()) rep << "GUITEST_FAIL no-issues\n"; rep.flush();
-                                        fprintf(stderr, "GUITEST_FAIL no-issues\n"); return 1; }
-        list->setCurrentRow(0);
-        QCoreApplication::processEvents();
-
-        // 3) Click "Giải thích (AI)"
-        QPushButton* explainBtn = nullptr;
-        for (QPushButton* b : win->findChildren<QPushButton*>())
-            if (b->text().contains(QStringLiteral("Giải thích"))) { explainBtn = b; break; }
-        if (!explainBtn) { if (rf.isOpen()) rep << "GUITEST_FAIL no-explain-btn\n"; rep.flush();
-                           fprintf(stderr, "GUITEST_FAIL no-explain-btn\n"); return 1; }
-        bool btnEnabled = explainBtn->isEnabled();
-        if (rf.isOpen()) rep << "explain_btn_enabled=" << (btnEnabled ? "yes" : "no") << "\n";
-        explainBtn->click();
-
-        // 4) Chờ Gemini trả lời (panel append "**AI:**") tối đa 30s
-        QTextBrowser* out = win->findChild<QTextBrowser*>();
-        QElapsedTimer t; t.start();
-        bool gotReply = false, gotErr = false;
-        while (t.elapsed() < 30000) {
-            QCoreApplication::processEvents();
-            QThread::msleep(100);
-            if (out) {
-                QString txt = out->toPlainText();
-                if (txt.contains(QStringLiteral("Lỗi AI")) || txt.contains(QStringLiteral("Chưa cấu hình"))) {
-                    gotErr = true; break;
-                }
-                if (txt.contains(QStringLiteral("AI:"))) { gotReply = true; break; }
-            }
-        }
-        QString panelText = out ? out->toPlainText() : QStringLiteral("<no textbrowser>");
-        // che key nếu lỡ xuất hiện
-        panelText.replace(QRegularExpression(QStringLiteral("AIza[A-Za-z0-9_-]+")), QStringLiteral("<KEY>"));
-        if (rf.isOpen()) {
-            rep << "got_reply=" << (gotReply ? "yes" : "no") << " got_err=" << (gotErr ? "yes" : "no") << "\n";
-            rep << "--- PANEL OUTPUT ---\n" << panelText << "\n";
-            rep << ((gotReply && !gotErr) ? "GUITEST_OK\n" : gotErr ? "GUITEST_AI_ERR\n" : "GUITEST_TIMEOUT\n");
-            rep.flush();
-        }
-        // 5) Navigation: mô phỏng click item 0 → focusOnIssue → renderer viewport/zoom phải đổi
-        {
-            DWFViewer* vw = win->findChild<DWFViewer*>();
-            if (vw && vw->renderer() && list->count() > 0) {
-                QRectF vpBefore = vw->renderer()->viewport();
-                double zBefore = vw->renderer()->zoom();
-                QRect ir = list->visualItemRect(list->item(0));
-                QPointF cpt = ir.center();
-                QPointF gpt = list->viewport()->mapToGlobal(ir.center());
-                QMouseEvent press(QEvent::MouseButtonPress, cpt, gpt, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(list->viewport(), &press);
-                QMouseEvent rel(QEvent::MouseButtonRelease, cpt, gpt, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
-                QApplication::sendEvent(list->viewport(), &rel);
-                for (int i = 0; i < 12; ++i) { QCoreApplication::processEvents(); QThread::msleep(30); }
-                QRectF vpAfter = vw->renderer()->viewport();
-                double zAfter = vw->renderer()->zoom();
-                bool navChanged = (vpAfter != vpBefore) || (qAbs(zAfter - zBefore) > 1e-6);
-                if (rf.isOpen()) { rep << "nav_changed=" << (navChanged ? "yes" : "no")
-                                       << " zoom " << zBefore << "->" << zAfter << "\n"; rep.flush(); }
-            }
-        }
-        if (!outPng.isEmpty()) win->grab().save(outPng, "PNG");
-        fprintf(stderr, (gotReply && !gotErr) ? "GUITEST_OK issues=%d\n" : gotErr ? "GUITEST_AI_ERR issues=%d\n" : "GUITEST_TIMEOUT issues=%d\n", issueCount);
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // usage: --dwf-aiexplain <file.dwf> [sheetIndex]  (headless, gọi Gemini giải thích issue)
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-aiexplain")) {
-        QString dwf = QString::fromLocal8Bit(argv[2]);
-        auto* viewer = new DWFViewer();
-        viewer->setAttribute(Qt::WA_DontShowOnScreen, true);
-        viewer->resize(1600, 1000);
-        viewer->show();
-        QCoreApplication::processEvents();
-        if (!viewer->loadFile(dwf)) { fprintf(stderr, "AIEXPLAIN_FAIL load\n"); return 1; }
-        QCoreApplication::processEvents();
-        auto issues = viewer->runAICheck();
-        QCoreApplication::processEvents();
-        // WIN32 GUI-subsystem exe: stdout không capture qua cmd redirect → ghi report ra file để verify.
-        // Dùng applicationDirPath() (xác định) vì runtime cwd khi launch qua interop không đáng tin.
-        QFile repFile(QCoreApplication::applicationDirPath() + QStringLiteral("/aiexplain_report.txt"));
-        QTextStream rep(&repFile);
-        if (repFile.open(QIODevice::WriteOnly | QIODevice::Text))
-            rep.setEncoding(QStringConverter::Utf8);
-        AICopilot copilot;
-        if (!copilot.hasApiKey()) {
-            if (repFile.isOpen()) { rep << "AIEXPLAIN_SKIP no-key issues=" << issues.size() << "\n"; rep.flush(); }
-            fprintf(stderr, "AIEXPLAIN_SKIP no-key issues=%d\n", (int)issues.size());
-            return 0;
-        }
-        int done = 0;
-        int cap = qMin(issues.size(), 3);
-        for (int i = 0; i < cap; ++i) {
-            const Issue& iss = issues[i];
-            QString rag = AICopilot::retrieveContext(iss.ruleId);
-            QString result; bool ok = false;
-            QEventLoop loop;
-            QObject::connect(&copilot, &AICopilot::reply, [&](const QString& md){ result = md; ok = true; loop.quit(); });
-            QObject::connect(&copilot, &AICopilot::failed, [&](const QString& e){ result = e; ok = false; loop.quit(); });
-            copilot.explainIssue(iss, QStringLiteral("sheet"), rag);
-            loop.exec();
-            QObject::disconnect(&copilot, nullptr, nullptr, nullptr);
-            if (repFile.isOpen()) {
-                rep << "=== ISSUE " << i << " [" << iss.ruleId << "] rag=" << (rag.isEmpty() ? "no" : "yes") << " ===\n"
-                    << iss.description << "\nAI: " << result << "\n\n";
-                rep.flush();
-            }
-            printf("=== ISSUE %d [%s] ===\n%s\nAI: %s\n\n",
-                   i, iss.ruleId.toUtf8().constData(), iss.description.toUtf8().constData(),
-                   result.toUtf8().constData());
-            if (ok) ++done;
-        }
-        if (repFile.isOpen()) { rep << "AIEXPLAIN_OK count=" << done << "/" << cap << "\n"; rep.flush(); }
-        fprintf(stderr, "AIEXPLAIN_OK count=%d/%d\n", done, cap);
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF AI rule-check: detect issues and draw markups, optionally save snapshot
-    // usage: --dwf-aicheck <file.dwf> [out.png] [W] [H]
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-aicheck")) {
-        QString dwf = QString::fromLocal8Bit(argv[2]);
-        QString out = (argc >= 4) ? QString::fromLocal8Bit(argv[3]) : QString();
-        int W = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 1600;
-        int H = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 1000;
-        if (W < 100) W = 1600;
-        if (H < 100) H = 1000;
-
-        auto* viewer = new DWFViewer();
-        viewer->setAttribute(Qt::WA_DontShowOnScreen, true);
-        viewer->resize(W, H);
-        viewer->show();
-        QCoreApplication::processEvents();
-        if (!viewer->loadFile(dwf)) {
-            fprintf(stderr, "AICHECK_FAIL load\n");
-            return 1;
-        }
-        QCoreApplication::processEvents();
-        auto issues = viewer->runAICheck();
-        QCoreApplication::processEvents();
-        for (const auto& iss : issues) {
-            printf("[%s] conf=%.2f | %s\n",
-                   iss.ruleId.toUtf8().constData(),
-                   iss.aiConfidence,
-                   iss.description.toUtf8().constData());
-        }
-        if (!out.isEmpty()) {
-            QPixmap pm = viewer->grab();
-            bool saved = pm.save(out, "PNG");
-            fprintf(stdout, saved ? "SNAP_OK\n" : "SNAP_SAVE_FAIL\n");
-        }
-        fprintf(stderr, "AICHECK_OK issues=%d\n", (int)issues.size());
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF headless snapshot: grab the full window including toolbar
-    // usage: --dwf-snap <file.dwf> <out.png> [W] [H] [zoom] [fx] [fy] [sheet]
-    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--dwf-snap")) {
-        QString dwf = QString::fromLocal8Bit(argv[2]);
-        QString out = QString::fromLocal8Bit(argv[3]);
-        int W = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 1920;
-        int H = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 1200;
-        if (W < 100) W = 1920;
-        if (H < 100) H = 1200;
-        auto* win = new DWFMainWindow(QString());
-        win->setAttribute(Qt::WA_DontShowOnScreen, true);
-        win->resize(W, H);
-        win->show();
-        QCoreApplication::processEvents();
-        if (!win->viewer()->loadFile(dwf)) {
-            fprintf(stderr, "SNAP_FAIL load\n");
-            return 1;
-        }
-        QCoreApplication::processEvents();
-        if (argc >= 10) {   // optional sheet index
-            int s = QString::fromLocal8Bit(argv[9]).toInt();
-            win->viewer()->goToSheet(s);
-            QCoreApplication::processEvents();
-        }
-        if (argc >= 7) {   // [zoom] [fx] [fy]
-            double zoom = QString::fromLocal8Bit(argv[6]).toDouble();
-            double fx = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toDouble() : 0.5;
-            double fy = (argc >= 9) ? QString::fromLocal8Bit(argv[8]).toDouble() : 0.5;
-            if (zoom > 0) win->viewer()->snapView(zoom, fx, fy);
-            QCoreApplication::processEvents();
-        }
-        QPixmap pm = win->grab();
-        bool ok = pm.save(out, "PNG");
-        fprintf(stdout, ok ? "SNAP_OK %s (%dx%d)\n" : "SNAP_SAVE_FAIL\n",
-                out.toLocal8Bit().constData(), W, H);
-        return ok ? 0 : 1;
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF text dump: print all text objects of the richest sheet (x y rot | text) for diagnosis
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-textdump") {
-        DWFParse gp;
-        if (!gp.loadDWF(QString::fromLocal8Bit(argv[2]))) { fprintf(stderr, "load fail\n"); return 1; }
-        auto w2d = gp.parseW2DGeometry();
-        int best = -1; int bestN = -1;
-        for (int i = 0; i < w2d.sheets.size(); ++i)
-            if (w2d.sheets[i].objects.size() > bestN) { bestN = w2d.sheets[i].objects.size(); best = i; }
-        if (best < 0) { printf("no sheet\n"); return 0; }
-        int nText = 0;
-        for (const auto& o : w2d.sheets[best].objects) {
-            if (o.type == QStringLiteral("text") && !o.points.isEmpty()) {
-                printf("%.0f %.0f r%.0f L%d:%s v%d | %s\n", o.points[0].x(), o.points[0].y(),
-                       o.rotation, o.layerNum, o.layerName.toUtf8().constData(), o.visible?1:0, o.text.toUtf8().constData());
-                ++nText;
-            }
-        }
-        fprintf(stderr, "TEXTDUMP sheet=%d texts=%d\n", best, nText);
-        {
-            QMap<int,int> layerCount, layerHidden;
-            QMap<int,QString> layerNames;
-            for (const auto& o : w2d.sheets[best].objects) {
-                layerCount[o.layerNum]++;
-                if (!o.visible) layerHidden[o.layerNum]++;
-                if (!o.layerName.isEmpty() && !layerNames.contains(o.layerNum))
-                    layerNames[o.layerNum] = o.layerName;
-            }
-            for (auto it = layerCount.begin(); it != layerCount.end(); ++it) {
-                int ln = it.key();
-                fprintf(stderr, "LAYER %d name=%s objs=%d hidden=%d\n",
-                        ln, layerNames.value(ln).toUtf8().constData(),
-                        it.value(), layerHidden.value(ln));
-            }
-        }
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF interactive viewer mode
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-view") {
-        app.setStyle(QStyleFactory::create("Fusion"));
-        auto* win = new DWFMainWindow(QString::fromLocal8Bit(argv[2]));
-        win->show();
-        return app.exec();
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF rule engine test mode
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-rules") {
-        QTextStream out(stdout);
-        QString dwfPath = QString::fromLocal8Bit(argv[2]);
-        QString rulesPath = (argc >= 4)
-            ? QString::fromLocal8Bit(argv[3])
-            : QDir("yaml/rules.yaml").absolutePath();
-
-        // Load DWF for context (non-fatal if fails)
-        DWFLoader loader;
-        if (loader.loadFile(dwfPath)) {
-            auto meta = loader.getMetadata();
-            out << "DWF: \"" << meta.projectName << "\"  ID: " << meta.objectId
-                << "  v" << meta.version << "  sections: " << meta.sectionCount << "\n";
-        } else {
-            out << "DWF: " << dwfPath << " (unable to load, rules test continues)\n";
-        }
-
-        RuleEngine engine;
-        if (!engine.loadRules(rulesPath)) {
-            out << "DWF_RULES_FAIL — cannot load rules from " << rulesPath << "\n";
-            return 1;
-        }
-        out << "Rules loaded from: " << rulesPath << "\n";
-
-        auto issues = engine.runChecks();
-        out << "Issues found: " << issues.size() << "\n";
-        for (const auto& iss : issues) {
-            const char* sev = iss.severity == Severity::Critical ? "CRIT"
-                            : iss.severity == Severity::Error    ? "ERR"
-                            : iss.severity == Severity::Warning  ? "WARN" : "INFO";
-            out << "  [" << sev << "] " << iss.ruleId
-                << " | " << iss.objectId << " — " << iss.description << "\n";
-            if (!iss.suggestion.isEmpty())
-                out << "          -> " << iss.suggestion << "\n";
-        }
-        out << "DWF_RULES_OK\n";
-        out.flush();
-        return 0;
-    }
-#endif
-
-#ifdef _WIN32
-    // DWF report generation test mode
-    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == "--dwf-report") {
-        QTextStream out(stdout);
-        QString dwfPath = QString::fromLocal8Bit(argv[2]);
-        QString outputDir = (argc >= 4)
-            ? QString::fromLocal8Bit(argv[3])
-            : QDir::currentPath();
-        QString rulesPath = (argc >= 5)
-            ? QString::fromLocal8Bit(argv[4])
-            : QDir("yaml/rules.yaml").absolutePath();
-        QString jsonPath = QDir(outputDir).absoluteFilePath("report.json");
-        QString pdfPath  = QDir(outputDir).absoluteFilePath("report.pdf");
-
-        // Load DWF for context
-        DWFLoader loader;
-        if (loader.loadFile(dwfPath)) {
-            auto meta = loader.getMetadata();
-            out << "DWF: \"" << meta.projectName << "\"  ID: " << meta.objectId << "\n";
-        }
-
-        RuleEngine engine;
-        if (!engine.loadRules(rulesPath)) {
-            out << "DWF_REPORT_FAIL — cannot load rules from " << rulesPath << "\n";
-            return 1;
-        }
-
-        auto issues = engine.runChecks();
-
-        // Text report
-        Reporter reporter;
-        QString report = reporter.generateReport(issues);
-        out << report;
-
-        // JSON export
-        bool jsonOk = reporter.exportToJSON(issues, jsonPath);
-        out << "JSON export: " << (jsonOk ? "OK" : "FAIL") << " -> " << jsonPath << "\n";
-
-        // PDF export
-        bool pdfOk = reporter.exportToPDF(issues, pdfPath);
-        out << "PDF export: " << (pdfOk ? "OK" : "FAIL") << " -> " << pdfPath << "\n";
-
-        out << "DWF_REPORT_OK\n";
-        out.flush();
-        return 0;
-    }
-#endif
+    // Ngay sau QApplication, truoc MainWindow: bat het log ra file.
+    installTextLog();
+    qDebug() << "[gate] app version =" << FELIXPDF_VERSION;
 
 #ifndef TORREADER_NO_PDFIUM
     // Hidden headless CLI mode for crash reproduction
@@ -2358,6 +1634,7 @@ int main(int argc, char* argv[]) {
                 int rot = FPDFPage_GetRotation(page);
                 double dispW = FPDF_GetPageWidth(page);
                 double dispH = FPDF_GetPageHeight(page);
+                const QPointF box = pdfBoxOrigin(page);
 
                 FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
                 if (!textPage) { FPDF_ClosePage(page); continue; }
@@ -2382,7 +1659,6 @@ int main(int argc, char* argv[]) {
                     }
 
                     QRectF pdfRect(left, bottomPdf, right - left, topPdf - bottomPdf);
-                    const QPointF box = pdfBoxOrigin(page);
                     QRectF dispRect = pdfRectToDisp(pdfRect, dispW, dispH, rot, box.x(), box.y());
 
                     int snippetStart = qMax(0, charIdx - 20);
@@ -2451,6 +1727,78 @@ int main(int argc, char* argv[]) {
         }
         out.flush();
         return totalMatches > 0 ? 0 : 2; // 0=found, 2=no matches (not a failure)
+    }
+
+    // usage: --links-test <input.pdf>
+    // Probe (SPEC_PDF_LINKS muc 3): dem link moi trang + hit-test o tam tung
+    // rect (ca trang xoay lan khong xoay). Dinh kem dong quy doi nguoc de
+    // chung minh hit-test dung.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--links-test")) {
+        QTextStream out(stdout);
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+
+        PdfDocument::libAddRef();
+        int pass = 0, fail = 0;
+        {
+            PdfDocument doc;
+            if (!doc.open(inputPath)) {
+                out << "LINKS_TEST_FAIL cannot open " << inputPath << "\n";
+                out.flush();
+                PdfDocument::libRelease();
+                return 1;
+            }
+            int pageCount = doc.pageCount();
+            out << "File: " << inputPath << "\n";
+            out << "Pages: " << pageCount << "\n";
+
+            for (int pi = 0; pi < pageCount; ++pi) {
+                const QVector<PdfLink> links = PdfLinks::forPage(doc.raw(), pi);
+                const PdfLinks::PageInfo info = PdfLinks::pageInfo(doc.raw(), pi);
+                out << "[links] page=" << (pi + 1)
+                    << " count=" << links.size()
+                    << " rot=" << info.rot
+                    << " disp=" << info.dispW << "x" << info.dispH
+                    << " box=(" << info.boxX << "," << info.boxY << ")\n";
+                for (int li = 0; li < links.size(); ++li) {
+                    const PdfLink& L = links[li];
+                    const QString kind = !L.uri.isEmpty() ? "uri"
+                        : (L.destPage >= 0 ? "goto" : "unsupported");
+                    const QString target = !L.uri.isEmpty() ? L.uri
+                        : (L.destPage >= 0
+                           ? QString("page%1(x=%2,y=%3)")
+                               .arg(L.destPage + 1).arg(L.destX).arg(L.destY)
+                           : QString());
+                    const QRectF r = L.rectPdf.normalized();
+                    out << "[links] page=" << (pi + 1)
+                        << " rect=(" << r.left() << "," << r.bottom()
+                        << "," << r.width() << "x" << r.height() << ")"
+                        << " kind=" << kind << " target=" << target << "\n";
+
+                    // Hit-test: rect -> disp -> tam -> quy doi nguoc ve page.
+                    // Lua y: link co the CHONG nhau (rect nho nam trong rect lon)
+                    // — linkAt tra link DONG NHAT thoat ra truoc. Vi vay chi can
+                    // hitIdx>=0 la hop le; exact=true chung to tai tam rect tra ve
+                    // DUNG link do (khong chong — tai lieu test dan cho nay).
+                    const QRectF dispR = pdfRectToDisp(r, info.dispW, info.dispH,
+                                                       info.rot, info.boxX, info.boxY);
+                    const QPointF dispCenter = dispR.center();
+                    const QPointF back = PdfLinks::dispToPdf(dispCenter, info);
+                    const int hitIdx = PdfLinks::linkAt(links, dispCenter, info);
+                    const bool exact = (hitIdx == li);
+                    out << "[links]   hit-test center=(" << dispCenter.x() << ","
+                        << dispCenter.y() << ") backToPdf=(" << back.x() << ","
+                        << back.y() << ") inside=" << (r.contains(back) ? "true" : "false")
+                        << " linkAt=" << (hitIdx >= 0 ? "true" : "false")
+                        << " exact=" << (exact ? "true" : "false") << "\n";
+                    if (hitIdx >= 0 && r.contains(back)) ++pass; else ++fail;
+                }
+            }
+            out << "[links] PASS=" << pass << " FAIL=" << fail << "\n";
+            out << (fail == 0 ? "LINKS_TEST_OK\n" : "LINKS_TEST_FAIL\n");
+            out.flush();
+        }
+        PdfDocument::libRelease();
+        return fail == 0 ? 0 : 1;
     }
 
     // usage: --markup-lifecycle <input.pdf>
@@ -2748,6 +2096,84 @@ int main(int argc, char* argv[]) {
 
         FPDF_CloseDocument(doc);
         PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --pinlrubench <input.pdf> [pageA] [pageB]
+    // Headless bench for the pin LRU: pin A, pin B, pin A, pin B. The 3rd/4th pins
+    // must be LRU hits (hit=1, ms=0) instead of reloading from disk (hit=0).
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--pinlrubench")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageA = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 4;
+        int pageB = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : pageA + 1;
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        if (!doc) {
+            out << "PINLRUBENCH: FAIL cannot open " << inputPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc);
+        if (pageA < 0 || pageB < 0 || pageA >= pageCount || pageB >= pageCount) {
+            out << "PINLRUBENCH: FAIL pages out of range pages=" << pageCount << "\n"; out.flush();
+            FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc, inputPath);
+        out << "PINLRUBENCH file=" << inputPath << " pages=" << pageCount
+            << " pinA=" << pageA << " pinB=" << pageB << "\n"; out.flush();
+
+        for (int p : {pageA, pageB, pageA, pageB}) mgr.pinPage(p);
+
+        mgr.releaseSharedPage();
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --pinlruflush <input.pdf> [pageA] [pageB]
+    // Prove the pin LRU is flushed when the document is swapped (SPEC item 4):
+    // pin 5 pages on doc1 (fills the LRU and evicts one), swap to a fresh doc2,
+    // re-pin pageA/pageB — must be fresh loads (hit=0), no stale FPDF_PAGE reuse,
+    // no crash. setDocument() is the same path the GUI uses on close/reopen.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--pinlruflush")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int pageA = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 4;
+        int pageB = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : pageA + 1;
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc1 = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        if (!doc1) {
+            out << "PINLRUFLUSH: FAIL cannot open " << inputPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc1);
+        if (pageA < 0 || pageB < 0 || pageA >= pageCount || pageB >= pageCount) {
+            out << "PINLRUFLUSH: FAIL pages out of range pages=" << pageCount << "\n"; out.flush();
+            FPDF_CloseDocument(doc1); PdfDocument::libRelease(); return 1;
+        }
+
+        out << "PINLRUFLUSH file=" << inputPath << " pages=" << pageCount << "\n"; out.flush();
+        AnnotationManager mgr;
+        mgr.setDocument(doc1, inputPath);
+        out << "PINLRUFLUSH: pin 5 pages on doc1 (fill LRU + evict one)\n"; out.flush();
+        for (int p : {0, 1, 2, 3, 4}) mgr.pinPage(p);
+
+        FPDF_DOCUMENT doc2 = FPDF_LoadDocument(inputPath.toUtf8().constData(), nullptr);
+        out << "PINLRUFLUSH: setDocument(doc2) — LRU must be flushed\n"; out.flush();
+        mgr.setDocument(doc2, inputPath);
+
+        out << "PINLRUFLUSH: re-pin pageA/pageB on doc2 (must be hit=0, fresh load)\n"; out.flush();
+        for (int p : {pageA, pageB, pageA, pageB}) mgr.pinPage(p);
+
+        mgr.releaseSharedPage();
+        FPDF_CloseDocument(doc2);
+        FPDF_CloseDocument(doc1);
+        PdfDocument::libRelease();
+        out << "PINLRUFLUSH: OK\n"; out.flush();
         return 0;
     }
 
@@ -4880,6 +4306,1018 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // usage: --uiprobe <input.pdf> <outdir> [waitMs=8000] [shotTab=0..5]
+    // Probe giao dien (SPEC_PROBE_LOG_SNAPSHOT muc 4): mo cua so that (ke ca
+    // theme), nap pdf, cho waitMs roi lam DUNG viec cua muc 3 nhung ghi ra
+    // <outdir>/uiprobe.png + <outdir>/uiprobe.txt. Dung lai khuon --guiprobe.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--uiprobe")) {
+        const QString inputPath = QString::fromLocal8Bit(argv[2]);
+        const QString outDir    = QString::fromLocal8Bit(argv[3]);
+        int waitMs = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 8000;
+        if (waitMs <= 0) waitMs = 8000;   // mac dinh 8000, khong phai 3000
+        int shotTab = -1;
+        if (argc >= 6) {
+            const int val = QString::fromLocal8Bit(argv[5]).toInt();
+            if (val >= 0 && val <= 5)
+                shotTab = val;
+        }
+        if (!QDir().mkpath(outDir)) {
+            fprintf(stderr, "UIPROBE_FAIL khong tao duoc %s\n", outDir.toLocal8Bit().constData());
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+
+        // Cho du waitMs: file CAD lon render tien-dan, chup som ra vung xem
+        // TRANG TRON (bai hoc 08-14).
+        const int loops = qMax(waitMs / 50, 1);
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        // Khong goi probeSelectSidebarTab rieng — shotTab duoc truyen vao probeSnapshot
+        // de sau khi dump OcrPanel xong, UI chuyen sang tab mong muon roi moi chup.
+
+        const QString outPng = outDir + QLatin1String("/uiprobe.png");
+        const QString outTxt = outDir + QLatin1String("/uiprobe.txt");
+        QString err;
+        if (!w.probeSnapshot(outPng, outTxt, &err, shotTab)) {
+            fprintf(stderr, "UIPROBE_FAIL %s\n", err.toLocal8Bit().constData());
+            return 1;
+        }
+        fprintf(stdout, "[uiprobe] shotTab=%d\n", shotTab);
+        fprintf(stdout, "UIPROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --uiprobe-dialog <input.pdf> <outdir> <merge|about|sign|print> [waitMs=8000]
+    // Probe hop thoai (SPEC_PROBE_DIALOG_FRAMES phan 1): mo DUNG hop thoai bang
+    // cach kich hoat QAction tren toolbar roi chup CHINH hop thoai (cua so rieng)
+    // ra <outdir>/dialog_<ten>.png + .txt. Noi dung chup + dong nam trong probeDialog.
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--uiprobe-dialog")) {
+        const QString inputPath = QString::fromLocal8Bit(argv[2]);
+        const QString outDir    = QString::fromLocal8Bit(argv[3]);
+        const QString dlgName   = QString::fromLocal8Bit(argv[4]).toLower();
+        int waitMs = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 8000;
+        if (waitMs <= 0) waitMs = 8000;
+        if (dlgName != QLatin1String("merge") && dlgName != QLatin1String("about")
+                && dlgName != QLatin1String("sign") && dlgName != QLatin1String("print")) {
+            fprintf(stderr, "UIPROBE_DIALOG_FAIL ten hop thoai khong hop le (merge/about/sign/print)\n");
+            return 1;
+        }
+        if (!QDir().mkpath(outDir)) {
+            fprintf(stderr, "UIPROBE_DIALOG_FAIL khong tao duoc %s\n", outDir.toLocal8Bit().constData());
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        const int loops = qMax(waitMs / 50, 1);
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QString err;
+        if (!w.probeDialog(dlgName, outDir, &err)) {
+            fprintf(stderr, "UIPROBE_DIALOG_FAIL %s\n", err.toLocal8Bit().constData());
+            return 1;
+        }
+        const QString outPng = outDir + QLatin1String("/dialog_") + dlgName + QLatin1String(".png");
+        fprintf(stdout, "UIPROBE_DIALOG_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --uiprobe-frames <input.pdf> <outdir> [intervalMs=600]
+    // Chup nhieu khung de dung GIF (SPEC_PROBE_DIALOG_FRAMES phan 2): chay kich
+    // ban trinh dien CO DINH, moi buoc ghi <outdir>/frame_XXX.png roi in so khung.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--uiprobe-frames")) {
+        const QString inputPath = QString::fromLocal8Bit(argv[2]);
+        const QString outDir    = QString::fromLocal8Bit(argv[3]);
+        int intervalMs = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 600;
+        if (intervalMs <= 0) intervalMs = 600;
+        if (!QDir().mkpath(outDir)) {
+            fprintf(stderr, "UIPROBE_FRAMES_FAIL khong tao duoc %s\n", outDir.toLocal8Bit().constData());
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        const int loops = qMax(8000 / 50, 1);   // cho nap tai lieu on dinh truoc khi chay kich ban
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        const int count = w.probeFrames(outDir, intervalMs);
+        fprintf(stdout, "UIPROBE_FRAMES_OK %d\n", count);
+        return 0;
+    }
+
+    // usage: --viewprobe <input.pdf> <out.png> <continuous:0|1> <zoomPercent> <page1Based> [waitMs] [centerXpt] [centerYpt]
+    // Probe: lai che do xem lien tuc + zoom + trang de nghiem thu annot tren ban ve CAD nang
+    if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--viewprobe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QString outPng = QString::fromLocal8Bit(argv[3]);
+        bool continuous = (QString::fromLocal8Bit(argv[4]) == QLatin1String("1"));
+        bool zoomOk = false;
+        double zoomPercent = QString::fromLocal8Bit(argv[5]).toDouble(&zoomOk);
+        int page1Based = QString::fromLocal8Bit(argv[6]).toInt();
+        int waitMs = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toInt() : 15000;
+        const double kNaN = std::numeric_limits<double>::quiet_NaN();
+        double centerXpt = kNaN, centerYpt = kNaN;
+        if (argc >= 9) centerXpt = QString::fromLocal8Bit(argv[8]).toDouble();
+        if (argc >= 10) centerYpt = QString::fromLocal8Bit(argv[9]).toDouble();
+        if (!zoomOk) {
+            fprintf(stderr, "VIEWPROBE: FAIL zoom khong hop le\n");
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+
+        // Chờ nạp xong y như --guiprobe
+        for (int i = 0; i < 60; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        w.probeSetView(continuous, zoomPercent, page1Based, centerXpt, centerYpt);
+        if (!std::isnan(centerXpt) && !std::isnan(centerYpt))
+            fprintf(stdout, "VIEWPROBE_CENTER %.1f %.1f\n", centerXpt, centerYpt);
+
+        // CAD 92 trang render tien-dan rat cham: chay du waitMs, toi thieu 80 vong
+        const int loops = qMax(waitMs / 50, 80);
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QPixmap pm = w.grab();
+        QImage img = pm.toImage();
+        if (img.isNull()) {
+            fprintf(stderr, "VIEWPROBE: FAIL grab returned null\n");
+            return 1;
+        }
+        if (!img.save(outPng, "PNG")) {
+            fprintf(stderr, "VIEWPROBE: FAIL cannot save %s\n", outPng.toLocal8Bit().constData());
+            return 1;
+        }
+
+        fprintf(stdout, "VIEWPROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --search-fold-test <pdf>
+    // Nghiem thu tim kiem BO DAU (SPEC_ABOUT_PICK_SEARCH phan 3). Truy van
+    // NHUNG CUNG trong ma nguon — KHONG lay tu argv (chu Viet qua argv hong
+    // am tham vi main doc bang fromLocal8Bit). Neu <pdf> chua ton tai thi tao
+    // PDF co chu tieng Viet that (NFC + NFD + khong dau) roi chay luon.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--search-fold-test")) {
+        QTextStream out(stdout);
+        QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        PdfDocument::libAddRef();   // truoc khi goi bat ky API PDFium (tao PDF hay mo PDF)
+        if (!QFileInfo::exists(pdfPath)) {
+            // Tao PDF de nghi: go chu tieng Viet that bang FreeText annot.
+            // Luu y: AnnotationManager va QPdfWriter deu NFC hoa chuoi nhap
+            // vao, nen dong NFD trong PDF se ra dang NFC. Truong hop chu trong
+            // PDF da o dang NFD duoc kiem bang foldForMatch() o phia duoi (cung
+            // mot ham buildFoldMap dung cho ca chuoi trong trang).
+            const QStringList lines = {
+                QString::fromUtf8("MẶT"),                                   // NFC
+                QString::fromUtf8("MẶT").normalized(QString::NormalizationForm_D), // NFD
+                QString::fromUtf8("MAT"),                                  // khong dau
+                QString::fromUtf8("MÁT"),                                  // dau khac
+                QString::fromUtf8("đứng"),                                 // d co dau
+            };
+            FPDF_DOCUMENT tdoc = FPDF_CreateNewDocument();
+            FPDF_PAGE tpage = FPDFPage_New(tdoc, 0, 612, 792);
+            FPDFPage_GenerateContent(tpage);
+            FPDF_ClosePage(tpage);
+            AnnotationManager tmgr;
+            tmgr.setDocument(tdoc, pdfPath);
+            for (int i = 0; i < lines.size(); ++i)
+                tmgr.createInlineNote(0, QRectF(40, 40 + i * 40, 520, 30), lines[i],
+                                      QStringLiteral("foldtest"), false, QColor(Qt::black), 14.0f);
+            {
+                QFile f(pdfPath);
+                f.open(QIODevice::WriteOnly);
+                TRFileWriter fw;
+                fw.file = &f;
+                fw.base.version = 1;
+                fw.base.WriteBlock = TRFileWriter::WriteBlock;
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_SaveAsCopy(tdoc, &fw.base, 0);
+            }
+            FPDF_CloseDocument(tdoc);
+            out << "FOLD_TEST created test pdf: " << pdfPath << "\n";
+            out.flush();
+        }
+
+        PdfDocument doc;
+        if (!doc.open(pdfPath)) {
+            out << "FOLD_TEST FAIL cannot open " << pdfPath << "\n";
+            out.flush();
+            PdfDocument::libRelease();
+            return 1;
+        }
+
+        // In toan van trang 0 duoi dang hex codepoint de doi chieu dang NFD/NFC
+        // co duoc giu nguyen trong PDF that hay khong.
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE pg = FPDF_LoadPage(doc.raw(), 0);
+            if (pg) {
+                FPDF_TEXTPAGE tp = FPDFText_LoadPage(pg);
+                if (tp) {
+                    const int nc = FPDFText_CountChars(tp);
+                    std::vector<unsigned short> b2(static_cast<size_t>(nc) + 1, 0);
+                    FPDFText_GetText(tp, 0, nc, b2.data());
+                    const QString t2 = QString::fromUtf16(b2.data());
+                    QStringList cps;
+                    for (const QChar& c : t2)
+                        cps << QString::number(c.unicode(), 16);
+                    out << "Page text codepoints: " << cps.join(QLatin1Char(' ')) << "\n";
+                    out.flush();
+                    FPDFText_ClosePage(tp);
+                }
+                FPDF_ClosePage(pg);
+            }
+        }
+
+        // Ham chay 1 truy van that, cho searchComplete, tra danh sach ket qua.
+        auto runSearch = [&](const QString& query, bool matchDiacritics)
+                            -> QList<SearchResult> {
+            TextSearch searcher;
+            QList<SearchResult> hits;
+            QEventLoop loop;
+            bool done = false;
+            QObject::connect(&searcher, &TextSearch::found, &loop,
+                             [&](SearchResult r) { hits.append(r); });
+            QObject::connect(&searcher, &TextSearch::searchComplete, &loop,
+                             [&](int) { done = true; loop.quit(); });
+            searcher.search(&doc, query, Qt::CaseInsensitive, matchDiacritics);
+            QTimer::singleShot(60000, &loop, &QEventLoop::quit);
+            loop.exec();
+            if (!done)
+                out << "FOLD_TEST WARN timeout query=" << query << "\n";
+            return hits;
+        };
+
+        // Truy van nhung cung trong ma nguon (khong di qua argv).
+        const QString NFC   = QString::fromUtf8("MẶT");
+        const QString NFD   = NFC.normalized(QString::NormalizationForm_D);
+        const QString PLAIN = QString::fromUtf8("MAT");
+        const QString DUNG  = QString::fromUtf8("đứng");
+
+        struct FoldRow { const char* label; QString query; bool exact; };
+        const FoldRow rows[] = {
+            { "MẶT  NFC   bo dau    ", NFC,   false },
+            { "MẶT  NFD   bo dau    ", NFD,   false },
+            { "MAT  —     bo dau    ", PLAIN, false },
+            { "MẶT  NFC   chinh xac ", NFC,   true  },
+            { "dung  NFC  bo dau    ", DUNG,  false },
+        };
+
+        int trioCount = -1;
+        bool pass = true;
+
+        // Kiem TRUC TIEP phep gap dang (khong phu thuoc PDF): NFC, NFD va 'd'
+        // phai ra cung mot dang so khop.
+        const QString m_nfc = QString::fromUtf8("MẶT");
+        const QString m_nfd = m_nfc.normalized(QString::NormalizationForm_D);
+        out << "fold check: foldForMatch(NFC)=" << TextSearch::foldForMatch(m_nfc)
+            << " foldForMatch(NFD)=" << TextSearch::foldForMatch(m_nfd)
+            << " foldForMatch(dung)=" << TextSearch::foldForMatch(DUNG)
+            << " (ky vong mat/dung)\n";
+        out.flush();
+        if (TextSearch::foldForMatch(m_nfc) != QStringLiteral("mat")
+            || TextSearch::foldForMatch(m_nfd) != QStringLiteral("mat")
+            || TextSearch::foldForMatch(DUNG) != QStringLiteral("dung"))
+            pass = false;
+
+        out << "\nBang nghiem thu (PDF: " << pdfPath << ")\n";
+        for (int idx = 0; idx < 5; ++idx) {
+            const FoldRow& row = rows[idx];
+            const QList<SearchResult> hits = runSearch(row.query, row.exact);
+            const int n = hits.size();
+            out << "  [" << idx << "] " << row.label << " -> " << n << " ket qua\n";
+            if (idx < 3) {
+                if (trioCount < 0) trioCount = n;
+                else if (n != trioCount) pass = false;
+            } else if (idx == 3) {
+                if (n > trioCount) pass = false;
+            } else {
+                if (n <= 0) pass = false;   // "dung" phai co it nhat 1 ket qua
+            }
+            out.flush();
+        }
+
+        // Chi tiet: charIdx/charCount + rect cua vao ket qua dau (che do bo dau).
+        out << "\nChi tiet che do bo dau (MẶT NFC): charIdx/charCount + rect0\n";
+        const QList<SearchResult> foldHits = runSearch(NFC, false);
+        for (int i = 0; i < qMin(4, foldHits.size()); ++i) {
+            const SearchResult& r = foldHits[i];
+            const QRectF rc = r.rects.isEmpty() ? QRectF() : r.rects.first();
+            out << "  [" << i << "] page=" << (r.pageIndex + 1)
+                << " charIdx=" << r.charIdx << " charCount=" << r.charCount
+                << " rect0=" << rc.x() << "," << rc.y()
+                << "," << rc.width() << "x" << rc.height()
+                << " snippet=\"" << r.contextSnippet.left(30) << "\"\n";
+        }
+        out.flush();
+
+        // Rect che do bo dau phai TRUNG rect che do chinh xac cho cung vi tri
+        // (chung to anh xa chi so nguoc khong lech).
+        out << "\nDoi chieu rect bo dau vs chinh xac (cung vi tri phai trung):\n";
+        const QList<SearchResult> exactHits = runSearch(NFC, true);
+        int matchRect = 0;
+        for (const SearchResult& e : exactHits) {
+            if (e.rects.isEmpty()) continue;
+            bool found = false;
+            for (const SearchResult& f : foldHits) {
+                if (f.rects.isEmpty()) continue;
+                if (f.pageIndex == e.pageIndex && f.rects.first() == e.rects.first()
+                    && f.charIdx == e.charIdx && f.charCount == e.charCount) {
+                    found = true;
+                    break;
+                }
+            }
+            out << "  exact rect0=" << e.rects.first().x() << "," << e.rects.first().y()
+                << " charIdx=" << e.charIdx << " charCount=" << e.charCount
+                << " -> " << (found ? "TRUNG" : "KHONG TRUNG") << "\n";
+            if (!found) pass = false;
+            ++matchRect;
+        }
+        out.flush();
+
+        out << "\nFOLD_TEST " << (pass ? "PASS" : "FAIL") << "\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return pass ? 0 : 1;
+    }
+
+    // usage: --about-probe <outdir>
+    // Chup AboutDialog ca 2 theme ra PNG de kiem hinh thuc: logo card dung mau
+    // theme (khong con mang trang), chu License dung token, font he thong.
+    // Kem in mau DIEM ANH THAT cua logo card va vung license de nghiem thu so.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--about-probe")) {
+        const QString outDir = QString::fromLocal8Bit(argv[2]);
+        QDir().mkpath(outDir);
+        for (bool dark : { true, false }) {
+            const ThemeTokens& t = dark ? darkHC() : lightHC();
+            qApp->setStyleSheet(
+                QStringLiteral("QDialog { background:%1; color:%2; } "
+                               "QLabel { background:transparent; } "
+                               "QTextBrowser, QTextEdit { background:%1; color:%2; }")
+                    .arg(t.bgAlt, t.fg));
+            AboutDialog dlg(dark);
+            dlg.show();
+            for (int i = 0; i < 20; ++i) { QCoreApplication::processEvents(); QThread::msleep(20); }
+            const QString tag = dark ? QStringLiteral("dark") : QStringLiteral("light");
+            const QPixmap pm = dlg.grab();
+            const bool ok = pm.isNull() ? false
+                : pm.save(outDir + QStringLiteral("/about_%1.png").arg(tag), "PNG");
+            // Mau diem anh that cua logo card (QLabel co pixmap) + vung license.
+            auto pixAt = [](QWidget* w) -> QString {
+                if (!w || w->width() <= 0 || w->height() <= 0) return QStringLiteral("n/a");
+                const QImage img = w->grab().toImage();
+                if (img.isNull()) return QStringLiteral("n/a");
+                return img.pixelColor(img.width() / 2, 2).name();
+            };
+            QString logoPix = QStringLiteral("n/a"), licPix = QStringLiteral("n/a");
+            for (QLabel* l : dlg.findChildren<QLabel*>())
+                if (!l->pixmap(Qt::ReturnByValue).isNull()) { logoPix = pixAt(l); break; }
+            for (QTextBrowser* tb : dlg.findChildren<QTextBrowser*>())
+                { licPix = pixAt(tb); break; }
+            qInfo().noquote() << QString("[aboutprobe] %1 saved=%2 logoPix=%3 licPix=%4")
+                .arg(tag).arg(ok ? 1 : 0).arg(logoPix, licPix);
+        }
+        qApp->setStyleSheet(QString());
+        return 0;
+    }
+
+    // usage: --searchnav-test <input.pdf> <query> <continuous:0|1> <zoomPercent> <resultIdx1Based> [waitMs]
+    // Probe (SPEC_SEARCH_NAV_R2): tim kiem THAT, roi "bam" ket qua thu
+    // resultIdx1Based qua dung tin hieu searchResultSelected. Dinh kem dong
+    // qInfo "[searchnav] ..." o MainWindow de nghiem thu bang so.
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--searchnav-test")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QString query     = QString::fromLocal8Bit(argv[3]);
+        bool continuous   = (QString::fromLocal8Bit(argv[4]) == QLatin1String("1"));
+        bool zoomOk = false;
+        double zoomPercent = QString::fromLocal8Bit(argv[5]).toDouble(&zoomOk);
+        int resultIdx = QString::fromLocal8Bit(argv[6]).toInt();
+        int waitMs = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toInt() : 15000;
+        if (!zoomOk) {
+            fprintf(stderr, "SEARCHNAV: FAIL zoom khong hop le\n");
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+        for (int i = 0; i < 60; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        w.probeSearchNav(continuous, zoomPercent, query, resultIdx, waitMs);
+        for (int i = 0; i < 20; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+        fprintf(stdout, "SEARCHNAV_OK continuous=%d zoom=%d result=%d\n",
+                continuous ? 1 : 0, qRound(zoomPercent), resultIdx);
+        return 0;
+    }
+
+    // usage: --searchstate-test <pdfA> <pdfB> <query> <continuous:0|1> <zoomPercent> [waitMs]
+    // Probe (SPEC_SEARCH_STATE_R3): nghiem thu 3 loi trang thai tim kiem bang
+    // log — tim o A roi doi tab A/B phai giu ket qua rieng, va [hl] moi trang
+    // phai drawn>0 khi lọt vao vung nhin o che do lien tuc.
+    if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--searchstate-test")) {
+        QString pathA = QString::fromLocal8Bit(argv[2]);
+        QString pathB = QString::fromLocal8Bit(argv[3]);
+        QString query = QString::fromLocal8Bit(argv[4]);
+        bool continuous = (QString::fromLocal8Bit(argv[5]) == QLatin1String("1"));
+        bool zoomOk = false;
+        double zoomPercent = QString::fromLocal8Bit(argv[6]).toDouble(&zoomOk);
+        int waitMs = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toInt() : 15000;
+        if (!zoomOk) {
+            fprintf(stderr, "SEARCHSTATE: FAIL zoom khong hop le\n");
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.probeSearchState(pathA, pathB, query, continuous, zoomPercent, waitMs);
+        for (int i = 0; i < 20; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+        fprintf(stdout, "SEARCHSTATE_DONE continuous=%d zoom=%d\n",
+                continuous ? 1 : 0, qRound(zoomPercent));
+        return 0;
+    }
+
+    // usage: --ocr-layer-test <outdir>
+    // Kiem tra TANG CHU VO HINH khong can Tesseract (chay duoc tren Linux):
+    // chen cac tu gia (OcrWord) vao mot trang moi, roi kiem:
+    //   1) FPDFText_CountChars sau khi chen > 0
+    //   2) OcrTextLayer::pageDone ba 0 lan dau, 1 lan sau (khong chen 2 lan)
+    //   3) FPDFText_GetText doc nguoc lai dung chu da chen (ke ca tieng Viet)
+    //   4) Box point sau khi doc nguoc khop vi tri da chen (sai so nho)
+    //   5) sha256 file PDF tren dia khong doi sau khi chen (lop chi trong RAM)
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ocr-layer-test")) {
+        QTextStream out(stdout);
+        const QString outDir = QString::fromLocal8Bit(argv[2]);
+        QDir().mkpath(outDir);
+        PdfDocument::libAddRef();
+
+        const QString pdfPath = outDir + QLatin1String("/layer_test.pdf");
+        FPDF_DOCUMENT doc = FPDF_CreateNewDocument();
+        if (!doc) { out << "LAYER FAIL create doc\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE np = FPDFPage_New(doc, 0, 300, 200);
+            if (!np) { out << "LAYER FAIL create page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            FPDFPage_GenerateContent(np);
+            FPDF_ClosePage(np);
+        }
+        { QFile f(pdfPath);
+          if (!f.open(QIODevice::WriteOnly)) { out << "LAYER FAIL write\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+          TRFileWriter fw; fw.file = &f; fw.base.version = 1; fw.base.WriteBlock = TRFileWriter::WriteBlock;
+          bool ok = false; { QMutexLocker lock(&s_pdfiumMutex); ok = FPDF_SaveAsCopy(doc, &fw.base, 0) != 0; }
+          f.close();
+          if (!ok) { out << "LAYER FAIL save base\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        }
+        auto sha = [](const QString& p) -> QString {
+            QFile f(p);
+            if (!f.open(QIODevice::ReadOnly)) return QString();
+            QCryptographicHash h(QCryptographicHash::Sha256);
+            while (!f.atEnd()) h.addData(f.read(1024 * 1024));
+            return QString::fromLatin1(h.result().toHex());
+        };
+        const QString beforeSha = sha(pdfPath);
+
+        // Tu gia dat tai vi tri da biet: (x,y) point, cao 10pt
+        QVector<OcrWord> words;
+        auto mk = [&](const QString& t, double x, double y, float conf) {
+            OcrWord w; w.text = t; w.boxPt = QRectF(x, y, t.size() * 5.0, 10.0); w.conf = conf; words << w;
+        };
+        mk(QStringLiteral("Hello"), 20, 150, 95.0f);
+        mk(QStringLiteral("Hatch"), 90, 150, 94.0f);
+        mk(QStringLiteral("Gạch"), 160, 150, 90.0f);   // tieng Viet
+
+        out << "pageDone before = " << OcrTextLayer::pageDone(doc, 0) << "\n";
+        const int inserted = OcrTextLayer::insertPage(doc, 0, words);
+        out << "inserted = " << inserted << "\n";
+        if (inserted != words.size()) { out << "LAYER FAIL insert count\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        out << "pageDone after = " << OcrTextLayer::pageDone(doc, 0) << "\n";
+        if (!OcrTextLayer::pageDone(doc, 0)) { out << "LAYER FAIL pageDone\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+
+        // Chen lan 2 phai bi tu choi (khong nhan doi)
+        const int dup = OcrTextLayer::insertPage(doc, 0, words);
+        out << "reinsert (expect 0) = " << dup << "\n";
+        if (dup != 0) { out << "LAYER FAIL reinsert not blocked\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+
+        // Doc nguoc text + box
+        int nChars = 0; QString gotText;
+        QVector<QRectF> gotBoxes;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE pg = FPDF_LoadPage(doc, 0);
+            if (!pg) { out << "LAYER FAIL load page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            FPDF_TEXTPAGE tp = FPDFText_LoadPage(pg);
+            nChars = tp ? FPDFText_CountChars(tp) : -1;
+            if (tp && nChars > 0) {
+                std::vector<unsigned short> buf(nChars + 1, 0);
+                FPDFText_GetText(tp, 0, nChars, buf.data());
+                gotText = QString::fromUtf16(buf.data()).trimmed();
+                for (int i = 0; i < nChars; ++i) {
+                    double l = 0, t = 0, r = 0, b = 0;
+                    if (FPDFText_GetCharBox(tp, i, &l, &r, &t, &b))
+                        gotBoxes << QRectF(l, b, r - l, t - b);
+                }
+            }
+            if (tp) FPDFText_ClosePage(tp);
+            FPDF_ClosePage(pg);
+        }
+        out << "CountChars after = " << nChars << "\n";
+        if (nChars <= 0) { out << "LAYER FAIL no chars\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        out << "extracted = [" << gotText << "]\n";
+        if (!gotText.contains(QLatin1String("Hello")) || !gotText.contains(QLatin1String("Hatch"))
+            || !gotText.contains(QStringLiteral("Gạch"))) {
+            out << "LAYER FAIL text mismatch\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+        // Kiem vi tri: tu "Hello" bat dau o x=20, y=150. Char box dau tien
+        // phai gan x=20 va y=150..160.
+        if (gotBoxes.size() >= 1) {
+            const QRectF b0 = gotBoxes.first();
+            out << "first char box = (" << QString::number(b0.left(), 'f', 1) << ","
+                << QString::number(b0.top(), 'f', 1) << ")..("
+                << QString::number(b0.right(), 'f', 1) << ","
+                << QString::number(b0.bottom(), 'f', 1) << ")\n";
+            const bool xOk = qAbs(b0.left() - 20.0) < 3.0;
+            const bool yOk = b0.bottom() >= 148.0 && b0.bottom() <= 152.0;
+            if (!xOk || !yOk) { out << "LAYER FAIL pos mismatch\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        }
+
+        const QString afterSha = sha(pdfPath);
+        out << "sha256 unchanged = " << (beforeSha == afterSha && !beforeSha.isEmpty() ? "YES" : "NO") << "\n";
+        if (beforeSha != afterSha) { out << "LAYER FAIL file modified\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+
+        // ── 7) Ghi ban sao CO chu vo hinh de nghiem thu chon chu (SPEC_TEXTSEL
+        // ADOBE muc 4): doc nay chua lop OCR, FPDFText_* thay nhu chu thuong.
+        const QString withTextPath = outDir + QLatin1String("/layer_with_text.pdf");
+        { QFile f(withTextPath);
+          if (f.open(QIODevice::WriteOnly)) {
+              TRFileWriter fw; fw.file = &f; fw.base.version = 1; fw.base.WriteBlock = TRFileWriter::WriteBlock;
+              { QMutexLocker lock(&s_pdfiumMutex); FPDF_SaveAsCopy(doc, &fw.base, 0); }
+              f.close();
+          }
+        }
+        out << "Saved OCR-layer copy (for textsel): " << withTextPath << "\n";
+
+        FPDF_CloseDocument(doc);
+        OcrTextLayer::forgetDocument(doc);
+        out << "OCR_LAYER_OK\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --ocr-pixdiff-test <outdir>
+    // Pixel-diff cua lop chu vo hinh — loai bo loi "chu OCR hien de len anh scan".
+    // Trang GIAU object (2005 tu, qua nguong 2000 cua VectorLayer::build) de nhanh
+    // TEXT cua lop vector THUC SU chay. Text duoc chen theo kieu MO PHONG PDFium
+    // Windows (bblanchon, khong ho tro SetTextRenderMode): chi fill alpha=0, render
+    // mode van la FILL. Loi cu: lop vector bo qua alpha, GetRenderedBitmap ve chu
+    // thanh muc den => to tile co muc. Ve chuan FPDF_RenderPageBitmap ton trong
+    // alpha=0 => khong ra muc. Ca hai deu nen trang => diff = 0 (muc tieu).
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ocr-pixdiff-test")) {
+        QTextStream out(stdout);
+        const QString outDir = QString::fromLocal8Bit(argv[2]);
+        QDir().mkpath(outDir);
+        PdfDocument::libAddRef();
+
+        const double PW = 800.0, PH = 600.0;   // point
+        FPDF_DOCUMENT doc = FPDF_CreateNewDocument();
+        if (!doc) { out << "PIXDIFF FAIL create doc\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        FPDF_FONT font = nullptr;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE np = FPDFPage_New(doc, 0, PW, PH);
+            if (!np) { out << "PIXDIFF FAIL create page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            FPDFPage_GenerateContent(np);
+            FPDF_ClosePage(np);
+
+            QFile f(QStringLiteral(":/fonts/DejaVuSans.ttf"));
+            QByteArray data;
+            if (f.open(QIODevice::ReadOnly)) data = f.readAll();
+            if (data.isEmpty()) { out << "PIXDIFF FAIL font\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            font = FPDFText_LoadFont(doc, reinterpret_cast<const uint8_t*>(data.constData()),
+                                     static_cast<uint32_t>(data.size()), FPDF_FONT_TRUETYPE, /*cid=*/1);
+            if (!font) { out << "PIXDIFF FAIL load font\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        }
+
+        // Chen 2005 tu: FILL mode + fill alpha=0 (mo phong PDFium Windows bblanchon
+        // khong ho tro SetTextRenderMode — INVISIBLE khong dat duoc, chi con alpha).
+        const int perRow = 130;
+        const int nWords = 2005;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE page = FPDF_LoadPage(doc, 0);
+            if (!page) { out << "PIXDIFF FAIL load page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            for (int i = 0; i < nWords; ++i) {
+                const int row = i / perRow, col = i % perRow;
+                const double x = 20.0 + col * 6.0, y = 20.0 + row * 11.0;
+                FPDF_PAGEOBJECT obj = FPDFPageObj_CreateTextObj(doc, font, 11.5f);
+                if (!obj) continue;
+                const QString text = QStringLiteral("OCRinvisible");
+                if (!FPDFText_SetText(obj, reinterpret_cast<FPDF_WIDESTRING>(text.utf16()))) {
+                    FPDFPageObj_Destroy(obj);
+                    continue;
+                }
+                // CHI alpha=0, KHONG dat render mode (mo phong loi PDFium Windows)
+                FPDFPageObj_SetFillColor(obj, 0, 0, 0, 0);
+                FPDFPageObj_SetStrokeColor(obj, 0, 0, 0, 0);
+                FS_MATRIX m{1.0f, 0.0f, 0.0f, 1.0f, float(x), float(y)};
+                FPDFPageObj_SetMatrix(obj, &m);
+                FPDFPage_InsertObject(page, obj);
+            }
+            FPDFPage_GenerateContent(page);
+            FPDF_ClosePage(page);
+        }
+        out << "words inserted (fill alpha=0, FILL mode) = " << nWords << "\n";
+
+        const double scale = 3.0;   // 3 px/pt — du de thay muc den
+        const int wPx = qMax(1, (int)std::lround(PW * scale));
+        const int hPx = qMax(1, (int)std::lround(PH * scale));
+
+        VectorLayer vl;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            const bool built = vl.build(doc, 0);
+            if (!built) { out << "PIXDIFF FAIL vector build (nObj<=2000?)\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+        }
+        out << "textTiles after fix = " << vl.textTiles().size() << " (expect 0)\n";
+
+        QImage tileImg(wPx, hPx, QImage::Format_ARGB32);
+        tileImg.fill(Qt::white);
+        {
+            QPainter p(&tileImg);
+            p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+            for (const TextTile& t : vl.textTiles()) {
+                QImage a = t.img.convertToFormat(QImage::Format_ARGB32);
+                const QRgb c = t.color;
+                for (int y = 0; y < a.height(); ++y)
+                    for (int x = 0; x < a.width(); ++x) {
+                        const int al = qAlpha(a.pixel(x, y));
+                        if (al == 0) continue;
+                        a.setPixel(x, y, qRgba(qRed(c), qGreen(c), qBlue(c), al));
+                    }
+                QRectF target(t.rectPt.left() * scale, (PH - t.rectPt.top()) * scale,
+                              t.rectPt.width() * scale, t.rectPt.height() * scale);
+                p.drawImage(target, a);
+            }
+        }
+
+        QImage refImg(wPx, hPx, QImage::Format_ARGB32);
+        refImg.fill(Qt::white);
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE pg = FPDF_LoadPage(doc, 0);
+            if (!pg) { out << "PIXDIFF FAIL load page\n"; out.flush(); FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1; }
+            FPDF_BITMAP bmp = FPDFBitmap_CreateEx(wPx, hPx, FPDFBitmap_BGRA,
+                                                  refImg.bits(), refImg.bytesPerLine());
+            if (bmp) {
+                FPDFBitmap_FillRect(bmp, 0, 0, wPx, hPx, 0xFFFFFFFF);
+                FPDF_RenderPageBitmap(bmp, pg, 0, 0, wPx, hPx, 0, 0);
+                FPDFBitmap_Destroy(bmp);
+            }
+            FPDF_ClosePage(pg);
+        }
+
+        qint64 diff = 0, inkTile = 0, inkRef = 0;
+        for (int y = 0; y < hPx; ++y) {
+            const QRgb* rt = reinterpret_cast<const QRgb*>(tileImg.constScanLine(y));
+            const QRgb* rr = reinterpret_cast<const QRgb*>(refImg.constScanLine(y));
+            for (int x = 0; x < wPx; ++x) {
+                if (rt[x] != 0xFFFFFFFFu) ++inkTile;
+                if (rr[x] != 0xFFFFFFFFu) ++inkRef;
+                if (rt[x] != rr[x]) ++diff;
+            }
+        }
+        out << "pixel-diff invisible layer: inkTiles=" << inkTile
+            << " inkRasterRef=" << inkRef << " diff=" << diff << "\n";
+
+        FPDF_CloseDocument(doc);
+        // textTiles != 0 la dau hieu LOI tren moi ban PDFium (object vo hinh van
+        // duoc nop vao lop vector). ink/diff chi thay muc tren ban Windows
+        // (bblanchon, GetRenderedBitmap ve chu de len anh scan).
+        if (vl.textTiles().size() != 0 || diff != 0 || inkTile != 0 || inkRef != 0) {
+            out << "PIXDIFF FAIL invisible text drawn by vector layer\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        out << "OCR_PIXDIFF_OK\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --ocr-accept <source.pdf> <srcPageIndex> <workdir> [langs]
+    // Nghiem thu OCR 3a tren Linux, bao cao bang so:
+    //   1) Dung PDF chi-anh tu 1 trang cua source.pdf (rasterize roi boc lai)
+    //   2) Dem FPDFText_CountChars TRUOC OCR (phai = 0)
+    //   3) Chay OCR + chen lop chu vo hinh, in CountChars SAU, so tu, thoi gian
+    //   4) In 3 tu: hinh chu nhat pixel (Tesseract) + hinh chu nhat point (PDF)
+    //   5) Chay TextSearch tim mot tu OCR doc duoc, kiem chieu cao highlight deu
+    //   6) sha256 file PDF truoc/sau (phai giong nhau — khong sua file)
+    // [langs] (tu dong 5) la ma Tesseract mac dinh "vie+eng" — them de nghiem
+    // thu cac goi ngon ngu moi (SPEC_OCR_LANGPACK phan nghiem thu muc 4).
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ocr-accept")) {
+        QTextStream out(stdout);
+        const QString srcPath = QString::fromLocal8Bit(argv[2]);
+        const int srcPage = QString::fromLocal8Bit(argv[3]).toInt();
+        const QString workdir = QString::fromLocal8Bit(argv[4]);
+        const QString langs = (argc >= 5) ? QString::fromLocal8Bit(argv[5])
+                                          : QStringLiteral("vie+eng");
+        QDir().mkpath(workdir);
+
+        PdfDocument::libAddRef();
+
+        // ── 1) Dung PDF chi-anh: rasterize srcPage cua source.pdf ───────────
+        const QString pdfPath = workdir + QLatin1String("/ocr_test_image.pdf");
+        const int dpi = 300;   // can nho tuyet doi cua engine (OCR chat luong cao)
+        int effDpi = dpi;
+        double srcW = 0, srcH = 0;
+        {
+            FPDF_DOCUMENT sdoc = nullptr;
+            { QMutexLocker lock(&s_pdfiumMutex); sdoc = FPDF_LoadDocument(srcPath.toUtf8().constData(), nullptr); }
+            if (!sdoc) { out << "OCR_ACCEPT FAIL cannot open " << srcPath << "\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+            FPDF_PAGE sp = nullptr;
+            { QMutexLocker lock(&s_pdfiumMutex); sp = FPDF_LoadPage(sdoc, srcPage); }
+            if (!sp) { out << "OCR_ACCEPT FAIL cannot load source page\n"; out.flush(); FPDF_CloseDocument(sdoc); PdfDocument::libRelease(); return 1; }
+            { QMutexLocker lock(&s_pdfiumMutex);
+              srcW = FPDF_GetPageWidth(sp);
+              srcH = FPDF_GetPageHeight(sp);
+            }
+            // dpi theo kich thuoc trang — giong engine: canh dai ~5000px, tran 600.
+            const double maxEdgePt = qMax(srcW, srcH);
+            effDpi = (maxEdgePt > 0.0)
+                ? qBound(300, (int)std::lround(5000.0 * 72.0 / maxEdgePt), 600)
+                : dpi;
+            const int wPx = qMax(1, (int)std::lround(srcW * effDpi / 72.0));
+            const int hPx = qMax(1, (int)std::lround(srcH * effDpi / 72.0));
+            std::vector<unsigned char> px((size_t)wPx * hPx, 255);
+            FPDF_BITMAP bmp = nullptr;
+            { QMutexLocker lock(&s_pdfiumMutex);
+              bmp = FPDFBitmap_CreateEx(wPx, hPx, FPDFBitmap_Gray, px.data(), wPx);
+              if (bmp) { FPDFBitmap_FillRect(bmp, 0, 0, wPx, hPx, 0xFFFFFFFF);
+                         FPDF_RenderPageBitmap(bmp, sp, 0, 0, wPx, hPx, 0, 0); }
+            }
+            FPDF_ClosePage(sp);
+            if (!bmp) { out << "OCR_ACCEPT FAIL render\n"; out.flush(); FPDF_CloseDocument(sdoc); PdfDocument::libRelease(); return 1; }
+            FPDFBitmap_Destroy(bmp);
+            FPDF_CloseDocument(sdoc);
+
+            // Tao PDF chi-anh bang QPdfWriter (Qt6::Gui) — boi FPDFImageObj
+            // trong PDFium ban nay khong nhan BGRA/Gray tu CreateEx (ra anh trang).
+            // Dung QImage voi stride ro rang roi .copy() de loai bo bo dem.
+            QImage gray(reinterpret_cast<const uchar*>(px.data()), wPx, hPx, wPx,
+                        QImage::Format_Grayscale8);
+            const QImage grayCopy = gray.copy();
+            {
+                QPdfWriter pdfw(pdfPath);
+                pdfw.setPageLayout(QPageLayout(QPageSize(QSizeF(srcW, srcH), QPageSize::Point),
+                                               QPageLayout::Portrait, QMarginsF()));
+                // QPdfWriter lam viec theo device unit: o resolution=effDpi, trang
+                // rong srcW*effDpi/72 device px. Ve hinh vao dung toan bo vung do.
+                pdfw.setResolution(effDpi);
+                QPainter p(&pdfw);
+                p.drawImage(QRectF(0, 0, srcW * effDpi / 72.0, srcH * effDpi / 72.0), grayCopy);
+                p.end();
+            }
+        }
+
+        // ── 2) Mo PDF chi-anh: dem chu TRUOC OCR ────────────────────────────
+        PdfDocument doc;
+        if (!doc.open(pdfPath)) { out << "OCR_ACCEPT FAIL reopen\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        out << "Image PDF: " << pdfPath << "\n";
+        out << "Page size: " << QString::number(srcW, 'f', 1) << " x "
+            << QString::number(srcH, 'f', 1) << " pt\n";
+        out << "Raster dpi: " << effDpi << " (page long edge " << qMax(srcW, srcH)
+            << "pt => target ~5000px)\n";
+
+        auto countChars = [&](FPDF_DOCUMENT d, int p) -> int {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE pg = FPDF_LoadPage(d, p);
+            if (!pg) return -1;
+            FPDF_TEXTPAGE tp = FPDFText_LoadPage(pg);
+            int n = tp ? FPDFText_CountChars(tp) : -1;
+            if (tp) FPDFText_ClosePage(tp);
+            FPDF_ClosePage(pg);
+            return n;
+        };
+        const int beforeChars = countChars(doc.raw(), 0);
+        out << "FPDFText_CountChars BEFORE OCR = " << beforeChars << " (expect 0)\n";
+        if (beforeChars != 0) { out << "OCR_ACCEPT FAIL image pdf has text\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        // ── 3) OCR ───────────────────────────────────────────────────────────
+        QString whyNot;
+        if (!OcrEngine::available(&whyNot)) {
+            out << "OCR_ACCEPT FAIL engine unavailable: " << whyNot << "\n"; out.flush(); PdfDocument::libRelease(); return 1;
+        }
+        QElapsedTimer timer; timer.start();
+        auto words = OcrEngine::recognizePage(doc.raw(), 0, langs, dpi,
+                                              []() { return false; });
+        const qint64 ocrMs = timer.elapsed();
+        out << "OCR time: " << ocrMs << " ms\n";
+        out << "Words recognized: " << words.size() << "\n";
+        if (words.isEmpty()) { out << "OCR_ACCEPT FAIL no words\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        // ── 4) In 3 tu: box pixel (tu Tesseract) + box point (da quy doi) ────
+        // De co box pixel can render lai o cung dpi — tra ve gia tri tu box point
+        // quy nguoc de doi chieu. Box point da tinh: x = px*72/dpi, y = hPt - py*72/dpi.
+        out << "Coordinate check (3 words, rot=0, origin=(0,0)):\n";
+        for (int i = 0; i < qMin(3, words.size()); ++i) {
+            const OcrWord& w = words[i];
+            const double leftPx  = w.boxPt.left() * dpi / 72.0;
+            const double topPx   = (srcH - w.boxPt.top()) * dpi / 72.0;
+            const double rightPx = w.boxPt.right() * dpi / 72.0;
+            const double botPx   = (srcH - w.boxPt.bottom()) * dpi / 72.0;
+            out << "  \"" << w.text << "\" conf=" << QString::number(w.conf, 'f', 0)
+                << "  pixel=(" << QString::number(leftPx, 'f', 0) << "," << QString::number(topPx, 'f', 0)
+                << ")..(" << QString::number(rightPx, 'f', 0) << "," << QString::number(botPx, 'f', 0) << ")"
+                << "  point=(" << QString::number(w.boxPt.left(), 'f', 1) << "," << QString::number(w.boxPt.top(), 'f', 1)
+                << ")..(" << QString::number(w.boxPt.right(), 'f', 1) << "," << QString::number(w.boxPt.bottom(), 'f', 1)
+                << ")\n";
+        }
+
+        // ── Chen lop chu vo hinh ─────────────────────────────────────────────
+        const int inserted = OcrTextLayer::insertPage(doc.raw(), 0, words);
+        out << "Invisible text objects inserted: " << inserted << "\n";
+        if (inserted <= 0) { out << "OCR_ACCEPT FAIL insert\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        // Trang da OCR — chen lan 2 phai tra ve 0 (khong tao chu trung lap)
+        const int reinsert = OcrTextLayer::insertPage(doc.raw(), 0, words);
+        out << "Re-insert same page (expect 0): " << reinsert << "\n";
+        if (reinsert != 0) { out << "OCR_ACCEPT FAIL double insert\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        const int afterChars = countChars(doc.raw(), 0);
+        out << "FPDFText_CountChars AFTER OCR = " << afterChars << " (expect > 0)\n";
+        if (afterChars <= 0) { out << "OCR_ACCEPT FAIL no chars after\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+
+        // ── 5) TextSearch tim mot tu + chieu cao highlight ───────────────────
+        // Dung tu DAU TIEN (hoac tu dai nhat trong 5 tu dau) de tim tron tu,
+        // khong tim ky tu don — chieu cao highlight moi co y nghia.
+        QString query = words[0].text;
+        for (int i = 1; i < qMin(5, words.size()); ++i)
+            if (words[i].text.size() > query.size()) query = words[i].text;
+        if (query.size() < 1) query = QStringLiteral("a");
+        TextSearch searcher;
+        QList<SearchResult> results;
+        QEventLoop loop2;
+        QObject::connect(&searcher, &TextSearch::found, &loop2, [&](SearchResult r) { results << r; });
+        bool done = false;
+        QObject::connect(&searcher, &TextSearch::searchComplete, &loop2, [&](int) { done = true; loop2.quit(); });
+        searcher.search(&doc, query, Qt::CaseInsensitive);
+        QTimer::singleShot(30000, &loop2, &QEventLoop::quit);
+        loop2.exec();
+        out << "TextSearch query=\"" << query << "\" results=" << results.size() << "\n";
+        if (done && results.isEmpty()) { out << "OCR_ACCEPT FAIL search empty\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            // Chieu cao highlight: tap tat ca rect tim duoc, do min/max/mean
+            QVector<double> heights;
+            for (const SearchResult& r : results)
+                for (const QRectF& rc : r.rects)
+                    heights << rc.height();
+            if (!heights.isEmpty()) {
+                double sum = 0, mn = 1e9, mx = -1e9;
+                for (double h : heights) { sum += h; mn = qMin(mn, h); mx = qMax(mx, h); }
+                const double mean = sum / heights.size();
+                out << "Highlight heights: count=" << heights.size()
+                    << " min=" << QString::number(mn, 'f', 2)
+                    << " max=" << QString::number(mx, 'f', 2)
+                    << " mean=" << QString::number(mean, 'f', 2)
+                    << " (max/min ratio=" << QString::number(mx / qMax(0.0001, mn), 'f', 2) << ")\n";
+            }
+        }
+
+        // ── 6) sha256 truoc/sau ──────────────────────────────────────────────
+        auto sha = [](const QString& p) -> QString {
+            QFile f(p);
+            if (!f.open(QIODevice::ReadOnly)) return QString();
+            QCryptographicHash h(QCryptographicHash::Sha256);
+            while (!f.atEnd()) h.addData(f.read(1024 * 1024));
+            return QString::fromLatin1(h.result().toHex());
+        };
+        const QString beforeSha = sha(pdfPath);
+        const QString afterSha  = sha(pdfPath);
+        out << "sha256 unchanged: " << (beforeSha == afterSha && !beforeSha.isEmpty() ? "YES" : "NO")
+            << " (" << beforeSha.left(16) << "...)\n";
+
+        out << "OCR_ACCEPT_OK\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return (beforeChars == 0 && afterChars > 0 && !results.isEmpty() && beforeSha == afterSha) ? 0 : 1;
+    }
+
+    // usage: --textsel-test <pdf> <page1Based> <x1> <y1> <x2> <y2>
+    // Nghiem thu chon chu theo CHI SO KY TU (SPEC_TEXTSEL_ADOBE muc NGHIEM THU):
+    // (x1,y1)-(x2,y2) la TOA DO HIEN THI (Y-down, goc trai tren, da ap /Rotate
+    // + CropBox), giai lai nhan-keo-nha. In anchor/focus char, so ky tu, so
+    // rect (1 rect = 1 dong), chu chon duoc, va word/line range tai diem dau.
+    if (argc >= 8 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--textsel-test")) {
+        QTextStream out(stdout);
+        const QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        const int page = QString::fromLocal8Bit(argv[3]).toInt() - 1;
+        const double x1 = QString::fromLocal8Bit(argv[4]).toDouble();
+        const double y1 = QString::fromLocal8Bit(argv[5]).toDouble();
+        const double x2 = QString::fromLocal8Bit(argv[6]).toDouble();
+        const double y2 = QString::fromLocal8Bit(argv[7]).toDouble();
+
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(pdfPath)) {
+            out << "[textsel] FAIL cannot open " << pdfPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        const TextSelection::PageInfo info = TextSelection::pageFor(doc.raw(), page);
+        if (!info.tp) {
+            out << "[textsel] FAIL no text page (page=" << (page + 1) << ")\n"; out.flush();
+            TextSelection::closeDocument(doc.raw()); PdfDocument::libRelease(); return 1;
+        }
+        const QPointF p1 = TextSelection::dispToPagePt(info, QPointF(x1, y1));
+        const QPointF p2 = TextSelection::dispToPagePt(info, QPointF(x2, y2));
+        const double tolX = 5.0, tolY = 5.0;   // zoom ~1 cho harness
+        int a = TextSelection::charIndexAt(info.tp, p1.x(), p1.y(), tolX, tolY);
+        int f = TextSelection::charIndexAt(info.tp, p2.x(), p2.y(), tolX, tolY);
+        out << "[textsel] page=" << (page + 1) << " rot=" << info.rot
+            << " anchorChar=" << a << " focusChar=" << f;
+        if (a >= 0 && f < 0) f = a;
+        if (a < 0 && f >= 0) a = f;
+        if (a < 0 || f < 0) {
+            out << " count=0 rects=0\n";
+            out << "[textsel] text=\"\"\n";
+            out.flush();
+            TextSelection::closeDocument(doc.raw()); PdfDocument::libRelease();
+            return 0;
+        }
+        if (f < a) qSwap(a, f);
+        const int count = f - a + 1;
+        const QVector<QRectF> rects = TextSelection::rectsForRangeDisp(info, a, count);
+        const QString text = TextSelection::textForRange(info.tp, a, count);
+        out << " count=" << count << " rects=" << rects.size() << "\n";
+        out << "[textsel] text=\"" << text << "\"\n";
+        for (int i = 0; i < rects.size(); ++i) {
+            out << "[textsel] rect[" << i << "]="
+                << QString::number(rects[i].x(), 'f', 2) << ","
+                << QString::number(rects[i].y(), 'f', 2) << ","
+                << QString::number(rects[i].width(), 'f', 2) << ","
+                << QString::number(rects[i].height(), 'f', 2) << "\n";
+        }
+        // word/line range tai diem anchor (nghiem thu muc 5: chon dung TROM TU).
+        {
+            int ws = 0, wc = 0, ls = 0, lc = 0;
+            TextSelection::wordRange(info.tp, a, &ws, &wc);
+            TextSelection::lineRange(info.tp, a, &ls, &lc);
+            const QString wtext = TextSelection::textForRange(info.tp, ws, wc);
+            out << "[textsel] word[" << a << "]=" << ws << "," << wc
+                << ",\"" << wtext << "\"\n";
+            out << "[textsel] line[" << a << "]=" << ls << "," << lc << "\n";
+        }
+        out.flush();
+        TextSelection::closeDocument(doc.raw());
+        PdfDocument::libRelease();
+        return 0;
+    }
+
     // usage: --foreignbench <input.pdf>
     // Measure 3 approaches to render foreign annotation layer, choose cheapest.
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--foreignbench")) {
@@ -5068,6 +5506,23 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // usage: --pageflip-bench <input.pdf> <p1_1based> <p2_1based> <lan>
+    // Harness lat trang (SPEC_PERF_DESK_ABOUT phan 1): lat qua lai giua p1 va p2
+    // `lan` lau qua DUNG onPageChanged, in thoi gian tung lan doi trang.
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--pageflip-bench")) {
+        const QString inputPath = QString::fromLocal8Bit(argv[2]);
+        const int p1 = QString::fromLocal8Bit(argv[3]).toInt() - 1;
+        const int p2 = QString::fromLocal8Bit(argv[4]).toInt() - 1;
+        const int loops = QString::fromLocal8Bit(argv[5]).toInt();
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        w.probeFlipBench(p1, p2, loops);
+        return 0;
+    }
+
     // usage: --flagbench <input.pdf> <page_1based>
     // Benchmark: render one page with 5 flag combos, 3 runs each, report avg ms + save PNGs.
     if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--flagbench")) {
@@ -5164,21 +5619,6 @@ int main(int argc, char* argv[]) {
     // Open file passed via command line (e.g. drag-to-exe)
     if (argc > 1)
         window.openFile(QString::fromLocal8Bit(argv[1]));
-#endif
-
-#ifdef TORREADER_NO_PDFIUM
-#ifdef _WIN32
-    app.setStyle(QStyleFactory::create("Fusion"));
-    QString startFile = (argc > 1) ? QString::fromLocal8Bit(argv[1]) : QString();
-    if (startFile.isEmpty()) {
-        startFile = QFileDialog::getOpenFileName(nullptr,
-            "Open DWF File", QString(), "DWF Files (*.dwf *.dwfx)");
-    }
-    auto* win = new DWFMainWindow(startFile);
-    win->setWindowTitle(QStringLiteral("TorReader DWF Viewer"));
-    win->resize(1280, 800);
-    win->show();
-#endif
 #endif
 
     return app.exec();
