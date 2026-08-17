@@ -29,6 +29,8 @@ apps:
   torreader:
     extensions: [kde-neon-6]
     command: usr/bin/TorReader
+    environment:
+      LD_LIBRARY_PATH: $SNAP/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
     common-id: cloud.torreader.TorReader
     desktop: usr/share/applications/cloud.torreader.TorReader.desktop
     plugs:
@@ -107,6 +109,14 @@ parts:
       patchelf --set-rpath "\$ORIGIN/../lib:\$ORIGIN/../lib/${TRIPLET}" \
         "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
       patchelf --print-rpath "${CRAFT_PART_INSTALL}/usr/bin/TorReader"
+
+      # Set rpath $ORIGIN for staged libtesseract and liblept so transitive deps are found
+      for lib in "${CRAFT_PART_INSTALL}/usr/lib/${TRIPLET}"/libtesseract.so.* \
+                 "${CRAFT_PART_INSTALL}/usr/lib/${TRIPLET}"/liblept.so.*; do
+        if [ -f "$lib" ] && [ ! -L "$lib" ]; then
+          patchelf --set-rpath "\$ORIGIN" "$lib" || true
+        fi
+      done
 
       # Du lieu OCR: 10 ngon ngu, dat canh binary vi OcrEngine::tessdataDir()
       # tim <thu muc exe>/tessdata truoc khi thu cac duong khac.
