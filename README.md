@@ -5,12 +5,14 @@
   </picture>
 </p>
 
-# TorReader PDF
+<h1 align="center">TorReader PDF</h1>
 
-[![Release](https://img.shields.io/github/v/release/FelixNgH/TorreaderPDF)](https://github.com/FelixNgH/TorreaderPDF/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/FelixNgH/TorreaderPDF/total)](https://github.com/FelixNgH/TorreaderPDF/releases)
-[![License: MIT](https://img.shields.io/github/license/FelixNgH/TorreaderPDF?v=2)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
+<p align="center">
+  <a href="https://github.com/FelixNgH/TorreaderPDF/releases/latest"><img src="https://img.shields.io/github/v/release/FelixNgH/TorreaderPDF" alt="Release"></a>
+  <a href="https://github.com/FelixNgH/TorreaderPDF/releases"><img src="https://img.shields.io/github/downloads/FelixNgH/TorreaderPDF/total" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/FelixNgH/TorreaderPDF?v=2" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue" alt="Platform">
+</p>
 
 A free, portable PDF reader and editor for Windows and Linux, built for people who work with
 large technical documents — drawing sets, tender packages, scanned reports — often on machines
