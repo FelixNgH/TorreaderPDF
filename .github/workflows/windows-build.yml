@@ -39,11 +39,11 @@ jobs:
           modules: 'qtimageformats'
           cache: true
 
-      - name: Install vcpkg dependencies (OpenSSL, QPDF, ZLIB)
+      - name: Install vcpkg dependencies (OpenSSL, QPDF, ZLIB, Tesseract)
         shell: pwsh
         run: |
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
-            openssl:x64-windows qpdf:x64-windows zlib:x64-windows
+            openssl:x64-windows qpdf:x64-windows zlib:x64-windows tesseract:x64-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure
@@ -52,7 +52,13 @@ jobs:
           cmake -B build -S . -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows
+            -DVCPKG_TARGET_TRIPLET=x64-windows 2>&1 | Tee-Object -Variable cfg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # CMake only warns when Tesseract is missing and builds an OCR stub, which
+          # is far too quiet a way to ship a package with a headline feature gone.
+          if ($cfg -match 'Tesseract khong tim thay') {
+            throw "Tesseract was not found — OCR would be silently disabled in this build"
+          }
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -82,6 +88,25 @@ jobs:
             Copy-Item "$vcbin\*.dll" $out -Force -ErrorAction SilentlyContinue
           }
           Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Verify package contents
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          if (-not (Test-Path $out)) { $out = "build\bin" }
+          $missing = @()
+          foreach ($f in 'TorReader.exe','Qt6Network.dll','pdfium.dll',
+                          'msvcp140.dll','vcruntime140.dll','tls\qschannelbackend.dll') {
+            if (-not (Test-Path "$out\$f")) { $missing += $f }
+          }
+          if (-not (Get-ChildItem "$out" -Filter 'tesseract*.dll' -ErrorAction SilentlyContinue)) {
+            $missing += 'tesseract*.dll'
+          }
+          $langs = @(Get-ChildItem "$out\tessdata" -Filter *.traineddata -ErrorAction SilentlyContinue)
+          Write-Host "tessdata language files: $($langs.Count)"
+          if ($langs.Count -lt 10) { $missing += "tessdata/*.traineddata (found $($langs.Count), expected 10+)" }
+          if ($missing) { throw "Incomplete package, missing: $($missing -join ', ')" }
+          Write-Host "Package verified."
 
       - name: Package
         shell: pwsh
