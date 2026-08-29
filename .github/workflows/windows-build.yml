@@ -63,11 +63,18 @@ jobs:
           $out = "build\bin\Release"
           if (-not (Test-Path $out)) { $out = "build\bin" }
           Get-ChildItem $out
-          # --compiler-runtime: the shipped portable build carries msvcp140/vcruntime140
-          # locally, so don't assume the VC++ redistributable is installed.
-          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations `
-            --compiler-runtime "$out\TorReader.exe"
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations "$out\TorReader.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # windeployqt's --compiler-runtime is a silent no-op on the runner, and
+          # the shipped portable build carries the CRT locally rather than assuming
+          # the VC++ redistributable is installed. Copy it in by hand.
+          $crt = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\2022\*\VC\Redist\MSVC" `
+                   -Directory -Filter 'Microsoft.VC*.CRT' -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\x64\\' } |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "MSVC redistributable CRT not found on the runner" }
+          Write-Host "CRT from $($crt.FullName)"
+          Copy-Item "$($crt.FullName)\*.dll" $out -Force
           # Vendored PDFium and the vcpkg runtime DLLs sit outside windeployqt's view.
           Copy-Item third_party\pdfium\bin\pdfium.dll $out -Force
           $vcbin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
