@@ -18,6 +18,10 @@ TranslationPopup::TranslationPopup(QWidget* parent)
     setAttribute(Qt::WA_ShowWithoutActivating);
     setFixedWidth(340);
 
+    m_lblLangPair = new QLabel(this);
+    m_lblLangPair->setStyleSheet("color:#2563EB; font-size:8pt; font-weight:bold;");
+    m_lblLangPair->setVisible(false);
+
     m_lblOriginal = new QLabel(this);
     m_lblOriginal->setWordWrap(true);
     m_lblOriginal->setStyleSheet("color:#666; font-size:9pt; font-style:italic;");
@@ -52,6 +56,7 @@ TranslationPopup::TranslationPopup(QWidget* parent)
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(14, 12, 14, 12);
     layout->setSpacing(6);
+    layout->addWidget(m_lblLangPair);
     layout->addWidget(m_lblOriginal);
     layout->addWidget(m_lblTranslated);
     layout->addLayout(hdr);
@@ -66,9 +71,13 @@ TranslationPopup::TranslationPopup(QWidget* parent)
 
 void TranslationPopup::showTranslation(const QString& original,
                                         const QString& translation,
-                                        const QPoint& globalPos)
+                                        const QPoint& globalPos,
+                                        const QString& langPair)
 {
+    m_lblLangPair->setText(langPair);
+    m_lblLangPair->setVisible(!langPair.isEmpty());
     m_lblOriginal->setText(original);
+    m_lblOriginal->setVisible(!original.isEmpty());
     m_lblTranslated->setText(translation.isEmpty()
                              ? "<i>(no translation)</i>" : translation);
     m_translation = translation;
@@ -76,7 +85,9 @@ void TranslationPopup::showTranslation(const QString& original,
 
     adjustSize();
 
-    QRect screen = QGuiApplication::primaryScreen()->availableGeometry();
+    QScreen* scr = QGuiApplication::screenAt(globalPos);
+    if (!scr) scr = QGuiApplication::primaryScreen();
+    QRect screen = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
     int x = qBound(screen.left(), globalPos.x() - width() / 2,
                    screen.right()  - width());
     int y = globalPos.y() - height() - 12;

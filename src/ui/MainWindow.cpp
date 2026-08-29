@@ -26,6 +26,7 @@
 #include "core/GoogleAuth.h"
 #include "core/Translator.h"
 #include "TranslationPopup.h"
+#include "LanguagePickerPopup.h"
 #include "NoteInputDialog.h"
 #include "core/UpdateChecker.h"
 #include "GateDialog.h"
@@ -785,7 +786,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     // Permanent hint bar — shows shortcut hints on the right side of the status bar
     auto* hintLabel = new QLabel(
-        "Ctrl+Scroll: Zoom  ·  Alt+Drag: Translate  "
+        "Ctrl+Scroll: Zoom  ·  Ctrl/Alt+Drag: Translate  "
         "·  Scroll: Flip page  ·  Right-click thumbnail: Page options");
     m_hintLabel = hintLabel;
     hintLabel->setStyleSheet(QStringLiteral("color:%1; font-size:10px; padding-right:8px;")
@@ -798,14 +799,36 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_googleAuth = new GoogleAuth(this);
     m_translator = new Translator(this);
     m_transPopup = new TranslationPopup(nullptr); // top-level floating window
+    m_langPicker = new LanguagePickerPopup(nullptr);
+
+    // The picker asks "from X into Y" before anything goes over the network.
+    connect(m_langPicker, &LanguagePickerPopup::translateRequested,
+            this, [this](const QString& text, const QString& src, const QString& dst) {
+        statusBar()->showMessage("Translating\xE2\x80\xA6", 2000);
+        m_translator->translate(text, src, dst);
+    });
 
     connect(m_translator, &Translator::finished,
-            this, [this](const QString& orig, const QString& trans) {
-        m_transPopup->showTranslation(orig, trans, m_lastTransPos);
+            this, [this](const QString& orig, const QString& trans,
+                         const QString& src, const QString& dst) {
+        const QString pair = QStringLiteral("%1 \xE2\x86\x92 %2")
+                                 .arg(Translator::languageName(src),
+                                      Translator::languageName(dst));
+        m_transPopup->showTranslation(orig, trans, m_lastTransPos, pair);
     });
     connect(m_translator, &Translator::failed,
             this, [this](const QString& err) {
-        statusBar()->showMessage("Translation failed: " + err, 4000);
+        // A 4-second status flash was too easy to miss, which made every
+        // failure look like "nothing happened". Show the reason where the
+        // translation itself would have appeared.
+        statusBar()->showMessage("Translation failed: " + err, 10000);
+        m_transPopup->showTranslation(
+            QString(),
+            QStringLiteral("<span style='color:#B91C1C;'>Translation failed</span>"
+                           "<br><span style='font-weight:normal; font-size:9pt;'>%1</span>")
+                .arg(err.toHtmlEscaped()),
+            m_lastTransPos,
+            QStringLiteral("Error"));
     });
 
     connect(m_continuousView, &ContinuousView::textRegionSelected,
@@ -1231,7 +1254,8 @@ void MainWindow::setupActionBar() {
     // Translate — nut tren toolbar (giua About va Share app).
     m_translateAct = new QAction("Translate", this);
     m_translateAct->setToolTip(
-        "Enable Google Translate — hold Ctrl and drag over text to select & translate\n"
+        "Enable Google Translate — hold Ctrl (or Alt) and drag over text to select & translate\n"
+        "A pop-up asks which language to translate from and into (English \xE2\x86\x92 Vietnamese by default)\n"
         "Works in both Single and Continuous modes\n"
         "Right-click to reset consent");
     m_translateAct->setShortcut(QKeySequence("Ctrl+Shift+T"));
@@ -1241,9 +1265,11 @@ void MainWindow::setupActionBar() {
             mb.setWindowTitle("Google Translate Enabled");
             mb.setText(
                 "<b>Translation is enabled.</b><br><br>"
-                "Hold <b>Ctrl</b> and drag over text to select it.<br>"
+                "Hold <b>Ctrl</b> (or <b>Alt</b>) and drag over text to select it.<br>"
                 "Works in both <b>Single page</b> and <b>Continuous</b> modes.<br>"
-                "Release to automatically translate the selected text to Vietnamese.<br><br>"
+                "On release a pop-up asks which language to translate "
+                "<b>from</b> and <b>into</b> \xE2\x80\x94 English \xE2\x86\x92 Vietnamese by default.<br>"
+                "Tick <i>Always use this pair</i> there to skip the pop-up next time.<br><br>"
                 "<i>To disable/reset: right-click the Translate button.</i>");
             mb.setIcon(QMessageBox::Information);
             mb.setStandardButtons(QMessageBox::Ok);
@@ -4533,16 +4559,25 @@ void MainWindow::onTextRegionSelected(int pageIdx, QRectF rectPts, QPoint global
 
     FPDF_DOCUMENT rawDoc = t->doc->raw();
     m_lastTransPos = globalPos;
-    statusBar()->showMessage("Translating…", 3000);
+    statusBar()->showMessage("Extracting text…", 3000);
 
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher]() {
+            [this, watcher, globalPos]() {
         watcher->deleteLater();
         QString text = watcher->result();
-        if (!text.isEmpty())
-            m_translator->translate(text);
-        else
+        if (!text.isEmpty()) {
+            // Ask "from X into Y" first, unless the user ticked "don't ask again".
+            if (LanguagePickerPopup::rememberChoice()) {
+                statusBar()->showMessage("Translating…", 2000);
+                m_translator->translate(text,
+                                        LanguagePickerPopup::savedSource(),
+                                        LanguagePickerPopup::savedTarget());
+            } else {
+                statusBar()->clearMessage();
+                m_langPicker->askFor(text, globalPos);
+            }
+        } else
             statusBar()->showMessage(
                 "No selectable text in this area. "
                 "Scanned pages may require OCR.", 4000);

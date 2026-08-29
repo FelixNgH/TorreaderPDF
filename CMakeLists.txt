@@ -187,6 +187,7 @@ set(SOURCES
     src/ui/UpdateBanner.cpp
     src/ui/GateDialog.cpp
     src/ui/TranslationPopup.cpp
+    src/ui/LanguagePickerPopup.cpp
     src/ui/NotificationBar.cpp
     >
 )
@@ -231,6 +232,7 @@ set(HEADERS
     src/ui/UpdateBanner.h
     src/ui/GateDialog.h
     src/ui/TranslationPopup.h
+    src/ui/LanguagePickerPopup.h
     src/ui/NotificationBar.h
     >
 )
