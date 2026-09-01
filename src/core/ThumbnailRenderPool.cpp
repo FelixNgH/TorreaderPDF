@@ -1,6 +1,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "ThumbnailRenderPool.h"
+#include "PageCache.h"
+#include "PdfiumLock.h"
+#include "PdfRenderer.h"  // VIỆC: để gọi borrowPoolHandle/returnPoolHandle
 #include <QMutexLocker>
 #include <QElapsedTimer>
 #include <QDebug>
@@ -28,8 +31,10 @@ extern QMutex s_pdfiumMutex;
 
 // ── ThumbnailWorker ───────────────────────────────────────────────────────────
 
-ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cache, quint64 epoch, QObject* parent)
-    : QThread(parent), m_doc(doc), m_slot(slot), m_cache(cache), m_epoch(epoch) {}
+ThumbnailWorker::ThumbnailWorker(FPDF_DOCUMENT doc, int slot, TileCacheFile* cache, quint64 epoch,
+                                 std::atomic<bool>* renderPaused, ThumbnailRenderPool* pool, QObject* parent)
+    : QThread(parent), m_doc(doc), m_slot(slot), m_cache(cache), m_epoch(epoch),
+      m_renderPaused(renderPaused), m_pool(pool) {}
 
 void ThumbnailWorker::enqueue(int pageIndex, int priority) {
     QMutexLocker lock(&m_mutex);
@@ -78,6 +83,19 @@ void ThumbnailWorker::run() {
             }
         }
 
+        // Dang tam dung: KHONG dung PDFium. Tra yeu cau ve hang doi roi ngu ngan,
+        // de trang nguoi dung dang xem duoc uu tien dung xong truoc.
+        if (m_renderPaused && m_renderPaused->load()) {
+            {
+                QMutexLocker lock(&m_mutex);
+                if (m_stop) break; // dung lai: khong day lai hang doi mai mai
+                m_queuedPrio.insert(req.pageIndex, req.priority);
+                m_queue.push(req);
+            }
+            QThread::msleep(50);
+            continue;
+        }
+
         // ── Progressive render via PDFium (releases mutex between slices) ──
 
         QImage image;
@@ -87,35 +105,80 @@ void ThumbnailWorker::run() {
         FPDF_PAGE   fpdfPage = nullptr;
         FPDF_BITMAP bmp      = nullptr;
         int renderStatus     = FPDF_RENDER_READY;
+        FPDF_DOCUMENT poolHandle = nullptr;  // VIỆC: pool handle nếu có
+        bool usingPoolHandle = false;  // VIỆC: ghi dấu để biết cách cleanup
 
-        // Step 1: Start (lock mutex for this slice only)
+        // 🔴 RAII 2026-08-31 — DO DUOC RO RI: 79 luot muon / 78 luot tra.
+        // Muon o MOT cho (duoi day) nhung tra tay o BA cho cach nhau 142 dong, va giua chung
+        // co 4 lenh return/continue. Chi can MOT duong thoat quen tra la handle mat vinh vien;
+        // pool chi co 3 slot nen dung lau la can sach => moi thu lui ve o khoa chung
+        // => app CANG DUNG CANG CHAM. Guard nay bao dam tra du moi duong thoat.
+        struct PoolHandleGuard {
+            ThumbnailRenderPool* pool = nullptr;
+            FPDF_DOCUMENT h = nullptr;
+            void release() {   // goi khi da tra tay roi, de guard khoi tra lan hai
+                pool = nullptr; h = nullptr;
+            }
+            ~PoolHandleGuard() {
+                if (pool && h && pool->pdfRenderer())
+                    pool->pdfRenderer()->returnPoolHandleForThumbnail(h);
+            }
+        } _phGuard;
+
+        // Step 0: Thử lấy pool handle từ renderer nếu có
+        if (m_pool && m_pool->pdfRenderer()) {
+            class PdfRenderer* renderer = m_pool->pdfRenderer();
+            poolHandle = renderer->borrowPoolHandleForThumbnail();
+            if (poolHandle) {
+                usingPoolHandle = true;
+                _phGuard.pool = m_pool;
+                _phGuard.h    = poolHandle;
+                qDebug() << "[thumb song song] page=" << req.pageIndex << "dung pool handle";
+            }
+        }
+
+        // Step 1: Start (load page từ pool handle hoặc PageCache)
         {
-            // Yield to main renderer for ALL priorities: thumbnail delayed a few hundred ms
-            // is invisible to user, but main page stuck 15s is very visible.
-            // Anti-starvation: after kThumbYieldMaxTries, take lock by force so thumbnails still appear.
-            constexpr int kThumbYieldMaxTries = 25; // ~25 x (5ms try + 20ms sleep) ~ 600ms
-            if (req.yieldTries < kThumbYieldMaxTries) {
-                if (!s_pdfiumMutex.tryLock(5)) {
-                    QMutexLocker lock(&m_mutex);
-                    req.yieldTries++;
-                    if (req.yieldTries % 10 == 0)
-                        qDebug() << "[perf] thumb YIELD page=" << req.pageIndex
-                                 << "tries=" << req.yieldTries;
-                    m_queuedPrio.insert(req.pageIndex, req.priority);
-                    m_queue.push(req);
-                    QThread::msleep(20);
+            if (usingPoolHandle) {
+                // ĐƯỜNG POOL HANDLE: không cần s_pdfiumMutex
+                fpdfPage = FPDF_LoadPage(poolHandle, req.pageIndex);
+                if (!fpdfPage) {
+                    qDebug() << "[perf] thumb pool load page failed page=" << req.pageIndex;
+                    if (m_pool && m_pool->pdfRenderer())
+                        m_pool->pdfRenderer()->returnPoolHandleForThumbnail(poolHandle); _phGuard.release();
                     continue;
                 }
-                s_pdfiumMutex.unlock();
             } else {
-                qDebug() << "[perf] thumb FORCE lock page=" << req.pageIndex
-                         << "(het luot nhuong)";
+                // ĐƯỜNG CŨ: dùng mutex + PageCache
+                // Yield to main renderer for ALL priorities: thumbnail delayed a few hundred ms
+                // is invisible to user, but main page stuck 15s is very visible.
+                // Anti-starvation: after kThumbYieldMaxTries, take lock by force so thumbnails still appear.
+                constexpr int kThumbYieldMaxTries = 25; // ~25 x (5ms try + 20ms sleep) ~ 600ms
+                if (req.yieldTries < kThumbYieldMaxTries) {
+                    if (!s_pdfiumMutex.tryLock(5)) {
+                        QMutexLocker lock(&m_mutex);
+                        req.yieldTries++;
+                        if (req.yieldTries % 10 == 0)
+                            qDebug() << "[perf] thumb YIELD page=" << req.pageIndex
+                                     << "tries=" << req.yieldTries;
+                        m_queuedPrio.insert(req.pageIndex, req.priority);
+                        m_queue.push(req);
+                        QThread::msleep(20);
+                        continue;
+                    }
+                    s_pdfiumMutex.unlock();
+                } else {
+                    qDebug() << "[perf] thumb FORCE lock page=" << req.pageIndex
+                             << "(het luot nhuong)";
+                }
+
+                TimedPdfiumLock thumbLock(__FILE__, __LINE__);
+
+                // R1 (SPEC_PERF_HEAVYPAGE): di qua PageCache — NGUON SU THAT DUY NHAT.
+                // Da giu s_pdfiumMutex (thumbLock) ngay truoc do nen goi acquire() hop le.
+                fpdfPage = PageCache::acquire(m_doc, req.pageIndex);
+                if (!fpdfPage) continue;
             }
-
-            QMutexLocker thumbLock(&s_pdfiumMutex);
-
-            fpdfPage = FPDF_LoadPage(m_doc, req.pageIndex);
-            if (!fpdfPage) continue;
 
             // ── Try embedded thumbnail first ──
             FPDF_BITMAP tb = FPDFPage_GetThumbnailAsBitmap(fpdfPage);
@@ -132,8 +195,16 @@ void ThumbnailWorker::run() {
                     m_cache->writePage(req.pageIndex, CacheZoom::Thumb, embImg);
                 qDebug() << "[perf] thumb WORKER emit page=" << req.pageIndex << "worker=" << (void*)this << "thread=" << QThread::currentThreadId();
                 emit thumbnailReady(req.pageIndex, embImg, m_epoch);
-                FPDF_ClosePage(fpdfPage);
-                continue;
+
+                // Cleanup embedded: trả handle/PageCache
+                if (usingPoolHandle) {
+                    FPDF_ClosePage(fpdfPage);
+                    if (m_pool && m_pool->pdfRenderer())
+                        m_pool->pdfRenderer()->returnPoolHandleForThumbnail(poolHandle); _phGuard.release();
+                } else {
+                    PageCache::release(m_doc, req.pageIndex, fpdfPage);
+                }
+                continue;   // handle muon tu PageCache hoac pool — khong can FPDF_ClosePage trong cac truong hop khac
             }
 
             double w = FPDF_GetPageWidth(fpdfPage);
@@ -167,26 +238,52 @@ void ThumbnailWorker::run() {
                 if (m_stop) break;
             }
             {
-                QMutexLocker thumbLock(&s_pdfiumMutex);
+                if (usingPoolHandle) {
+                    // Pool handle không cần khoá
+                    ThumbPauseCtx pctx;
+                    pctx.timer.start();
+                    IFSDK_PAUSE pause;
+                    pause.version = 1;
+                    pause.NeedToPauseNow = ThumbNeedToPauseNow;
+                    pause.user = &pctx;
+                    renderStatus = FPDF_RenderPage_Continue(fpdfPage, &pause);
+                } else {
+                    // Đường cũ: cần khoá
+                    TimedPdfiumLock thumbLock(__FILE__, __LINE__);
 
-                ThumbPauseCtx pctx;
-                pctx.timer.start();
-                IFSDK_PAUSE pause;
-                pause.version = 1;
-                pause.NeedToPauseNow = ThumbNeedToPauseNow;
-                pause.user = &pctx;
+                    ThumbPauseCtx pctx;
+                    pctx.timer.start();
+                    IFSDK_PAUSE pause;
+                    pause.version = 1;
+                    pause.NeedToPauseNow = ThumbNeedToPauseNow;
+                    pause.user = &pctx;
 
-                renderStatus = FPDF_RenderPage_Continue(fpdfPage, &pause);
+                    renderStatus = FPDF_RenderPage_Continue(fpdfPage, &pause);
+                }
             }
         }
 
         // Step 3: Close
         {
-            QMutexLocker thumbLock(&s_pdfiumMutex);
             if (renderStatus == FPDF_RENDER_TOBECONTINUED || renderStatus == FPDF_RENDER_DONE)
                 FPDF_RenderPage_Close(fpdfPage);
             if (bmp) { FPDFBitmap_Destroy(bmp); bmp = nullptr; }
-            if (fpdfPage) { FPDF_ClosePage(fpdfPage); fpdfPage = nullptr; }
+
+            // Trả handle/PageCache
+            if (usingPoolHandle) {
+                // 🔴 SUA 2026-08-31 — RO RI TRANG PDFium (goc cua ~5 GB RAM).
+                // Nhanh nay tra HANDLE ve pool nhung QUEN dong TRANG da mo tren handle do.
+                // Handle duoc muon lai, mo them trang nua, lai khong dong => trang tich tu
+                // tren 12 handle moi tab. DO DUOC: moi trang A0 dang mo ton ~37 MB bo nho
+                // noi bo PDFium (giu 40 trang = 1.639 MB, dong het = 191 MB).
+                // Voi ~86 thumbnail di duong nay thi ~3,2 GB — dung co phan RAM khong giai
+                // thich duoc. Nhanh embedded o tren (dong ~201) VAN LUON dong dung.
+                if (fpdfPage) { FPDF_ClosePage(fpdfPage); fpdfPage = nullptr; }
+                if (m_pool && m_pool->pdfRenderer())
+                    m_pool->pdfRenderer()->returnPoolHandleForThumbnail(poolHandle); _phGuard.release();
+            } else {
+                PageCache::release(m_doc, req.pageIndex, fpdfPage);
+            }
         }
 
         if (!image.isNull() && renderStatus == FPDF_RENDER_DONE) {
@@ -200,47 +297,75 @@ void ThumbnailWorker::run() {
             qDebug() << "[perf] thumb FAILED page=" << req.pageIndex;
         }
     }
-
-    if (m_doc) {
-        QMutexLocker thumbLock(&s_pdfiumMutex);
-        FPDF_CloseDocument(m_doc);
-        m_doc = nullptr;
-    }
+    // R1: doc la MUON tu PdfDocument (shared handle) — KHONG forgetDocument, KHONG
+    // FPDF_CloseDocument o day. Tai lieu chu tu dong forgetDocument + close khi dong.
 }
 
 // ── ThumbnailRenderPool ───────────────────────────────────────────────────────
 
 ThumbnailRenderPool::ThumbnailRenderPool(QObject* parent) : QObject(parent) {}
 
+void ThumbnailRenderPool::insertThumbnail(int pageIndex, const QImage& img) {
+    if (pageIndex < 0 || img.isNull()) return;
+    if (m_cache.isOpen()) m_cache.writePage(pageIndex, CacheZoom::Thumb, img);
+    qDebug().noquote() << "[perf] thumb done page=" << pageIndex
+                       << "engine=vectorGPU ms=0";
+    emit thumbnailReady(pageIndex, img, m_epoch);
+}
+
+void ThumbnailRenderPool::setRenderPaused(bool paused) {
+    m_renderPaused.store(paused);
+}
+
+bool ThumbnailRenderPool::isRenderPaused() const {
+    return m_renderPaused.load();
+}
+
+void ThumbnailRenderPool::setPdfRenderer(PdfRenderer* renderer) {
+    m_pdfRenderer = renderer;
+}
+
 ThumbnailRenderPool::~ThumbnailRenderPool() { close(); }
 
-bool ThumbnailRenderPool::open(const QString& pdfPath) {
+bool ThumbnailRenderPool::open(const QString& pdfPath, FPDF_DOCUMENT sharedDoc,
+                               uint64_t preHash, uint64_t preSize, int prePageCount) {
     if (m_open) close();
     m_path = pdfPath;
-    QByteArray pathBytes = pdfPath.toUtf8();
+    if (!sharedDoc) { qDebug() << "[perf] thumb pool FAILED to open — no shared doc"; return false; }
 
-    // Open disk cache for thumbnails
+    // Open disk cache for thumbnails (R1: dung CHUNG doc voi renderer chinh — khong parse rieng).
     {
         QFileInfo fi(pdfPath);
-        uint64_t hash = TileCacheFile::hashFile(pdfPath);
-        int pgCount = 0;
-        {
-            QMutexLocker thumbLock(&s_pdfiumMutex);
-            FPDF_DOCUMENT tmp = FPDF_LoadDocument(pathBytes.constData(), nullptr);
-            if (tmp) { pgCount = FPDF_GetPageCount(tmp); FPDF_CloseDocument(tmp); }
+        uint64_t hash = preHash ? preHash : TileCacheFile::hashFile(pdfPath);
+        uint64_t size = preSize ? preSize : static_cast<uint64_t>(fi.size());
+        int pgCount = (prePageCount > 0) ? prePageCount : 0;
+        if (pgCount <= 0) {
+            TimedPdfiumLock thumbLock(__FILE__, __LINE__);
+            pgCount = FPDF_GetPageCount(sharedDoc);
         }
         if (pgCount > 0)
-            m_cache.open(pdfPath, hash, static_cast<uint64_t>(fi.size()), pgCount);
+            m_cache.open(pdfPath, hash, size, pgCount);
     }
 
-    ++m_epoch;
+    // Epoch must be GLOBALLY unique across every pool instance, not per-object
+    // (SPEC_THUMB_DISPLAY 31/08 nghi van 3): each tab has its own pool, and a
+    // fresh object always produced epoch==1, so a background tab's already-queued
+    // thumbnail (posted just before the tab switch) matched the new tab's
+    // m_acceptEpoch==1 and got accepted into the wrong list. A monotonic global
+    // counter makes every open() distinct so stale cross-tab frames hit DROP stale.
+    static std::atomic<quint64> s_epochSeq{0};
+    m_epoch = ++s_epochSeq;
     for (int i = 0; i < kDocs; ++i) {
-        FPDF_DOCUMENT doc = FPDF_LoadDocument(pathBytes.constData(), nullptr);
-        if (!doc) { qDebug() << "[perf] thumb pool FAILED to open — FPDF_LoadDocument failed"; close(); return false; }
+        if (i == 0) {
+            if (prePageCount > 0)
+                m_pageCount = prePageCount;
+            else {
+                TimedPdfiumLock thumbLock(__FILE__, __LINE__);
+                m_pageCount = FPDF_GetPageCount(sharedDoc);
+            }
+        }
 
-        if (i == 0) m_pageCount = FPDF_GetPageCount(doc);
-
-        auto* w = new ThumbnailWorker(doc, i, &m_cache, m_epoch, nullptr);
+        auto* w = new ThumbnailWorker(sharedDoc, i, &m_cache, m_epoch, &m_renderPaused, this, nullptr);
         auto c = connect(w, &ThumbnailWorker::thumbnailReady, this,
                          [this](int pg, QImage img, quint64 ep) {
                              qDebug() << "[perf] thumb POOL relay page=" << pg;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.4.0 LANGUAGES CXX)
+project(TorReader VERSION 2.4.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -152,6 +152,7 @@ set(SOURCES
     src/core/GoogleAuth.cpp
     src/core/Translator.cpp
     src/core/VectorLayer.cpp
+    src/core/VectorCacheFile.cpp
     src/core/VectorGpuRenderer.cpp
     src/core/ForeignAnnotLayer.cpp
     src/core/PdfLinks.cpp
@@ -205,6 +206,7 @@ set(HEADERS
     src/core/GoogleAuth.h
     src/core/Translator.h
     src/core/VectorLayer.h
+    src/core/VectorCacheFile.h
     src/core/VectorGpuRenderer.h
     src/core/OwnAnnotHideGuard.h
     src/core/ForeignAnnotLayer.h

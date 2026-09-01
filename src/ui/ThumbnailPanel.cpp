@@ -1,6 +1,9 @@
 #include "ThumbnailPanel.h"
+#include "../core/PdfRenderer.h"
 #include "SearchPanel.h"
 #include "ThemeTokens.h"
+#include "../core/PdfiumLock.h"
+#include <QElapsedTimer>
 #include <QDebug>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -28,6 +31,8 @@
 #include <QLineEdit>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QStyledItemDelegate>
+#include <QPainter>
 #include <algorithm>
 #include <functional>
 #include <vector>
@@ -114,6 +119,23 @@ static QString cleanPdfText(const QString& raw) {
     return result.simplified();
 }
 
+// Custom delegate to paint the current page highlight in the thumbnail list.
+// QSS rule "QListWidget::item" overrides setBackground(), so we paint manually.
+class ThumbCurrentPageDelegate : public QStyledItemDelegate {
+public:
+    explicit ThumbCurrentPageDelegate(ThumbnailPanel* panel) : QStyledItemDelegate(panel), m_panel(panel) {}
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        if (m_panel && index.row() == m_panel->currentPageIndex()) {
+            painter->fillRect(option.rect, m_panel->currentPageHighlight());
+        }
+        QStyledItemDelegate::paint(painter, option, index);
+    }
+
+private:
+    ThumbnailPanel* m_panel = nullptr;
+};
+
 // ── Constructor ───────────────────────────────────────────────────────────────
 ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
 
@@ -133,6 +155,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
     m_list->setDropIndicatorShown(true);
     m_list->setDragDropMode(QAbstractItemView::InternalMove);
     m_list->setDefaultDropAction(Qt::MoveAction);
+    m_list->setItemDelegate(new ThumbCurrentPageDelegate(this));
 
     connect(m_list, &QListWidget::customContextMenuRequested, this,
             [this](const QPoint& pos) {
@@ -316,6 +339,20 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         }
         setActiveToolButton(0);
         cpLay->addWidget(toolWrap);
+        // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): mot nut Insert kich hoat
+        // hộp chon anh (PNG trong suot duoc uu tien). Khong phai ViewTool.
+        auto* insertBtn = new QPushButton(QStringLiteral("📷 Insert Image"));
+        insertBtn->setObjectName(QStringLiteral("insertImageTool"));
+        insertBtn->setFixedHeight(24);
+        QString insertTip;
+        if (m_dark) insertTip = darkHC().fg; else insertTip = lightHC().fg;
+        insertBtn->setStyleSheet(
+            QStringLiteral("color:%1;background:%2;border:1px solid %3;border-radius:4px;")
+                .arg(insertTip)
+                .arg(m_dark ? darkHC().bgAlt : lightHC().bgAlt)
+                .arg(m_dark ? darkHC().border : lightHC().border));
+        connect(insertBtn, &QPushButton::clicked, this, [this]{ emit insertImageRequested(); });
+        cpLay->addWidget(insertBtn);
         auto* propWrap = new QWidget;
         auto* pgl = new QGridLayout(propWrap);
         pgl->setContentsMargins(0, 2, 0, 2);
@@ -509,6 +546,11 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
         m_pendingThumbs.clear();
     }
     m_doc = doc;
+    // Disconnect the PREVIOUS pool's relay so a background tab's in-flight
+    // thumbnails stop reaching this panel (SPEC_THUMB_DISPLAY 31/08: the old
+    // per-worker direct connections below were never torn down on tab switch,
+    // so every tab kept feeding the visible list -> double delivery + cross-tab
+    // pollution + wrong-pageCount DROPPED-EARLY strands).
     if (m_thumbPool) disconnect(m_thumbPoolConn);
     m_renderer  = renderer;
     m_thumbPool = pool;
@@ -521,13 +563,9 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
             qDebug() << "[perf] thumb pool connected ok isOpen=" << m_thumbPool->isOpen()
                      << "pool=" << (void*)m_thumbPool << "panel=" << (void*)this;
     }
-    // Direct worker→panel connections as fallback (UniqueConnection avoids duplicates)
-    if (m_thumbPool) {
-        const auto& ww = m_thumbPool->workers();
-        for (auto* w : ww)
-            connect(w, &ThumbnailWorker::thumbnailReady, this, &ThumbnailPanel::onPageReady, Qt::UniqueConnection);
-        qDebug() << "[perf] thumb direct worker conn n=" << ww.size();
-    }
+    // ponytail: no per-worker direct connections — the pool relay already forwards
+    // every ThumbnailWorker::thumbnailReady. The old "fallback" doubled delivery and
+    // leaked across tabs (only the relay was disconnected on switch, not the workers).
     m_list->clear();
     m_currentPage = -1;
     m_contentGen.fetchAndAddOrdered(1);
@@ -624,6 +662,7 @@ void ThumbnailPanel::setCurrentPage(int pageIndex) {
     }
     syncBookmarkToPage(pageIndex);
     if (m_ocrPanel) m_ocrPanel->setCurrentPage(pageIndex);
+    m_list->viewport()->update();
 }
 
 // Chuyen tab sidebar theo id (dung cho probe --uiprobe va dieu khien tu ma).
@@ -633,6 +672,7 @@ void ThumbnailPanel::selectTab(int id) {
     }
     if (m_stack) m_stack->setCurrentIndex(id);
     if (id == 5 && m_ocrPanel) m_ocrPanel->refresh();
+    emit sidebarTabChanged(id);
 }
 
 // ── thumbnailForPage ──────────────────────────────────────────────────────────
@@ -780,7 +820,31 @@ QColor ThumbnailPanel::currentPageHighlight() const {
 }
 
 // ── onPageReady ───────────────────────────────────────────────────────────────
+void ThumbnailPanel::acceptFromFullRender(int pageIndex, const QImage& fullImg)
+{
+    if (fullImg.isNull() || pageIndex < 0 || !m_list || pageIndex >= m_list->count()) return;
+    auto* item = m_list->item(pageIndex);
+    if (!item || !item->icon().isNull()) return;   // da co thumbnail roi thi thoi
+    const int tw = int(PdfRenderer::kThumbMaxPx);
+    // ⚠️ KHONG dat ten bien la `small` — tren Windows do la MACRO (typedef char small trong
+    // rpcndr.h) nen `QImage small` bi dich thanh `QImage char` => C2628.
+    QImage thumbImg = fullImg.width() > tw
+                    ? fullImg.scaledToWidth(tw, Qt::SmoothTransformation)
+                    : fullImg;
+    item->setIcon(QIcon(QPixmap::fromImage(thumbImg)));
+    ++m_dbgAccepted;
+    qDebug() << "[thumb] TAI SU DUNG anh day du page=" << pageIndex
+             << "tu" << fullImg.width() << "px ->" << thumbImg.width() << "px (khoi doc lai trang)";
+    emit lowResPageAvailable(pageIndex, thumbImg);
+}
+
 void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epoch) {
+    struct _SlotMs {
+        QElapsedTimer t; const char* name; int pg;
+        _SlotMs(const char* n, int p) : name(n), pg(p) { t.start(); }
+        ~_SlotMs() { if (t.elapsed() > 50) qDebug().noquote() << "[slotms]" << name << "ms=" << t.elapsed() << "page=" << pg; }
+    };
+    _SlotMs _sm("thumbOnPageReady", pageIndex);
     if (m_acceptEpoch != 0 && epoch != m_acceptEpoch) {
         qDebug() << "[perf] thumb DROP stale page=" << pageIndex
                  << "epoch=" << epoch << "accept=" << m_acceptEpoch;
@@ -803,17 +867,28 @@ void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epo
         }
         return;
     }
-    double pw = m_doc->pageSize(pageIndex).width();
-    if (pw > 0.0 && image.width() > pw * 0.5) {
+    // 🔴 SUA 2026-08-31 — GOC CUA "file kho A4 khong hien thumbnail nao".
+    // Chot cu so anh voi NUA CHIEU RONG TRANG TINH BANG POINT — mot phep so sai don vi
+    // (pixel so voi point). Voi A0 rong 2384pt thi nguong 1192px nen anh 900px lot;
+    // nhung voi A4 rong 612pt thi nguong chi 306px => MOI thumbnail 900px deu bi VUT SACH.
+    // (kThumbMaxPx vua duoc nang 400 -> 900 trong ngay nen loi nay moi lo ra.)
+    // Y dinh that cua chot: chan anh KICH THUOC TRANG DAY DU lot vao thanh ben.
+    // Nen so voi tran thumbnail, dung don vi pixel ca hai ve.
+    if (image.width() > int(PdfRenderer::kThumbMaxPx * 1.5)) {
         qDebug() << "[perf] thumb REJECTED page=" << pageIndex
-                 << "imgW=" << image.width() << "pageW=" << pw;
+                 << "imgW=" << image.width() << "tran=" << int(PdfRenderer::kThumbMaxPx * 1.5);
         ++m_dbgRejected;
         return;
     }
     if (auto* item = m_list->item(pageIndex)) {
+        // Dem MOT lan cho moi trang — prefetch duoc goi tu nhieu cho (openFile +
+        // setDocument batch + requestVisibleThumbnails) nen cung mot trang co the
+        // den nhieu luot; dem moi luot lam m_dbgAccepted vuot so trang, vo nghia.
+        if (item->icon().isNull()) ++m_dbgAccepted;
         item->setIcon(QIcon(QPixmap::fromImage(image)));
-        ++m_dbgAccepted;
     }
+    // Day ban tho sang che do xem lien tuc: co san anh mo de ve ngay khi pan/zoom.
+    if (!image.isNull()) emit lowResPageAvailable(pageIndex, image);
 }
 
 void ThumbnailPanel::flushPendingThumbs() {
@@ -828,8 +903,10 @@ void ThumbnailPanel::flushPendingThumbs() {
         }
         int pg = it.key();
         if (pg >= 0 && pg < n) {
-            if (auto* item = m_list->item(pg))
+            if (auto* item = m_list->item(pg)) {
+                if (item->icon().isNull()) ++m_dbgAccepted;
                 item->setIcon(QIcon(QPixmap::fromImage(it.value().second)));
+            }
             it = m_pendingThumbs.erase(it);
         } else {
             ++it;
@@ -856,7 +933,7 @@ void ThumbnailPanel::buildBookmarks() {
 
     auto future = QtConcurrent::run([doc, myGen, this]() -> QVector<BmEntry> {
         QVector<BmEntry> entries;
-        QMutexLocker lock(&s_pdfiumMutex);
+        TimedPdfiumLock lock(__FILE__, __LINE__);
         if (m_bookmarkGen.loadAcquire() != myGen) return entries;
 
         std::function<void(FPDF_BOOKMARK, int)> walk;
@@ -977,7 +1054,7 @@ void ThumbnailPanel::buildContentTree() {
             if (m_contentGen.loadAcquire() != myGen) break;
             QString preview;
             {
-                QMutexLocker lock(&s_pdfiumMutex);
+                TimedPdfiumLock lock(__FILE__, __LINE__);
                 if (m_contentGen.loadAcquire() != myGen) break;
                 FPDF_PAGE page = FPDF_LoadPage(doc, i);
                 if (page) {
@@ -1037,7 +1114,7 @@ void ThumbnailPanel::buildProperties() {
     auto future = QtConcurrent::run([doc, myGen, this]() -> Props {
         Props p;
         auto getMeta = [&](const char* tag) -> QString {
-            QMutexLocker lk(&s_pdfiumMutex);
+            TimedPdfiumLock lk(__FILE__, __LINE__);
             if (m_propsGen.loadAcquire() != myGen) return {};
             unsigned long len = FPDF_GetMetaText(doc, tag, nullptr, 0);
             if (!len) return {};
@@ -1046,7 +1123,7 @@ void ThumbnailPanel::buildProperties() {
             return QString::fromUtf16(
                 reinterpret_cast<const char16_t*>(buf.data())).trimmed();
         };
-        { QMutexLocker lk(&s_pdfiumMutex); FPDF_GetFileVersion(doc, &p.fileVersion); }
+        { TimedPdfiumLock lk(__FILE__, __LINE__); FPDF_GetFileVersion(doc, &p.fileVersion); }
         p.title    = getMeta("Title");
         p.author   = getMeta("Author");
         p.subject  = getMeta("Subject");

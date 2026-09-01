@@ -7,13 +7,39 @@
 #include <QString>
 #include <QMutex>
 #include <QMap>
+#include <QElapsedTimer>
+#include <QThread>
+#include <QCoreApplication>
+#include <QDebug>
 #include <cmath>
 #include <vector>
 #include <cstdio>
 
 extern QMutex s_pdfiumMutex;
 
+// Qt 6.8 QMutexLocker la template, khong co AdoptLock ctor. Lop nay nhan mot khoa
+// DA DUOC lock (vi du tryLock thanh cong) va giai phong o MOI duong thoat (RAII),
+// dong thoi cho phep `unlock()` chu dong truoc khi xong viec (dung cho doan sau
+// lock khong can thiet). Goi unlock() lan thu hai / huy la no-op an toan.
+class AdoptedPdfiumLock {
+    QMutex* m;
+public:
+    explicit AdoptedPdfiumLock(QMutex* mutex) : m(mutex) {}
+    ~AdoptedPdfiumLock() { if (m) m->unlock(); }
+    void unlock() { if (m) { m->unlock(); m = nullptr; } }
+    AdoptedPdfiumLock(const AdoptedPdfiumLock&) = delete;
+    AdoptedPdfiumLock& operator=(const AdoptedPdfiumLock&) = delete;
+};
+
 AnnotationLayer::AnnotationLayer(QObject* parent) : QObject(parent) {}
+
+QString AnnotationLayer::insertStampImage(int pageIndex, const QImage& image,
+                                          QRectF rectDisp) {
+    if (!m_annotMgr) return QString();
+    m_lastCreatedUid = m_annotMgr->insertStampImage(pageIndex, image, rectDisp);
+    if (!m_lastCreatedUid.isEmpty()) emit annotationAdded(pageIndex);
+    return m_lastCreatedUid;
+}
 
 void AnnotationLayer::setDocument(FPDF_DOCUMENT doc) { m_doc = doc; }
 
@@ -43,19 +69,51 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         m_lastCreatedUid = m_annotMgr->generateUid();
         FPDFAnnot_SetStringValue(a, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
     };
+    // Chup index + snapshot NGAY TRUOC dong annot/invalidate: annot vua tao nam cuoi
+    // danh sach (/Annots). Neu de sau commit goi findAnnotIndexByUid thi phai re-load
+    // ca trang (2 giay tren trang nang) vi vua invalidate.
+    auto captureCreated = [&](FPDF_PAGE pg) {
+        int nc = FPDFPage_GetAnnotCount(pg);
+        m_lastCreatedIndex = nc - 1;
+        m_lastCreatedSnapshot = m_annotMgr
+            ? m_annotMgr->snapshotAnnot_locked(pg, pageIndex, m_lastCreatedIndex)
+            : AnnotSnapshot();
+    };
     auto setTool = [&](FPDF_ANNOTATION a) {
         QString tn = QString::fromLatin1(toolName(tool));
         FPDFAnnot_SetStringValue(a, "TRTOOL", reinterpret_cast<FPDF_WIDESTRING>(tn.utf16()));
     };
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    if (!s_pdfiumMutex.tryLock(3000)) {
+        qDebug().noquote() << "[annot] BAN qua lau (lock pdfium >3s) — bo qua thao tac nay page=" << pageIndex;
+        return;
+    }
+    AdoptedPdfiumLock lock(&s_pdfiumMutex);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     double pageH  = FPDF_GetPageHeight(page);
     double pageW  = FPDF_GetPageWidth(page);
     int    rot    = FPDFPage_GetRotation(page);
     const QPointF box = pdfBoxOrigin(page);
+
+    // Do thoi gian TUNG BUOC cua commit de biet buoc nao cham (owner yeu cau).
+    QElapsedTimer _t; _t.start();
+    qint64 _stepSum = 0;
+    auto _mark = [&](const char* s) {
+        qint64 seg = _t.restart();
+        _stepSum += seg;
+        qDebug().noquote() << "[markup] buoc=" << s << "ms=" << seg;
+    };
+    auto _tong = [&]() {
+        qDebug().noquote() << "[markup] buoc=tong ms=" << _stepSum;
+    };
 
     // Line & Arrow → INK annotation. A bare FPDF_ANNOT_LINE (no /L, no AP) is dropped on save.
     if (tool == AnnotTool::Line || tool == AnnotTool::Arrow) {
@@ -101,15 +159,20 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
         setUid(ink);
         setTool(ink);
+        _mark("taoAnnot");
         AnnotVisual _av;
         bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ink, pageIndex, _av);
+        _mark("sinhAP");
+        captureCreated(page);
         FPDFPage_CloseAnnot(ink);
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        _mark("invalidate");
         lock.unlock();
         if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
         if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
+        _mark("emit");
+        _tong();
         return;
     }
 
@@ -142,15 +205,20 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ink, 0.0f, 0.0f, style.strokeWidth);
         setUid(ink);
         setTool(ink);
+        _mark("taoAnnot");
         AnnotVisual _av;
         bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ink, pageIndex, _av);
+        _mark("sinhAP");
+        captureCreated(page);
         FPDFPage_CloseAnnot(ink);
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        _mark("invalidate");
         lock.unlock();
         if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
         if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
+        _mark("emit");
+        _tong();
         return;
     }
 
@@ -204,15 +272,20 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         FPDFAnnot_SetBorder(ck, 0.0f, 0.0f, style.strokeWidth);
         setUid(ck);
         setTool(ck);
+        _mark("taoAnnot");
         AnnotVisual _av;
         bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, ck, pageIndex, _av);
+        _mark("sinhAP");
+        captureCreated(page);
         FPDFPage_CloseAnnot(ck);
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        _mark("invalidate");
         lock.unlock();
         if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
         if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
+        _mark("emit");
+        _tong();
         return;
     }
 
@@ -272,6 +345,8 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         float rw = r - l, rh = t - b;
         if (rw < 1.0f && rh < 1.0f) {
             FPDFText_ClosePage(textPage);
+            m_lastCreatedIndex = -1;
+            m_lastCreatedSnapshot = AnnotSnapshot();
             FPDFPage_CloseAnnot(annot);
             lock.unlock();
             return;
@@ -292,15 +367,20 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         }
         setUid(annot);
         setTool(annot);
+        _mark("taoAnnot");
         AnnotVisual _av;
         bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, annot, pageIndex, _av);
+        _mark("sinhAP");
+        captureCreated(page);
         FPDFPage_CloseAnnot(annot);
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        _mark("invalidate");
         lock.unlock();
         if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
         if (_avOk) emit annotVisualAdded(pageIndex, _av);
         emit annotationAdded(pageIndex);
+        _mark("emit");
+        _tong();
         return;
     }
 
@@ -357,16 +437,21 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
             reinterpret_cast<FPDF_WIDESTRING>(kNewComment));
     }
 
-    setUid(annot);
-    setTool(annot);
-    AnnotVisual _av;
-    bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, annot, pageIndex, _av);
-    FPDFPage_CloseAnnot(annot);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
-    lock.unlock();
+        setUid(annot);
+        setTool(annot);
+        _mark("taoAnnot");
+        AnnotVisual _av;
+        bool _avOk = m_annotMgr && m_annotMgr->buildVisual(page, annot, pageIndex, _av);
+        _mark("sinhAP");
+        captureCreated(page);
+        FPDFPage_CloseAnnot(annot);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        _mark("invalidate");
+        lock.unlock();
 
-    if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
-    if (_avOk) emit annotVisualAdded(pageIndex, _av);
-    emit annotationAdded(pageIndex);
-}
+        if (m_annotMgr) m_annotMgr->bumpPageRevision(pageIndex);
+        if (_avOk) emit annotVisualAdded(pageIndex, _av);
+        emit annotationAdded(pageIndex);
+        _mark("emit");
+        _tong();
+    }

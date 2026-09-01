@@ -14,6 +14,7 @@
 #include "core/PdfDocument.h"
 #include "core/PdfRenderer.h"
 #include "core/TileCacheFile.h"
+#include "core/VectorCacheFile.h"
 #include "core/ThumbnailRenderPool.h"
 #include "core/TextSearch.h"
 #include "core/TextSelection.h"
@@ -69,25 +70,57 @@ struct DocTab {
     bool     annotScanInFlight = false;  // guards concurrent full annot scans
     QFuture<void> annotScanFuture;
     QFuture<void> annotVisualsFuture;    // rescan loadPageVisuals in flight (SPEC_NAV_INSTANT)
+    QFuture<void> annotPageFuture;       // loadPage background (VIỆC 1 SPEC_SMOOTH_123)
     QSet<int>     visualsScanning;       // trang dang co rescan chay (tranh trung lap)
     QHash<int, QList<AnnotInfo>> annotPageCache;
     QHash<int, bool> overlayCapablePage;   // cached per-page overlay capability
+    // 🔴 CO RIENG 2026-09-01: "overlay co ve HET moi annot cua trang nay khong".
+    // KHONG duoc gop vao `overlayCapablePage` — co do con phuc vu viec khac, ha no xuong
+    // lam SINGLE MAT MARKUP (da tra gia). Co nay CHI dung cho `canFastPath` (quyet dinh
+    // co can dung LOP BU cho chu thich ngoai hay khong).
+    QHash<int, bool> overlayVeHetPage;
     QHash<int, QList<AnnotVisual>> visualsCache;     // cached loadPageVisuals result per page
     QHash<int, quint32>            visualsRev;        // pageRevision at time of cache
     QHash<int, bool>               visualsHasForeign; // cached hasForeign per page
     QSet<int>        pagesNeedGenerate;     // pages needing FPDFPage_GenerateContent before save
     QString  originalPath;        // real on-disk file — Save target & tab name source
     bool     dirty = false;       // has unsaved in-memory edits (working copy != original)
+    // ── .torvec cache key (SPEC_PERF_HEAVYPAGE buoc B) ────────────────────────
+    // pdfPath = file dang duoc render (doc->filePath()); pdfHash bam MOT LAN o luc
+    // mo/mo lai, toi 4 cho build dung lai (KHONG bam lai file lon tren luong giao dien).
+    QString  pdfPath;             // file dang duoc render cho lop vector
+    uint64_t pdfHash = 0;         // hash cua pdfPath (da tinh san o luc mo)
     std::shared_ptr<VectorLayer> vecLayer;  // GPU vector overlay for heavy pages
     std::shared_ptr<ForeignAnnotLayer> fgnLayer;   // lop annot phan mem khac cho trang vector thuan
     QSet<int> fgnBuilding;                          // trang dang dung, tranh dung chong
+    // Trang da HOAN lop bu 1 lan vi chua co noi dung de ve (chot C3 2026-08-30).
+    // Xoa khi doi trang (moi lan hien duoc hoan lai toi da 1 lan — lan goi sau phai DUNG).
+    QSet<int> fgnDeferred;
     bool fgnRegionBuilding = false;
+    // 🔴 VIEc CHONG CRASH (30/08): fgnPending giu lop bu DANG BUILD (de goi cancel()),
+    //    fgnFuture la future cua tac vu lop bu. TRUOC khi dong/giai phong t->doc phai
+    //    cancelForeignAnnotTasks() — neu khong pdfium ghi vao doc da giai phong.
+    std::shared_ptr<ForeignAnnotLayer> fgnPending;
+    QFuture<bool> fgnFuture;
+    QFuture<bool> fgnRegionFuture;                  // future cua buildRegion dang chay
     int warmingPage = -1;
     QSet<int> vecBuilding;  // pages currently building vector layer (anti-duplicate)
+    // 🔴 Trang DA BI SUA trong phien nay (markup/di chuyen note...). Cache .torvec khoa theo
+    //    HASH FILE TREN DIA, ma sua trong bo nho thi hash KHONG doi => cache se tra ve hinh
+    //    CU va nuot moi chinh sua (loi 2026-08-19: keo comment, o chon di nhung hinh o lai).
+    //    Trang nam trong tap nay thi CAM dung cache .torvec cho toi khi dong tai lieu.
+    QSet<int> torvecDirty;
+    // Trang co markup KHONG overlay duoc (vi du trang co LINK => overlayCapable=false).
+    // Lop vector dung tu page object, khong chua annotation, nen nhung trang nay BAT BUOC
+    // phai lay raster (co FPDF_ANNOT) lam nen, neu khong markup se VO HINH.
+    QSet<int> forceRasterPages;
     QList<MarkupUndoEntry> undoStack;
     QList<MarkupUndoEntry> redoStack;
     QSet<int> ocrBusyPages;   // trang dang chay OCR o luong nen (tranh chay chong)
     bool ocrAllBusy = false;  // OCR ca tai lieu dang chay
+    // Livelock fix (2026-08-31): trang dang co mot lan hen lai loadPage dang cho.
+    // Chi giu MOT lan hen lai cho mot trang, tranh hai vong hen lai song song.
+    QSet<int> annotRetryPending;
 
     // ── Search state rieng cua TUNG tai lieu (SPEC_SEARCH_STATE_R3) ──────
     // Moi DocTab giu ket qua tim kiem cua chinh minh — doi tab qua lai thay
@@ -115,12 +148,20 @@ public:
 
     void openFile(const QString& path);
 
+    // Probe-only: expose tab hien tai cho --contvec-probe (currentTab la private).
+    DocTab* currentTabForProbe() const { return currentTab(); }
+
     // Probe-only: lai che do xem tu dong lenh (dung cho --viewprobe).
     // centerXpt/centerYpt: toa do TRANG PDF (goc duoi-trai, don vi point).
     // Truyen NaN (mac dinh) = giu nguyen vi tri cuon nhu cu.
     void probeSetView(bool continuous, double zoomPercent, int page1Based,
                       double centerXpt = std::numeric_limits<double>::quiet_NaN(),
                       double centerYpt = std::numeric_limits<double>::quiet_NaN());
+
+    // Probe-only (--contvec-probe): cuon ContinuousView toi trang (0-based) roi bơm
+    // su kien de timers (scrollTimer/vecBuildTimer) chay het — dung de nghiem thu
+    // Viec A/B/C (nap lai cache .torvec khi quay lai trang nang). Chi cho harness.
+    void probeContScrollTo(int page);
 
     // Probe-only (--searchnav-test): tim kiem THAT roi "bam" ket qua thu
     // resultIdx1Based qua dung tin hieu searchResultSelected.
@@ -130,6 +171,42 @@ public:
     // Probe-only (--searchstate-test): nghiem thu 3 loi trang thai tim kiem.
     void probeSearchState(const QString& pathA, const QString& pathB, const QString& query,
                           bool continuous, double zoomPercent, int waitMs);
+
+    // Probe-only (--viewfast-probe, SPEC_VIEWFAST): set fast mode BEFORE openFile.
+    void probeSetFastMode(bool on) { setViewMode(on); }
+    // Bai do CUON (them 2026-08-31): can cuon that trong Continuous de ep dung tinh huong
+    // "render bi cat giua chung" — bai do dung yen khong bao gio cham toi nhanh do.
+    void probeScrollToPage(int p);   // dinh nghia trong .cpp (ContinuousView chi khai bao truoc o day)
+    void probeSetZoom(double z);      // dat zoom cho ContinuousView (bai do markup+zoom)
+    void probeSetZoomSingle(double z); // dat zoom cho view Single
+    // Bai do TAO ANNOT (2026-09-01): di DUNG duong ma nguoi dung di khi bam nut Note/Text.
+    bool probeCreateNote(int page, double xPt, double yPt);
+    bool probeCreateText(int page, double xPt, double yPt, double wPt, double hPt);
+    // 🔴 Chup DUNG khung nhin dang hoat dong. `QWidget::grab()` KHONG lay duoc noi dung ve
+    // bang GPU (QOpenGLWidget) — do duoc: so pixel giong het nhau qua moi luot, ke ca khi
+    // app that su co doi. Phai dung grabFramebuffer() cua chinh widget GL.
+    QImage probeGrabView();
+    int  probePageCount() const { return currentTab() ? currentTab()->doc->pageCount() : 0; }
+    // Probe-only (--viewfast-probe): navigate to a page (0-based) via onPageChanged.
+    void probeSetPage(int page0Based);
+    // Probe-only (--viewfast-probe): trang dang xem o che do hien tai.
+    int probeCurrentPage() const;
+    bool probeIsFastMode() const { return m_fastMode; }
+    QString probeMemBreakdown() const;   // bai do bo nho 31/08
+    void    probeCloseTab(int idx) { onTabClose(idx); }
+    // Probe-only (--viewfast-twodoc-probe): kich hoat tab doc theo chi so 0-based
+    // (giong nguoi dung bam vao tab thu idx) de mo 2 tai lieu cung luc o View Fast.
+    void probeActivateTab(int idx);
+    // Probe-only (SPEC_THUMB_DISPLAY 31/08): don so thumbnail that GAN duoc vao list
+    // cua panel hien tai + so trang cua tab dang hien. In ra de chung minh
+    // m_dbgAccepted == pageCount cho moi tab (khong dem "thumb done" nua).
+    QString probeThumbCounters() const;
+    void    probeResetThumbCounters();
+    // Nghiém thu co polling (SPEC_THUMB_DISPLAY 31/08): kich hoat tab idx, quay
+    // vong den khi list cua no DAY du trang (hoac het timeout). Khong phu thuoc
+    // vao thoi gian mo/dung file (file A0 75 trang rat chậm) => khong flaky.
+    // Tra ve "VERIFY tab=<i> pages=<n> VISIBLE=<v> <OK|TIMEOUT>".
+    QString probeThumbVerify(int tabIdx, int timeoutMs);
 
     // Chup cua so ra pngPath + ghi dump mau ra txtPath (dung cho --uiprobe va
     // phim tat Ctrl+Shift+F12). errOut: ly do khi tra ve false.
@@ -202,10 +279,15 @@ signals:
     void ocrProgress(int pageIndex1Based, int totalPages);
     // Mot trang OCR xong (de panel cap nhat "Recognized (N words)").
     void ocrPageFinished(int pageIndex, int words);
+    // "Trang nay DA HIEN RA tren man hinh" — duoc phat cho ca duong raster (pageReady)
+    // va duong vector (setTabVectorLayer). Dung cho harness va cho cho nao can biet
+    // trang da san sang MA KHONG quan tam no hien bang raster hay vector.
+    void pageDisplayed(int pageIndex);
 
 private:
-    void setupActionBar();
-    void applyTheme(bool dark);
+     void setupActionBar();
+     void setViewMode(bool fastMode);
+     void applyTheme(bool dark);
     void syncSidebarToTab(int idx, bool forceRebuild = false);
     DocTab* currentTab() const;
     void showThumbnailContextMenu(int pageIndex, QPoint globalPos);
@@ -231,14 +313,15 @@ private:
     ContinuousView*  m_continuousView = nullptr;
     QSplitter*       m_splitter      = nullptr;
 
-    QAction*   m_continuousAct = nullptr;
-    QAction*   m_selectTextAct = nullptr;
-    QAction*   m_translateAct  = nullptr;
-    QAction*   m_darkAct       = nullptr;
-    QLineEdit* m_zoomEdit      = nullptr;
-    QLabel*    m_hintLabel     = nullptr;
-    bool       m_darkMode      = false;
-    bool       m_continuousMode = false;
+QAction*   m_viewQualityAct = nullptr;
+     QAction*   m_viewFastAct = nullptr;
+     QAction*   m_selectTextAct = nullptr;
+     QAction*   m_translateAct  = nullptr;
+     QAction*   m_darkAct       = nullptr;
+     QLineEdit* m_zoomEdit      = nullptr;
+     QLabel*    m_hintLabel     = nullptr;
+     bool       m_darkMode      = false;
+     bool       m_fastMode = true;   // owner chot 2026-08-31: mac dinh Continuous (View Fast)
     std::unique_ptr<PdfEditor>  m_editor;
     TextSearch*                 m_textSearch    = nullptr;
     FindBar*                    m_findBar       = nullptr;
@@ -268,6 +351,9 @@ private:
     void onAnnotPick(DocTab* t, int page, const QPointF& pt);
     void onAnnotContext(DocTab* t, int page, const QPointF& pt, const QPoint& gpos);
     void onAnnotMove(DocTab* t, int page, double dx, double dy);
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): chen anh thanh Stamp + co gian.
+    void onInsertImage();
+    void onAnnotResize(DocTab* t, int page, QRectF newRectDisp);
     // Day trang thai chon xuong CA HAI view (gpu + continuous) cho khop dien mao.
     void setMarkupSelectionViews(DocTab* t, int page, const QRectF& rectPdf,
                                  const QString& uid, const QString& type);
@@ -323,16 +409,40 @@ private:
     void refreshAnnotVisuals(DocTab* t, int page);
     // Áp kết quả visuals vào renderer + view (cả 2 view). Dùng chung cho đường
     // CACHE HIT (sync) và đường RESCAN (async, áp lại trên UI thread).
+    void vaVungChuThich(DocTab* t, int page, const QList<AnnotVisual>& visuals);
     void applyAnnotVisuals(DocTab* t, int page,
                            const QList<AnnotVisual>& visuals,
                            bool overlayCapable, bool hasForeign);
     bool canFastPath(DocTab* t, int page) const;
     bool baseIsVector(DocTab* t, int page) const;
+    // Nen lop vector of the view ACTUALLY drawing: Single = t->vecLayer, Continuous =
+    // ContinuousView::m_vecLayers. Root of "Comment mat" (30-08) if missing.
+    bool pageBaseIsVector(DocTab* t, int page) const;
+    // Trang co markup khong overlay duoc (canFastPath false) thi phai ve bang raster:
+    // lop vector lam nen se chan raster (drop reason=vectorReady) va markup VO HINH.
+    // Danh dau trang + go lop vector ra ngay neu dang dung.
+    void forceRasterPage(DocTab* t, int pg);
+    // R2 (SPEC_PERF_HEAVYPAGE): gan lop vector cho view + cap nhat chan raster full-quality.
+    // Lop ready+complete cua trang hien tai => huy lenh full-quality dang chay + chan lenh moi.
+    // Lop moi thay the lop cua trang khac => bo chan trang cu (raster quay lai binh thuong).
+    void setTabVectorLayer(DocTab* t, std::shared_ptr<VectorLayer> layer, int pg);
+    // Cac viec phai lam KHI TRANG DA HIEN RA, bat ke no hien bang raster hay bang lop vector.
+    // Duong raster goi tu handler pageReady; duong vector goi tu setTabVectorLayer.
+    void finishPageDisplay(DocTab* t, int idx);
+    // R3 (SPEC_PERF_HEAVYPAGE muc R3.2): tam dung thumbnail khi mo file de trang
+    // dang xem dung s_pdfiumMutex cho ban dung vector cua CHINH trang do. Kem dong
+    // ho an toan 3s tu go tam dung bat ke ban dung vector co xong hay khong.
+    void pauseThumbnails(DocTab* t);
+    // Chi tab DANG HIEN moi duoc render thumbnail. Thumbnail cua tab an khong ai nhin
+    // ma van an khoa pdfium toan cuc, lam moi thao tac cua nguoi dung phai xep hang sau
+    // no (do that 2026-08-19: 94 giay render thumbnail, 30 cai bi vut thang).
+    void syncThumbnailPoolsToActiveTab();
 
-    const QList<AnnotInfo>& annotsForPage(DocTab* t, int page);
+    const QList<AnnotInfo>& annotsForPage(DocTab* t, int page, bool* outOk = nullptr);
     void invalidateAnnotPage(DocTab* t, int page);
     void buildVectorLayer(DocTab* t, int pageIndex, bool force = false);
     void ensureForeignAnnotLayer(DocTab* t, int pageIndex);
+    void cancelForeignAnnotTasks(DocTab* t);  // cancel+wait cac tac vu lop bu truoc khi dong doc
     // annotsForPage returns a reference into the cache — DO NOT retain it
     // across any call that may invalidate the cache (invalidateAnnotPage,
     // removeAnnot, refreshAnnotVisuals, refreshCommentsForPage, etc.).

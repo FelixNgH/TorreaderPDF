@@ -2,6 +2,7 @@
 #include <QObject>
 #include <QPointF>
 #include <QVector>
+#include <QImage>
 #include "annotations/AnnotationTypes.h"
 #include "annotations/AnnotationManager.h"
 #include <fpdfview.h>
@@ -17,7 +18,12 @@ public:
     void setAnnotationManager(AnnotationManager* mgr) { m_annotMgr = mgr; }
     void commitAnnotation(int pageIndex, AnnotTool tool, const AnnotStyle& style,
                           QPointF start, QPointF end, const QVector<QPointF>& freehand);
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): chen PNG trong suot thanh Stamp
+    // annot. rectDisp o toa do hien thi. Tra TRUID neu xong, rong neu that bai.
+    QString insertStampImage(int pageIndex, const QImage& image, QRectF rectDisp);
     QString lastCreatedUid() const { return m_lastCreatedUid; }
+    int lastCreatedIndex() const { return m_lastCreatedIndex; }
+    AnnotSnapshot lastCreatedSnapshot() const { return m_lastCreatedSnapshot; }
 
 signals:
     void annotationAdded(int pageIndex);
@@ -27,4 +33,6 @@ private:
     FPDF_DOCUMENT m_doc = nullptr;
     AnnotationManager* m_annotMgr = nullptr;
     QString m_lastCreatedUid;
+    int m_lastCreatedIndex = -1;
+    AnnotSnapshot m_lastCreatedSnapshot;
 };

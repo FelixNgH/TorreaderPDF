@@ -1,6 +1,7 @@
 #include "TextSelection.h"
 #include "PdfCoords.h"
 #include "PageCache.h"
+#include "PdfiumLock.h"
 #include <QMutex>
 #include <QList>
 #include <QChar>
@@ -18,9 +19,10 @@ namespace TextSelection {
 PageInfo pageFor(FPDF_DOCUMENT doc, int page) {
     PageInfo out;
     if (!doc || page < 0) return out;
-    QMutexLocker lk(&s_pdfiumMutex);
+    TimedPdfiumLock lk(__FILE__, __LINE__);
     FPDF_PAGE pg = PageCache::acquire(doc, page);
     if (!pg) return out;
+    out.borrow.borrow(doc, page);   // R1: cap doi acquire() — release tu dong khi PageInfo het scope
     FPDF_TEXTPAGE tp = PageCache::textPage(doc, page);
     if (!tp) return out;
     PageCache::PageMeta meta;
@@ -46,13 +48,19 @@ PageInfo pageForCached(FPDF_DOCUMENT doc, int page) {
 
 void closePage(FPDF_DOCUMENT doc, int page) {
     if (!doc || page < 0) return;
-    QMutexLocker lk(&s_pdfiumMutex);
+    TimedPdfiumLock lk(__FILE__, __LINE__);
     PageCache::invalidate(doc, page);
 }
 
 void closeDocument(FPDF_DOCUMENT doc) {
     if (!doc) return;
-    QMutexLocker lk(&s_pdfiumMutex);
+    // 🔴 VIỆC 1: GUI chi duoc tryLock(0). Khong lay duoc thi bo qua —
+    // PdfDocument::close cung goi PageCache::forgetDocument.
+    TryPdfiumLock lk(__FILE__, __LINE__);
+    if (!lk.held()) {
+        qDebug().noquote() << "[textsel] closeDocument SKIP — khoa ban";
+        return;
+    }
     PageCache::forgetDocument(doc);
 }
 
@@ -69,13 +77,13 @@ QRectF pageRectToDispPt(const PageInfo& info, const QRectF& r) {
 
 int charIndexAt(FPDF_TEXTPAGE tp, double x, double y, double tolX, double tolY) {
     if (!tp) return -1;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     return FPDFText_GetCharIndexAtPos(tp, x, y, tolX, tolY);
 }
 
 int nearestCharAt(FPDF_TEXTPAGE tp, double x, double y, double tolY) {
     if (!tp) return -1;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     const int total = FPDFText_CountChars(tp);
     if (total <= 0) return -1;
     // Tim DONG (line rect) chua y (dung CountRects+GetRect — cung nguon su
@@ -108,7 +116,7 @@ int nearestCharAt(FPDF_TEXTPAGE tp, double x, double y, double tolY) {
 QVector<QRectF> rectsForRange(FPDF_TEXTPAGE tp, int start, int count) {
     QVector<QRectF> out;
     if (!tp || count <= 0) return out;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     const int n = FPDFText_CountRects(tp, start, count);
     for (int i = 0; i < n; ++i) {
         double l = 0, t = 0, r = 0, b = 0;
@@ -129,7 +137,7 @@ QVector<QRectF> rectsForRangeDisp(const PageInfo& info, int start, int count) {
 
 QString textForRange(FPDF_TEXTPAGE tp, int start, int count) {
     if (!tp || count <= 0) return QString();
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     std::vector<unsigned short> buf(static_cast<size_t>(count + 1), 0);
     if (FPDFText_GetText(tp, start, count, buf.data()) < 0) return QString();
     return QString::fromUtf16(buf.data());
@@ -139,7 +147,7 @@ void wordRange(FPDF_TEXTPAGE tp, int idx, int* start, int* count) {
     *start = 0;
     *count = 0;
     if (!tp || idx < 0) return;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     const int total = FPDFText_CountChars(tp);
     if (idx >= total) return;
     auto isSpace = [&](int i) -> bool {
@@ -160,7 +168,7 @@ void lineRange(FPDF_TEXTPAGE tp, int idx, int* start, int* count) {
     *start = 0;
     *count = 0;
     if (!tp || idx < 0) return;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     const int total = FPDFText_CountChars(tp);
     if (idx >= total) return;
     double l = 0, b = 0, r = 0, t = 0;
@@ -194,7 +202,7 @@ QHash<int, QVector<QRectF>> rangeRectsByPageDisp(FPDF_DOCUMENT doc,
         const PageInfo info = pageFor(doc, p);
         if (!info.tp) continue;
         int total = 0;
-        { QMutexLocker lock(&s_pdfiumMutex); total = FPDFText_CountChars(info.tp); }
+        { TimedPdfiumLock lock(__FILE__, __LINE__); total = FPDFText_CountChars(info.tp); }
         const int s = (p == anchorPage) ? anchorChar : 0;
         const int e = (p == focusPage) ? focusChar : total - 1;
         if (s < 0 || e < s || e >= total) continue;
@@ -212,7 +220,7 @@ QString rangeText(FPDF_DOCUMENT doc,
         const PageInfo info = pageFor(doc, p);
         if (!info.tp) continue;
         int total = 0;
-        { QMutexLocker lock(&s_pdfiumMutex); total = FPDFText_CountChars(info.tp); }
+        { TimedPdfiumLock lock(__FILE__, __LINE__); total = FPDFText_CountChars(info.tp); }
         const int s = (p == anchorPage) ? anchorChar : 0;
         const int e = (p == focusPage) ? focusChar : total - 1;
         if (s < 0 || e < s || e >= total) continue;

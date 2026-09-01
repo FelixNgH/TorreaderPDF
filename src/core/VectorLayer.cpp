@@ -7,11 +7,36 @@
 #include <QHash>
 #include <QElapsedTimer>
 #include <QDebug>
+#include <QDataStream>
 #include <QVarLengthArray>
+#include <QThread>
+#include <QCoreApplication>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 
 extern QMutex s_pdfiumMutex;
+
+// Do lat cho VectorLayer::build nha s_pdfiumMutex. QUET A/B do that tren trang
+// 2.540.585 path (2026-08-19), cot "dung hinh" la [stall] lon nhat:
+//   100ms -> build 5295ms, yields=13, dung hinh 578ms
+//   250ms -> build 3992ms, yields=5,  dung hinh 563ms   <= CHON
+//   500ms -> build 3873ms, yields=2,  dung hinh 647ms
+//  1000ms -> build 3831ms, yields=1,  dung hinh 647ms
+// Dung hinh KHONG tang theo do dai lat (vi luong chinh khong con doi khoa pdfium o
+// giai doan nay nua), nen chon lat du dai de build nhanh ma van con nhuong dinh ky.
+// Chinh theo luot bang bien moi truong TORREADER_VECTOR_SLICE_MS.
+static int vecSliceMsFromEnv() {
+    static const int v = [] {
+        bool ok = false;
+        int p = qgetenv("TORREADER_VECTOR_SLICE_MS").toInt(&ok);
+        int r = (ok && p > 0) ? p : 250;
+        qDebug().noquote() << "[vector] sliceMs=" << r;
+        return r;
+    }();
+    return v;
+}
 
 static std::atomic<quint64> s_uidCounter{1};
 
@@ -44,6 +69,263 @@ void VectorLayer::clear() {
     m_buildObjCount = 0;
 }
 
+// ── Serialize .torvec (SPEC_PERF_HEAVYPAGE) ────────────────────────────────
+// Dinh dang: tat ca little-endian, ghi thang khong nen. Magic 8 byte
+// "TORVEC01" + quint32 formatVersion(=1) + cac truong vo huong + cac mang POD.
+// KHONG ghi m_uid: uid la MOI moi lan nap (uid dinh danh the hien trong phien,
+// khong phai du lieu cache). Anh tile ghi theo TUNG DONG (constScanLine +
+// bytesPerLine) — KHONG gia dinh stride hai ben bang nhau.
+namespace {
+const char   kTorvecMagic[9] = "TORVEC01";   // 8 byte + NUL
+const quint32 kTorvecVersion = 1;
+
+constexpr qint64 kRawChunk = 1 << 20;
+
+bool wrRaw(QIODevice& dev, const char* p, qint64 n) {
+    qint64 done = 0;
+    while (done < n) {
+        qint64 chunk = qMin<qint64>(n - done, kRawChunk);
+        if (dev.write(p + done, chunk) != chunk) return false;
+        done += chunk;
+    }
+    return true;
+}
+bool rdRaw(QIODevice& dev, char* p, qint64 n) {
+    qint64 done = 0;
+    while (done < n) {
+        qint64 chunk = qMin<qint64>(n - done, kRawChunk);
+        qint64 got = dev.read(p + done, chunk);
+        if (got <= 0) return false;
+        done += got;
+    }
+    return true;
+}
+
+// quy doi LE cho dung kieu vo huong dung: quint8, qint32, quint32, float, double.
+#define WR_LE_INT(T) \
+    static bool wrLE(QIODevice& dev, T v) { \
+        unsigned char b[sizeof(T)]; \
+        for (int i = 0; i < int(sizeof(T)); ++i) \
+            b[i] = (unsigned char)((v >> (8 * i)) & 0xff); \
+        return dev.write(reinterpret_cast<const char*>(b), int(sizeof(T))) == int(sizeof(T)); \
+    } \
+    static bool rdLE(QIODevice& dev, T& v) { \
+        unsigned char b[sizeof(T)]; \
+        if (dev.read(reinterpret_cast<char*>(b), int(sizeof(T))) != int(sizeof(T))) return false; \
+        v = 0; \
+        for (int i = 0; i < int(sizeof(T)); ++i) \
+            v |= (T(b[i]) << (8 * i)); \
+        return true; \
+    }
+WR_LE_INT(quint8)
+WR_LE_INT(quint32)
+WR_LE_INT(quint64)
+WR_LE_INT(qint32)
+#undef WR_LE_INT
+
+static bool wrLE(QIODevice& dev, float v)  { quint32 u; std::memcpy(&u, &v, 4); return wrLE(dev, u); }
+static bool wrLE(QIODevice& dev, double v) { quint64 u; std::memcpy(&u, &v, 8); return wrLE(dev, u); }
+static bool rdLE(QIODevice& dev, float& v)  { quint32 u; if (!rdLE(dev, u)) return false; std::memcpy(&v, &u, 4); return true; }
+static bool rdLE(QIODevice& dev, double& v) { quint64 u; if (!rdLE(dev, u)) return false; std::memcpy(&v, &u, 8); return true; }
+
+template<typename T>
+bool wrPOD(QIODevice& dev, const QVector<T>& v) {
+    if (!wrLE(dev, (quint64)v.size())) return false;
+    return wrRaw(dev, reinterpret_cast<const char*>(v.constData()),
+                 (qint64)sizeof(T) * (qint64)v.size());
+}
+template<typename T>
+bool rdPOD(QIODevice& dev, QVector<T>& v) {
+    quint64 n = 0;
+    if (!rdLE(dev, n)) return false;
+    v.resize(int(n));
+    return rdRaw(dev, reinterpret_cast<char*>(v.data()),
+                 (qint64)sizeof(T) * (qint64)v.size());
+}
+} // namespace
+
+bool VectorLayer::saveTo(QIODevice& dev) const {
+    if (!dev.isWritable()) return false;
+    if (!wrRaw(dev, kTorvecMagic, 8)) return false;
+    if (!wrLE(dev, (quint32)kTorvecVersion)) return false;
+    if (!wrLE(dev, (quint8)(m_ready ? 1 : 0))) return false;
+    if (!wrLE(dev, (quint8)(m_complete ? 1 : 0))) return false;
+    if (!wrLE(dev, (qint32)m_page)) return false;
+    if (!wrLE(dev, (qint32)m_rotation)) return false;
+    if (!wrLE(dev, (double)m_pageSize.width())) return false;
+    if (!wrLE(dev, (double)m_pageSize.height())) return false;
+    if (!wrLE(dev, (qint32)m_fillOpaqueFloats)) return false;
+    if (!wrLE(dev, (quint32)m_tilesGen)) return false;
+    if (!wrLE(dev, (qint32)m_buildObjCount)) return false;
+
+    if (!wrPOD(dev, m_verts))  return false;
+    if (!wrPOD(dev, m_colors)) return false;
+    if (!wrPOD(dev, m_widths)) return false;
+    if (!wrPOD(dev, m_fillVerts))  return false;
+    if (!wrPOD(dev, m_fillColors)) return false;
+    if (!wrPOD(dev, m_depths))     return false;
+    if (!wrPOD(dev, m_fillDepths)) return false;
+    if (!wrPOD(dev, m_clipIdx))    return false;
+    if (!wrPOD(dev, m_fillClipIdx)) return false;
+    if (!wrPOD(dev, m_noteObjIdx)) return false;
+
+    if (!wrLE(dev, (quint64)m_clips.size())) return false;
+    for (const QRectF& r : m_clips) {
+        if (!wrLE(dev, (double)r.x())) return false;
+        if (!wrLE(dev, (double)r.y())) return false;
+        if (!wrLE(dev, (double)r.width())) return false;
+        if (!wrLE(dev, (double)r.height())) return false;
+    }
+
+    auto wrTiles = [&](const QVector<TextTile>& tiles) -> bool {
+        if (!wrLE(dev, (quint64)tiles.size())) return false;
+        for (const TextTile& t : tiles) {
+            if (!wrLE(dev, (double)t.rectPt.x())) return false;
+            if (!wrLE(dev, (double)t.rectPt.y())) return false;
+            if (!wrLE(dev, (double)t.rectPt.width())) return false;
+            if (!wrLE(dev, (double)t.rectPt.height())) return false;
+            if (!wrLE(dev, (float)t.depth)) return false;
+            if (!wrLE(dev, (float)t.clipIdx)) return false;
+            if (!wrLE(dev, (quint32)t.color)) return false;
+            if (!wrLE(dev, (quint8)(t.isAlpha ? 1 : 0))) return false;
+            if (!wrLE(dev, (quint8)(t.isNote ? 1 : 0))) return false;
+            const QImage& img = t.img;
+            if (img.isNull() || img.width() <= 0 || img.height() <= 0) {
+                if (!wrLE(dev, (qint32)0)) return false;
+                if (!wrLE(dev, (qint32)0)) return false;
+                if (!wrLE(dev, (qint32)0)) return false;
+                if (!wrLE(dev, (quint64)0)) return false;
+                continue;
+            }
+            const int  w  = img.width();
+            const int  h  = img.height();
+            const int  bpl = img.bytesPerLine();
+            const qint64 byteCount = (qint64)bpl * h;
+            if (!wrLE(dev, (qint32)w))  return false;
+            if (!wrLE(dev, (qint32)h))  return false;
+            if (!wrLE(dev, (qint32)int(img.format()))) return false;
+            if (!wrLE(dev, (quint64)byteCount)) return false;
+            for (int y = 0; y < h; ++y)
+                if (!wrRaw(dev, reinterpret_cast<const char*>(img.constScanLine(y)), bpl))
+                    return false;
+        }
+        return true;
+    };
+    if (!wrTiles(m_texts))  return false;
+    if (!wrTiles(m_images)) return false;
+    return true;
+}
+
+bool VectorLayer::loadFrom(QIODevice& dev) {
+    clear();
+    if (!dev.isReadable()) return false;
+
+    char magic[8];
+    if (!rdRaw(dev, magic, 8)) return false;
+    if (std::memcmp(magic, kTorvecMagic, 8) != 0) return false;
+    quint32 version = 0;
+    if (!rdLE(dev, version)) return false;
+    if (version != kTorvecVersion) return false;
+
+    quint8 ready = 0, complete = 0;
+    qint32 page = 0, rotation = 0, fillOpaque = 0, buildObjCount = 0;
+    double pw = 0, ph = 0;
+    quint32 tilesGen = 0;
+    if (!rdLE(dev, ready) || !rdLE(dev, complete) || !rdLE(dev, page)
+        || !rdLE(dev, rotation) || !rdLE(dev, pw) || !rdLE(dev, ph)
+        || !rdLE(dev, fillOpaque) || !rdLE(dev, tilesGen) || !rdLE(dev, buildObjCount))
+        return false;
+    m_ready = (ready != 0);
+    m_complete = (complete != 0);
+    m_page = page;
+    m_rotation = rotation;
+    m_pageSize = QSizeF(pw, ph);
+    m_fillOpaqueFloats = fillOpaque;
+    m_tilesGen = tilesGen;
+    m_buildObjCount = buildObjCount;
+
+    if (!rdPOD(dev, m_verts))  return false;
+    if (!rdPOD(dev, m_colors)) return false;
+    if (!rdPOD(dev, m_widths)) return false;
+    if (!rdPOD(dev, m_fillVerts))  return false;
+    if (!rdPOD(dev, m_fillColors)) return false;
+    if (!rdPOD(dev, m_depths))     return false;
+    if (!rdPOD(dev, m_fillDepths)) return false;
+    if (!rdPOD(dev, m_clipIdx))    return false;
+    if (!rdPOD(dev, m_fillClipIdx)) return false;
+    if (!rdPOD(dev, m_noteObjIdx)) return false;
+
+    quint64 nClips = 0;
+    if (!rdLE(dev, nClips)) return false;
+    m_clips.reserve(int(nClips));
+    for (quint64 i = 0; i < nClips; ++i) {
+        double x = 0, y = 0, w = 0, h = 0;
+        if (!rdLE(dev, x) || !rdLE(dev, y) || !rdLE(dev, w) || !rdLE(dev, h)) return false;
+        m_clips.append(QRectF(x, y, w, h));
+    }
+
+    auto rdTiles = [&](QVector<TextTile>& tiles) -> bool {
+        quint64 n = 0;
+        if (!rdLE(dev, n)) return false;
+        tiles.reserve(int(n));
+        for (quint64 i = 0; i < n; ++i) {
+            TextTile t;
+            double x = 0, y = 0, w = 0, h = 0;
+            if (!rdLE(dev, x) || !rdLE(dev, y) || !rdLE(dev, w) || !rdLE(dev, h)) return false;
+            t.rectPt = QRectF(x, y, w, h);
+            if (!rdLE(dev, t.depth)) return false;
+            if (!rdLE(dev, t.clipIdx)) return false;
+            quint32 color = 0;
+            if (!rdLE(dev, color)) return false;
+            t.color = QRgb(color);
+            quint8 alpha = 0, note = 0;
+            if (!rdLE(dev, alpha) || !rdLE(dev, note)) return false;
+            t.isAlpha = (alpha != 0);
+            t.isNote  = (note != 0);
+            qint32 iw = 0, ih = 0, ifmt = 0;
+            quint64 byteCount = 0;
+            if (!rdLE(dev, iw) || !rdLE(dev, ih) || !rdLE(dev, ifmt) || !rdLE(dev, byteCount))
+                return false;
+            if (iw > 0 && ih > 0) {
+                QImage::Format qf = QImage::Format(ifmt);
+                QImage img(iw, ih, qf);
+                if (img.isNull()) return false;   // format khong hop le
+                const int bpl = img.bytesPerLine();
+                if (byteCount != (quint64)bpl * ih) return false;   // stride khong khop
+                for (int yy = 0; yy < ih; ++yy)
+                    if (!rdRaw(dev, reinterpret_cast<char*>(img.scanLine(yy)), bpl))
+                        return false;
+                t.img = img;
+            } else {
+                if (byteCount != 0 || iw != 0 || ih != 0) return false;
+                t.img = QImage();
+            }
+            tiles.append(t);
+        }
+        return true;
+    };
+    if (!rdTiles(m_texts))  return false;
+    if (!rdTiles(m_images)) return false;
+    return true;
+}
+
+qint64 VectorLayer::approxBytes() const {
+    qint64 s = (qint64)m_verts.size() * sizeof(float)
+             + m_colors.size()
+             + (qint64)m_widths.size() * sizeof(float)
+             + (qint64)m_fillVerts.size() * sizeof(float)
+             + m_fillColors.size()
+             + (qint64)m_depths.size() * sizeof(float)
+             + (qint64)m_fillDepths.size() * sizeof(float)
+             + (qint64)m_clipIdx.size() * sizeof(float)
+             + (qint64)m_fillClipIdx.size() * sizeof(float)
+             + (qint64)m_clips.size() * sizeof(QRectF)
+             + (qint64)m_noteObjIdx.size() * sizeof(int);
+    for (const TextTile& t : m_texts)  s += t.img.sizeInBytes();
+    for (const TextTile& t : m_images) s += t.img.sizeInBytes();
+    return s;
+}
+
 static float polyArea2(const QVector<QPointF>& p) {
     double a = 0;
     for (int i = 0, n = p.size(); i < n; ++i) {
@@ -67,9 +349,20 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     clear();
     QElapsedTimer t;
     t.start();
-    // Trang muon TU PageCache (chu so huu duy nhat) — khong tu Close. Caller giu s_pdfiumMutex.
+    // Ben goi KHONG duoc giu s_pdfiumMutex; ham nay tu khoa va NHA theo lat.
+    // Trang muon TU PageCache (chu so huu duy nhat) — khong tu Close.
+    QElapsedTimer _w; _w.start();
+    std::unique_ptr<QMutexLocker<QMutex>> lk =
+        std::make_unique<QMutexLocker<QMutex>>(&s_pdfiumMutex);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at VectorLayer::build acquire" << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(doc, pageIndex);
     if (!page) return false;
+    // R1: cap doi acquire() — tu dong release o moi duong thoat (return som giua chung).
+    // GIU SUOT HAM — trang KHONG bi duoi trong luc ta nha khoa giua moi slice.
+    PageCache::PageBorrow _borrow(doc, pageIndex);
 
     // FPDF_GetPageWidth/Height DA ap /Rotate -> day la co HIEN THI, KHONG phai co hop crop.
     double pageW = FPDF_GetPageWidth(page);
@@ -402,7 +695,25 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     clipTriCache.reserve(1024);   // bot rehash -> bot rui ro con tro treo
     int dbgClipPolyBuilt = 0, dbgFillClipped = 0, dbgFillClipBail = 0;
     int dbgClipPtr = 0, dbgClipNoGeom = 0, dbgClipTooBig = 0;
+    const int kVecSliceMs = vecSliceMsFromEnv();
+    int dbgYields = 0;
+    QElapsedTimer sliceTimer; sliceTimer.start();
     for (int oi = 0; oi < nObj; ++oi) {
+        if (sliceTimer.elapsed() >= kVecSliceMs) {
+            lk.reset();                     // nha s_pdfiumMutex
+            // NGU 1ms chu khong yield: QMutex khong cong bang (barging), yield xong ta lay
+            // lai khoa ngay va ke dang xep hang van doi mai (da DO: yields=13 ma luong chinh
+            // van cho 3556ms). Ngu that moi nhuong duoc.
+            QThread::msleep(1);
+            QElapsedTimer _w; _w.start();
+            lk = std::make_unique<QMutexLocker<QMutex>>(&s_pdfiumMutex);
+            if (_w.elapsed() > 300)
+                qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                                   << "at VectorLayer::build slice" << "main="
+                                   << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
+            sliceTimer.restart();
+            ++dbgYields;
+        }
         curDepth = 1.0f - float(oi + 1) / float(nObj + 1);
         FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, oi);
         if (!obj) continue;
@@ -918,6 +1229,7 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                            << "segClipped=" << dbgSegClipped
                            << "segRescued=" << dbgSegRescued
                            << "strokeSkipped=" << dbgStrokeSkipped
+                           << "yields=" << dbgYields
                           << "complete=" << (complete ? 1 : 0)
                          << "completeReason=" << completeReason
                        << "ms=" << t.elapsed();

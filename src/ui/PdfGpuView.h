@@ -22,6 +22,7 @@
 #include "annotations/AnnotationTypes.h"
 #include "annotations/AnnotationManager.h"
 #include "core/VectorLayer.h"
+#include "core/VectorGpuRenderer.h"
 #include "core/ForeignAnnotLayer.h"
 #include "core/PdfLinks.h"
 #include "core/TextSelection.h"
@@ -63,6 +64,14 @@ public:
 
     // Accept a partial (in-progress) render from ProgressiveRenderTask
     void showPartial(int page, double scale, QImage img);
+    // Bai do bo nho 31/08: view nay giu 6 QImage + 1 lop vector, MOI TAB mot bo,
+    // va van giu nguyen KE CA khi dang o che do Continuous (view bi an).
+    qint64 bytesHeldImages() const {
+        auto B = [](const QImage& i){ return qint64(i.sizeInBytes()); };
+        return B(m_lastImage) + B(m_pendingImage) + B(m_pendingPartImg)
+             + B(m_sharpImage) + B(m_placeholder) + B(m_fgnRegImg);
+    }
+    qint64 bytesVectorLayer() const;
 
     void setZoom(double scale);
     void centerPage();
@@ -78,12 +87,17 @@ public:
     void setHighlights(const QList<QRectF>& all, int currentIdx);
     void clearHighlights();
 
+    void setVectorAnnotSafe(int page, bool safe);  // xem PdfGpuView.cpp: bat bien nen-vector
     void setAnnotVisuals(const QList<AnnotVisual>& visuals);
     void clearAnnotVisuals();
     void addPendingMarkup(AnnotTool tool, const AnnotStyle& style, QPointF a, QPointF b, const QVector<QPointF>& freehand = {});
     void clearPendingMarkups();
     void setSelectedAnnot(const QRectF& rectPdf);
     void clearSelectedAnnot();
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): cho phep co gian bang 4 tay nam
+    // goc. Goi tu MainWindow khi annot dang chon la Stamp cua TorReader.
+    void setSelectResizable(bool on);
+    bool selectResizable() const { return m_selResizable; }
     void setDragTarget(const QString& uid, const QString& ghostText,
                        float fontSizePt, const QColor& ghostColor);
     void clearDragTarget();
@@ -106,6 +120,7 @@ public:
     void setPlaceholder(const QImage& img);
 
     QSize currentPageImageSize() const;
+    QSizeF pageSizePt() const { return m_pageSizePt; }
 
     double   zoom()        const { return m_zoom; }
     int      currentPage() const { return m_pageIndex; }
@@ -142,6 +157,9 @@ signals:
     void annotationPickRequested(int pageIndex, QPointF pdfPoint);
     void annotationContextRequested(int pageIndex, QPointF pdfPoint, QPoint globalPos);
     void annotationMoveRequested(int pageIndex, double dx, double dy);
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): ket thuc keo tay nam goc.
+    // newRectDisp o toa do hien thi (Y-down). MainWindow chuyen sang /Rect PDF.
+    void annotationResizeRequested(int pageIndex, QRectF newRectDisp);
     void signatureRectPicked(int pageIndex, QRectF rectPt);
     void freehandCommitRequested(int pageIndex, const QVector<QPointF>& points);
     // Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE). MainWindow ghi vao
@@ -172,7 +190,24 @@ protected:
 private:
     void uploadTexture(const QImage& img);
     QMatrix4x4 computeTransform() const;
+    int        m_vecCovFloorLoc = -1;
+    // San do duc cho net mong hon 1px.
+    // 🔴 0.15 (cu) = ve "dung vat ly": net mong hon 1px thi nhat di theo ty le. Nghe hop ly
+    //    nhung tren ban ve CAD thu nho thi net 0,25pt ra mau xam ~217 tren nen trang => LUOI
+    //    TRUC, COT, DAM gan nhu TANG HINH. PDFium ve hairline DAC, va do la thu app hien thi
+    //    truoc khi co lop vector — nguoi dung nhan ra ngay ("nhin hoi nhat nhat", 2026-08-19).
+    //    Do duoc: muc (dien tich net) 17,81% -> 17,99% (gan nhu khong doi => KHONG dong vao
+    //    hinh hoc, hatch, be rong net), chi do sang trang 246,4 -> 230,8.
+    //    Owner chot 0.85 sau khi so hai anh cung mot vung.
+    //    Chinh theo luot bang bien moi truong TORREADER_VEC_COV_FLOOR (0..1).
+    //    Thumbnail luon dung 0.90 rieng (xem renderVectorThumbnail).
+    float      m_vecCovFloor = []{
+                   bool ok = false;
+                   const float v = qEnvironmentVariable("TORREADER_VEC_COV_FLOOR").toFloat(&ok);
+                   return (ok && v >= 0.0f && v <= 1.0f) ? v : 0.85f;
+               }();
     QMatrix4x4 vectorTransform() const;
+    QMatrix4x4 vectorTransform(int vpW, int vpH, double zoom, QPointF orig) const;
     QPointF pageOrigin() const;
 
     // GL resources
@@ -206,9 +241,24 @@ private:
     QVector<GLuint> m_tileTexText;
     QVector<GLuint> m_tileTexImg;
     quint32 m_tileTexGen = 0xFFFFFFFFu;
+    quint64 m_tileTexUid = 0;   // uid cua VectorLayer da nap texture — doi lop la phai cap lai
     GLuint m_tileVao = 0;
     bool    shouldUseVectorOverlay() const;
+    // "Trang co noi dung de thao tac" — KHONG dong nghia voi "co anh raster".
+    // Trang thuan vector (R2 + cache .torvec) co noi dung day du ma m_hasImage van false.
+    // Dung cho cac CONG TUONG TAC (chuot, cong cu ve, chon chu, link).
+    // KHONG dung cho cho nao thuc su doc m_lastImage / m_texture.
+    bool hasPageContent() const { return m_hasImage || shouldUseVectorOverlay(); }
+    // R3: ve lop vector hien tai ra anh co thumbnail bang GPU (KHONG dung PDFium).
+    // Tra QImage rong neu chua co lop vector day du cho trang hien tai.
+    // 🔴 PHAI goi tren LUONG GIAO DIEN — can GL context cua widget.
+public:
+    QImage  renderVectorThumbnail(double scale);
+private:
     void    drawVectorOverlay();
+    // Ban CO THAM SO: ve lop vector vao viewport bat ky (cua so HOAC framebuffer rieng).
+    // Tach ra tu drawVectorOverlay() de dung lai cho thumbnail GPU (R3).
+    void    drawVectorContent(int vpW, int vpH, double zoom, QPointF orig, qreal dprIn);
     void    drawPageBase(bool pureVector);
     void    drawSharpRegion(QPainter& p, const QPointF& orig, bool pureVector);
     void    drawForeignAnnotLayers(QPainter& p, const QPointF& orig, double pw, double ph, bool pureVector);
@@ -216,6 +266,9 @@ private:
     mutable bool m_vecLastOverlayState = false; // ponytail: tracks last shouldUseVectorOverlay result for logging
     bool    m_vecDrawLogged = false;             // ponytail: log first successful vector draw only
     double  m_lastTileLogZoom = -1;
+
+    VectorGpuRenderer m_vgrUnified;
+    bool              m_vgrUnifiedInit = false;
 
     // Pending upload
     QImage  m_pendingImage;
@@ -256,6 +309,15 @@ private:
     // Annotation selection rect (markup move/resize)
     QRectF m_selRect;
     bool   m_hasSel = false;
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): co gian bang tay nam goc.
+    bool    m_selResizable   = false;   // annot dang chon co tay nam hay khong
+    int     m_resizingCorner = -1;      // 0=TL,1=TR,2=BR,3=BL, -1=khong keo
+    QRectF  m_resizeOrigRect;
+    // Tra ve toa do (hien thi, Y-down) cua tay nam goc `corner` cua m_selRect.
+    QPointF selHandlePos(int corner) const;
+    int     handleAt(const QPointF& dispPt) const;
+    // Tinh rect moi theo con tro dang keo tay nam `corner`; giu ty le tru khi Shift.
+    QRectF  resizeRectFor(int corner, const QPointF& dragDisp, bool keepAspect) const;
 
     // ── Chon chu theo chi so ky tu (SPEC_TEXTSEL_ADOBE) ────────────────────
     bool    m_selDragging   = false;
@@ -316,6 +378,7 @@ private:
 
     // Overlays (drawn via QPainter on top of GL)
     QList<AnnotVisual>      m_annotVisuals;
+    QHash<int, bool>        m_vecAnnotSafe;   // trang -> nen vector co nuot markup khong
     QList<QRectF>           m_highlights;
     int                     m_currentHighlightIdx = -1;
     QVector<PendingMarkup>  m_pendingMarkups;

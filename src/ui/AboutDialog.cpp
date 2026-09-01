@@ -100,23 +100,15 @@ AboutDialog::AboutDialog(bool dark, QWidget* parent) : QDialog(parent) {
     aLayout->setSpacing(10);
     aLayout->setContentsMargins(24, 20, 24, 20);
 
-    // Logo card dung mau nen phu cua theme (den o Dark, trang o Light) — khong
-    // con mang trang choi giua nen den. Da kiem resources/icons: KHONG co bien
-    // the logo toi, nen chi doi nen card, khong tu lat mau anh bang code.
-    auto* logoCard = new QLabel;
+    // 🔴 2026-09-01 (owner): BO ANH LOGO — anh bi be hinh khi phong to trong hop About.
+    // Thay bang CHU "TorReader PDF" co lon, can giua. Chu vector nen sac o moi do phan giai
+    // va moi ty le man hinh, khong bao gio be hinh nhu anh bitmap.
+    auto* logoCard = new QLabel(QStringLiteral("TorReader PDF"));
     logoCard->setAlignment(Qt::AlignCenter);
     logoCard->setStyleSheet(
-        QStringLiteral("background: %1; border-radius: 10px; padding: 10px 20px;")
-            .arg(t.bgAlt));
-    QPixmap logo(":/icons/TorReader.ico");
-    if (!logo.isNull())
-        logoCard->setPixmap(logo.scaledToHeight(80, Qt::SmoothTransformation));
-    else {
-        logoCard->setText("TorReader PDF");
-        logoCard->setStyleSheet(logoCard->styleSheet() +
-            QStringLiteral("font-size: 20px; font-weight: bold; color: %1;")
-                .arg(t.accent));
-    }
+        QStringLiteral("background: %1; border-radius: 10px; padding: 18px 20px;"
+                       "font-size: 34px; font-weight: 700; letter-spacing: 0.5px; color: %2;")
+            .arg(t.bgAlt, t.accent));
     aLayout->addWidget(logoCard);
 
     auto* versionLabel = new QLabel(QStringLiteral("TorReader PDF — Version %1").arg(QStringLiteral(FELIXPDF_VERSION)));

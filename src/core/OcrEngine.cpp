@@ -1,5 +1,6 @@
 #include "OcrEngine.h"
 #include "PdfCoords.h"
+#include "PdfiumLock.h"
 #include <fpdf_edit.h>
 #include <QCoreApplication>
 #include <QDir>
@@ -118,7 +119,7 @@ QVector<OcrWord> OcrEngine::recognizePage(FPDF_DOCUMENT doc, int pageIndex,
     int effDpi = dpi; // tinh that o trong khoi mutex duoi day; giu ngoai de con dung khi quy doi px->pt
     std::vector<unsigned char> buf;
     {
-        QMutexLocker lock(&s_pdfiumMutex);
+        TimedPdfiumLock lock(__FILE__, __LINE__);
         FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
         if (!page) return out;
         wPt = FPDF_GetPageWidth(page);

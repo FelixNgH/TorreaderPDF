@@ -1,6 +1,7 @@
 #pragma once
 #include <QWidget>
 #include <QHash>
+#include <QSet>
 #include <QtGlobal>
 
 class QLabel;
@@ -64,6 +65,9 @@ private:
     void updateButtonState();
     void applyPanelTheme();
     void elideStatus();
+    // Dam bao bo dem "trang co chu" da co gia tri cho trang hien tai (kiem o
+    // LUONG NEN qua QtConcurrent — SPEC_PERF_HEAVYPAGE, xem OcrPanel.cpp).
+    void ensureHasTextKnown();
 
 protected:
     void resizeEvent(QResizeEvent* e) override;
@@ -78,6 +82,7 @@ private:
     bool         m_hasRun      = false;   // da chay OCR lan nao -> nut "Re-recognize"
     bool         m_dark        = false;
     QHash<int,int> m_wordsByPage;         // page -> so tu OCR
+    QSet<int>      m_hasTextChecking;     // trang dang kiem "co chu" o luong nen
 
     QLabel*       m_status      = nullptr;
     QString       m_statusFull;           // chu day du truoc khi elide

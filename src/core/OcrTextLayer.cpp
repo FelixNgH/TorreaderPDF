@@ -1,4 +1,5 @@
 #include "OcrTextLayer.h"
+#include "PdfiumLock.h"
 #include <QByteArray>
 #include <QFile>
 #include <QHash>
@@ -63,7 +64,7 @@ static void ensureRegistries() {
 }
 
 bool OcrTextLayer::pageDone(FPDF_DOCUMENT doc, int pageIndex) {
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     ensureRegistries();
     const auto it = g_ocrDonePages->constFind(doc);
     return it != g_ocrDonePages->cend() && it->contains(pageIndex);
@@ -106,7 +107,7 @@ int OcrTextLayer::insertPage(FPDF_DOCUMENT doc, int pageIndex,
                              const QVector<OcrWord>& words) {
     if (!doc || words.isEmpty()) return 0;
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     ensureRegistries();
     QSet<int>& done = (*g_ocrDonePages)[doc];
     if (done.contains(pageIndex)) return 0;   // trang da OCR — khong lam hai lan

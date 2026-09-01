@@ -3,6 +3,7 @@
 #include <QSizeF>
 #include <QRectF>
 #include <QImage>
+#include <QIODevice>
 #include <QtGlobal>
 #include <atomic>
 #include <fpdfview.h>
@@ -46,6 +47,12 @@ public:
     int rotation() const { return m_rotation; }
     int translateNoteTiles(const QRectF& hitRect, const QPointF& d);
     quint32 tilesGeneration() const { return m_tilesGen; }
+    // Ghi/doc TOAN BO trang thai da dung ra mot luong nhi phan. Dung cho cache .torvec.
+    // Tra false neu loi I/O hoac phien ban dinh dang khong khop.
+    bool saveTo(QIODevice& dev) const;
+    bool loadFrom(QIODevice& dev);
+    // Tong so byte du lieu (uoc luong) — de ben goi quyet dinh co dang cache khong.
+    qint64 approxBytes() const;
 private:
     quint64 m_uid;
     bool    m_ready = false;

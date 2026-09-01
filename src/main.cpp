@@ -19,6 +19,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <memory>
 #ifndef TORREADER_NO_PDFIUM
 #include "ui/MainWindow.h"
 #include "ui/AboutDialog.h"
@@ -35,6 +36,8 @@
 #include "core/VectorLayer.h"
 #include "core/PdfCoords.h"
 #include "core/PdfLinks.h"
+#include "core/PageCache.h"
+#include "core/PdfiumLock.h"
 #include "annotations/AnnotationManager.h"
 #include "annotations/AnnotationLayer.h"
 #include "annotations/AnnotationTypes.h"
@@ -60,6 +63,7 @@ extern QMutex s_pdfiumMutex;
 #include <QEventLoop>
 #include <QDir>
 #include <QImage>
+#include <QImageWriter>
 #include <QPixmap>
 #include <QMap>
 #include <QFileDialog>
@@ -171,6 +175,23 @@ int main(int argc, char* argv[]) {
     app.setApplicationVersion(FELIXPDF_VERSION);
     app.setOrganizationName("Loc Nguyen Huy");
     app.setOrganizationDomain("torreader.cloud");
+
+    // Do-luong: bat cac lan luong chinh bi chan > nguong. Chi bat khi co bien moi truong.
+    if (!qEnvironmentVariableIsEmpty("TORREADER_STALL_WATCH")) {
+        bool okThr = false;
+        int thrMs = qEnvironmentVariable("TORREADER_STALL_WATCH").toInt(&okThr);
+        if (!okThr || thrMs < 50) thrMs = 300;
+        auto* stallTimer = new QTimer(&app);
+        auto lastTick = std::make_shared<QElapsedTimer>();
+        lastTick->start();
+        QObject::connect(stallTimer, &QTimer::timeout, &app, [lastTick, thrMs]() {
+            const qint64 gap = lastTick->restart();
+            if (gap > thrMs)
+                qDebug().noquote() << "[stall] main thread blocked ms=" << gap;
+        });
+        stallTimer->start(20);
+        qDebug().noquote() << "[stall] watchdog ON threshold=" << thrMs << "ms";
+    }
 
     // Ngay sau QApplication, truoc MainWindow: bat het log ra file.
     installTextLog();
@@ -329,6 +350,175 @@ int main(int argc, char* argv[]) {
             << " (expected>=6, got " << found << ")\n";
         out.flush();
         return (okLoad && found >= 6) ? 0 : 1;
+    }
+
+    // usage: --imgstamp-test <out.pdf>
+    // Headless self-check cua Insert Image (SPEC_INSERT_IMAGE_2026-08-30). Dung
+    // DUNG duong code that: AnnotationManager::insertStampImage -> save -> reopen.
+    // Chay lai logic Gate 1 (1 Stamp + /AP + /Rect trong page) va Gate 2 (anh PNG
+    // trong suot GIU kenh alpha: vung trong suot khi render lai phai bang nen trang,
+    // KHONG phai khoi den/trang duc). In [imgstamp] + ket qua IMGSTAMP_TEST.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--imgstamp-test")) {
+        const QString outPath = QString::fromLocal8Bit(argv[2]);
+        QTextStream out(stdout);
+        PdfDocument::libAddRef();
+
+        // Trang moi 612x792, khong xoay => display == pdf (chi lat Y).
+        FPDF_DOCUMENT doc = FPDF_CreateNewDocument();
+        FPDF_PAGE np = FPDFPage_New(doc, 0, 612, 792);
+        FPDFPage_GenerateContent(np);
+        FPDF_ClosePage(np);
+
+        // Anh chân ly: 128x64, phia trai ~75% do duc, phia phai 25% TRONG SUOT.
+        QImage src(128, 64, QImage::Format_ARGB32_Premultiplied);
+        src.fill(Qt::transparent);
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 96; ++x)
+                src.setPixelColor(x, y, QColor(220, 40, 40, 255));
+
+        AnnotationManager mgr;
+        mgr.setDocument(doc, outPath);
+        // rect o toa do hien thi (Y-down), khong xoay.
+        QRectF rectDisp(200.0, 250.0, 180.0, 90.0);
+        const QString uid = mgr.insertStampImage(0, src, rectDisp);
+        if (uid.isEmpty()) {
+            out << "[imgstamp] FAIL: insertStampImage tra rong, err="
+                << mgr.lastError() << "\n";
+            out.flush();
+            FPDF_CloseDocument(doc);
+            PdfDocument::libRelease();
+            return 1;
+        }
+        if (!mgr.saveDocument()) {
+            out << "[imgstamp] FAIL: saveDocument err=" << mgr.lastError() << "\n";
+            out.flush();
+            FPDF_CloseDocument(doc);
+            PdfDocument::libRelease();
+            return 1;
+        }
+        FPDF_CloseDocument(doc);
+
+        // ── Gate 1: mo lai, dem Stamp + /AP + /Rect ─────────────────────────
+        FPDF_DOCUMENT doc2 = FPDF_LoadDocument(outPath.toUtf8().constData(), nullptr);
+        if (!doc2) {
+            out << "[imgstamp] FAIL reopen\n"; out.flush();
+            FPDF_CloseDocument(doc2);
+            PdfDocument::libRelease();
+            return 1;
+        }
+        int stampCount = 0, hasAPCount = 0;
+        QRectF stampRect;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc2, 0);
+            if (!p) { out << "[imgstamp] FAIL load page\n"; out.flush(); FPDF_CloseDocument(doc2); PdfDocument::libRelease(); return 1; }
+            const int n = FPDFPage_GetAnnotCount(p);
+            for (int i = 0; i < n; ++i) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, i);
+                if (!a) continue;
+                if (FPDFAnnot_GetSubtype(a) == FPDF_ANNOT_STAMP) {
+                    ++stampCount;
+                    if (FPDFAnnot_HasKey(a, "AP")) ++hasAPCount;
+                    FS_RECTF r{};
+                    if (FPDFAnnot_GetRect(a, &r))
+                        stampRect = QRectF(r.left, r.bottom, r.right - r.left, r.top - r.bottom);
+                }
+                FPDFPage_CloseAnnot(a);
+            }
+            FPDF_ClosePage(p);
+        }
+        const double pageW = 612.0, pageH = 792.0;
+        const bool rectInPage = (stampRect.width() > 0 && stampRect.height() > 0
+                                 && stampRect.left() >= 0 && stampRect.top() <= pageH
+                                 && stampRect.right() <= pageW && stampRect.bottom() >= 0);
+        out << "[imgstamp] Gate1 stamp=" << stampCount << " hasAP=" << hasAPCount
+            << " rect=(" << stampRect.x() << "," << stampRect.y() << " "
+            << stampRect.width() << "x" << stampRect.height() << ") inPage="
+            << (rectInPage ? 1 : 0) << "\n";
+        out.flush();
+
+        // ── Gate 2: render 60dpi, do pixel vung trong suot ──────────────────
+        const double dpi = 60.0 / 72.0;
+        const int rw = int(612 * dpi), rh = int(792 * dpi);
+        auto px = [&](double pt) { return int(pt * dpi); };
+        // Vung trong suot cua anh nam o TOP-RIGHT cua stamp (phan trai trong anh
+        // do duc ~75%). Quy doi sang pixel render (display == pdf vi khong xoay).
+        const int x0 = px(rectDisp.left() + 135.0);   // 96/128 * 180 = 135
+        const int y0 = px(rectDisp.top());
+        const int x1 = px(rectDisp.right());
+        const int y1 = px(rectDisp.top() + rectDisp.height() / 4.0);   // 64/4
+        auto nonWhiteIn = [&](const QImage& im, int a0, int b0, int a1, int b1) {
+            qint64 c = 0;
+            for (int y = b0; y < b1 && y < im.height(); ++y)
+                for (int x = a0; x < a1 && x < im.width(); ++x) {
+                    const QColor cpx = im.pixelColor(x, y);
+                    if (qAbs(cpx.red() - 255) > 2 || qAbs(cpx.green() - 255) > 2
+                        || qAbs(cpx.blue() - 255) > 2)
+                        ++c;
+                }
+            return c;
+        };
+        qint64 nonWhiteTopRight = 0, nonWhiteLeft = 0, nonWhiteTopRightFull = 0;
+        bool hasAlphaInVisual = false;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            QImage limited(rw, rh, QImage::Format_ARGB32); limited.fill(Qt::white);
+            QImage full(rw, rh, QImage::Format_ARGB32);       full.fill(Qt::white);
+            FPDF_PAGE p = FPDF_LoadPage(doc2, 0);
+            if (p) {
+                FPDF_BITMAP bmp = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA,
+                                                      limited.bits(), limited.bytesPerLine());
+                FPDF_RenderPageBitmap(bmp, p, 0, 0, rw, rh, 0,
+                                      FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE);
+                FPDFBitmap_Destroy(bmp);
+                FPDF_BITMAP bmp2 = FPDFBitmap_CreateEx(rw, rh, FPDFBitmap_BGRA,
+                                                       full.bits(), full.bytesPerLine());
+                FPDF_RenderPageBitmap(bmp2, p, 0, 0, rw, rh, 0, FPDF_ANNOT);
+                FPDFBitmap_Destroy(bmp2);
+                FPDF_ClosePage(p);
+            }
+            nonWhiteTopRight    = nonWhiteIn(limited, x0, y0, x1, y1);
+            nonWhiteTopRightFull= nonWhiteIn(full, x0, y0, x1, y1);
+            nonWhiteLeft        = nonWhiteIn(limited, px(rectDisp.left()), px(rectDisp.top()),
+                                             px(rectDisp.left() + 60.0), px(rectDisp.bottom()));
+        }
+
+        // Overlay cung phai giu alpha (loadPageVisuals -> anh goc) — duong hien
+        // thi Single + Continuous.
+        {
+            AnnotationManager mgr2;
+            mgr2.setDocument(doc2, outPath);
+            bool ovCap = false; bool hasFgn = false;
+            const QList<AnnotVisual> vis = mgr2.loadPageVisuals(0, &ovCap, &hasFgn);
+            out << "[imgstamp] overlayCapable=" << (ovCap ? 1 : 0)
+                << " hasForeign=" << (hasFgn ? 1 : 0) << " visuals=" << vis.size() << "\n";
+            for (const AnnotVisual& av : vis) {
+                if (av.subtype != FPDF_ANNOT_STAMP) continue;
+                if (!av.image.isNull()) {
+                    // Vung trong suot cua nguon: pixel alpha=0 phai con ton tai.
+                    for (int y = 0; y < av.image.height(); ++y)
+                        for (int x = 0; x < av.image.width(); ++x)
+                            if (qAlpha(av.image.pixel(x, y)) == 0) { hasAlphaInVisual = true; break; }
+                }
+            }
+        }
+
+        out << "[imgstamp] Gate2 limitedNonWhite=" << nonWhiteTopRight
+            << " fullNonWhite=" << nonWhiteTopRightFull
+            << " redLeft=" << nonWhiteLeft
+            << " overlayKeepsAlpha=" << (hasAlphaInVisual ? 1 : 0) << "\n";
+        out.flush();
+        FPDF_CloseDocument(doc2);
+
+        const bool pass = (stampCount >= 1 && hasAPCount >= 1 && rectInPage
+                           && nonWhiteTopRight == 0 && nonWhiteLeft > 100
+                           && hasAlphaInVisual);
+        out << "IMGSTAMP_TEST " << (pass ? "PASS" : "FAIL")
+            << " stamp=" << stampCount << " hasAP=" << hasAPCount
+            << " alphaClean=" << nonWhiteTopRight << " overlayAlpha=" << hasAlphaInVisual << "\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return pass ? 0 : 1;
     }
 
     // usage: --markup-test <input.pdf>
@@ -729,9 +919,9 @@ int main(int argc, char* argv[]) {
             int w = qMax(1, static_cast<int>(pageW * scale / qMax(pageW, pageH)));
             int h = qMax(1, static_cast<int>(pageH * scale / qMax(pageW, pageH)));
 
-            // Start ThumbnailRenderPool on same file
+            // Start ThumbnailRenderPool on same file (R1: dung CHUNG doc voi renderer chinh)
             auto thumbPoolB = std::make_unique<ThumbnailRenderPool>();
-            bool poolOkB = thumbPoolB->open(inputPath);
+            bool poolOkB = thumbPoolB->open(inputPath, docB.raw());
             CHECK("B pool open", poolOkB);
             if (poolOkB) {
                 thumbPoolB->prefetchRange(0, docB.pageCount() - 1);
@@ -800,9 +990,9 @@ int main(int argc, char* argv[]) {
                     rendererC->setTileCache(tileCacheC);
             }
 
-            // Start ThumbnailRenderPool like the app does
+            // Start ThumbnailRenderPool like the app does (R1: dung CHUNG doc cua renderer)
             auto thumbPoolC = std::make_unique<ThumbnailRenderPool>();
-            if (thumbPoolC->open(inputPath)) {
+            if (thumbPoolC->open(inputPath, docC.raw())) {
                 thumbPoolC->prefetchRange(0, docC.pageCount() - 1);
                 QCoreApplication::processEvents();
                 QThread::msleep(500);
@@ -2269,8 +2459,13 @@ int main(int argc, char* argv[]) {
         }
         {
             ThumbnailRenderPool pool;
+            PdfDocument poolDoc;   // R1: pool dung CHUNG doc voi renderer — mo truoc de lay handle
+            if (!poolDoc.open(workPath)) {
+                out << "SAVEBENCH: FAIL open doc for thumbpool\n"; out.flush();
+                QFile::remove(workPath); PdfDocument::libRelease(); return 1;
+            }
             QElapsedTimer t; t.start();
-            if (!pool.open(workPath)) {
+            if (!pool.open(workPath, poolDoc.raw())) {
                 out << "SAVEBENCH: FAIL ThumbnailRenderPool open\n"; out.flush();
                 QFile::remove(workPath); PdfDocument::libRelease(); return 1;
             }
@@ -2709,6 +2904,109 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // ── fgnobj-probe: hop hinh hoc ben trong annot ngoai (FreeText/Square/Line) ──
+    // usage: TorReader.exe --fgnobj-probe <pdf_path> [page1based]
+    // Duyệt annot từng trang, in subtype / hasAP / TRUID / objCount / types object.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--fgnobj-probe")) {
+        QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        QList<int> pages;                      // pages 1-based; empty = quét cả tài liệu
+        for (int i = 3; i < argc; ++i)
+            pages << QString::fromLocal8Bit(argv[i]).toInt();
+
+        auto subtypeName = [](int t) -> QString {
+            switch (t) {
+            case FPDF_ANNOT_FREETEXT: return "FreeText";
+            case FPDF_ANNOT_SQUARE: return "Square";
+            case FPDF_ANNOT_CIRCLE: return "Circle";
+            case FPDF_ANNOT_LINE: return "Line";
+            case FPDF_ANNOT_INK: return "Ink";
+            case FPDF_ANNOT_STAMP: return "Stamp";
+            case FPDF_ANNOT_HIGHLIGHT: return "Highlight";
+            case FPDF_ANNOT_UNDERLINE: return "Underline";
+            case FPDF_ANNOT_STRIKEOUT: return "StrikeOut";
+            case FPDF_ANNOT_SQUIGGLY: return "Squiggly";
+            case FPDF_ANNOT_TEXT: return "Text";
+            case FPDF_ANNOT_LINK: return "Link";
+            case FPDF_ANNOT_POLYGON: return "Polygon";
+            case FPDF_ANNOT_POLYLINE: return "PolyLine";
+            case FPDF_ANNOT_CARET: return "Caret";
+            default: return "(" + QString::number(t) + ")";
+            }
+        };
+        auto objTypeName = [](int t) -> QString {
+            switch (t) {
+            case FPDF_PAGEOBJ_TEXT: return "TEXT";
+            case FPDF_PAGEOBJ_PATH: return "PATH";
+            case FPDF_PAGEOBJ_IMAGE: return "IMAGE";
+            case FPDF_PAGEOBJ_SHADING: return "SHADING";
+            case FPDF_PAGEOBJ_FORM: return "FORM";
+            default: return "UNKNOWN";
+            }
+        };
+
+        QTextStream out(stdout);
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(pdfPath.toUtf8().constData(), nullptr);
+        if (!doc) {
+            out << "[fgnobj] FAIL cannot open " << pdfPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        int pageCount = FPDF_GetPageCount(doc);
+        QList<int> scan = pages.isEmpty()
+            ? [&]{ QList<int> all; for (int i = 1; i <= pageCount; ++i) all << i; return all; }()
+            : pages;
+        int annotNgoaiCoAP = 0, trongDoObjCount0 = 0;
+        for (int p : scan) {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE page = FPDF_LoadPage(doc, p - 1);
+            if (!page) { out << "[fgnobj] page=" << p << " FAIL cannot load page\n"; out.flush(); continue; }
+            int n = FPDFPage_GetAnnotCount(page);
+            for (int i = 0; i < n; ++i) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+                if (!a) continue;
+                int sub = FPDFAnnot_GetSubtype(a);
+                int hasAP  = FPDFAnnot_HasKey(a, "AP") ? 1 : 0;
+                int truid  = FPDFAnnot_HasKey(a, "TRUID") ? 1 : 0;
+                int oc = FPDFAnnot_GetObjectCount(a);
+                QString types = "-";
+                if (oc > 0) {
+                    QHash<QString,int> g;
+                    for (int j = 0; j < oc; ++j) {
+                        FPDF_PAGEOBJECT o = FPDFAnnot_GetObject(a, j);
+                        if (o) g[objTypeName(FPDFPageObj_GetType(o))]++;
+                    }
+                    QStringList parts;
+                    for (auto it = g.constBegin(); it != g.constEnd(); ++it)
+                        parts << it.key() + "×" + QString::number(it.value());
+                    types = parts.join(",");
+                }
+                out << "[fgnobj] page=" << p << " idx=" << i << " subtype=" << subtypeName(sub)
+                    << " hasAP=" << hasAP << " truid=" << truid
+                    << " objCount=" << oc << " types=" << types << "\n";
+                out.flush();
+                if (truid == 0 && hasAP) {
+                    bool haveObj = false;
+                    for (int j = 0; j < oc; ++j) {
+                        if (FPDFAnnot_GetObject(a, j)) { haveObj = true; break; }
+                    }
+                    ++annotNgoaiCoAP;
+                    if (haveObj) ++trongDoObjCount0;
+                }
+                FPDFPage_CloseAnnot(a);
+            }
+            FPDF_ClosePage(page);
+        }
+        FPDF_CloseDocument(doc);
+        PdfDocument::libRelease();
+        int pct = annotNgoaiCoAP ? qRound(100.0 * trongDoObjCount0 / annotNgoaiCoAP) : 0;
+        out << "[fgnobj] TONG page=" << scan.size()
+            << " annotNgoaiCoAP=" << annotNgoaiCoAP
+            << " trongDoObjCount>0=" << trongDoObjCount0
+            << "  tyle=" << pct << "%\n";
+        out.flush();
+        return 0;
+    }
+
     // ── Render probe (headless measurement: resolution-bound vs content-bound) ──
     // usage: TorReader.exe --render-probe <pdf_path> <page_number_1based>
     if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--render-probe")) {
@@ -2732,7 +3030,9 @@ int main(int argc, char* argv[]) {
                 QMutexLocker lock(&s_pdfiumMutex);
                 QElapsedTimer timer;
                 timer.start();
-                page = FPDF_LoadPage(doc.raw(), pageNum - 1);
+                // R1 (SPEC_PERF_HEAVYPAGE): di qua PageCache de dem FPDF_LoadPage bang
+                // [pagecache] LOAD. Da giu s_pdfiumMutex nen goi acquire() hop le.
+                page = PageCache::acquire(doc.raw(), pageNum - 1);
                 loadPageMs = timer.elapsed();
             }
             if (!page) {
@@ -2740,6 +3040,8 @@ int main(int argc, char* argv[]) {
                 PdfDocument::libRelease();
                 return 1;
             }
+            // R1: cap doi acquire() — tu dong release khi het scope probe.
+            PageCache::PageBorrow _probeBorrow(doc.raw(), pageNum - 1);
 
             double pageW = 0, pageH = 0;
             {
@@ -2868,7 +3170,8 @@ int main(int argc, char* argv[]) {
             out << "RENDER_PROBE_OK\n";
             out.flush();
 
-            { QMutexLocker lock(&s_pdfiumMutex); FPDF_ClosePage(page); }
+            // Handle muon tu PageCache — KHONG FPDF_ClosePage (PdfDocument::close se
+            // goi PageCache::forgetDocument khi doc ra khoi pham vi).
         }
         PdfDocument::libRelease();
         return 0;
@@ -3998,8 +4301,13 @@ int main(int argc, char* argv[]) {
         PdfDocument::libAddRef();
 
         ThumbnailRenderPool pool;
+        PdfDocument poolDoc;   // R1: pool dung CHUNG doc voi renderer — mo truoc de lay handle
+        if (!poolDoc.open(inPath)) {
+            out << "THUMBBENCH: FAIL poolDoc.open\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
         QElapsedTimer t; t.start();
-        if (!pool.open(inPath)) {
+        if (!pool.open(inPath, poolDoc.raw())) {
             out << "THUMBBENCH: FAIL pool.open\n"; out.flush();
             PdfDocument::libRelease(); return 1;
         }
@@ -4059,7 +4367,7 @@ int main(int argc, char* argv[]) {
 
         // Step 2: open pool on pdfA, record epochA
         ThumbnailRenderPool poolA;
-        if (!poolA.open(pdfA)) { out << "THUMBEPOCH: FAIL poolA.open\n"; out.flush(); return 1; }
+        if (!poolA.open(pdfA, docA.raw())) { out << "THUMBEPOCH: FAIL poolA.open\n"; out.flush(); return 1; }
         quint64 epochA = poolA.epoch();
 
         // Step 3: set up panel with docA
@@ -4070,7 +4378,7 @@ int main(int argc, char* argv[]) {
 
         // Step 4: switch pool to pdfB, verify epoch advances
         poolA.close();
-        if (!poolA.open(pdfB)) { out << "THUMBEPOCH: FAIL poolA.open(pdfB)\n"; out.flush(); return 1; }
+        if (!poolA.open(pdfB, docB.raw())) { out << "THUMBEPOCH: FAIL poolA.open(pdfB)\n"; out.flush(); return 1; }
         quint64 epochB = poolA.epoch();
         if (epochB == epochA) {
             out << "THUMBEPOCH: FAIL epoch khong tang sau open()\n";
@@ -4122,7 +4430,7 @@ int main(int argc, char* argv[]) {
         // (forceRebuild=false + same pointers → must NOT rebuild list).
         panel.setDocument(&docA, &rendererA, &poolA, true);
         poolA.close();
-        if (!poolA.open(pdfA)) { out << "THUMBEPOCH: FAIL poolA.open(pdfA)\n"; out.flush(); return 1; }
+        if (!poolA.open(pdfA, docA.raw())) { out << "THUMBEPOCH: FAIL poolA.open(pdfA)\n"; out.flush(); return 1; }
         quint64 epochC = poolA.epoch();
         panel.debugResetCounters();
         panel.setDocument(&docA, &rendererA, &poolA, false);
@@ -4155,7 +4463,7 @@ int main(int argc, char* argv[]) {
         quint64 epochD = 0;
         {
             ThumbnailRenderPool poolD;
-            if (!poolD.open(pdfA)) { out << "THUMBEPOCH: FAIL poolD.open(pdfA)\n"; out.flush(); return 1; }
+            if (!poolD.open(pdfA, docA.raw())) { out << "THUMBEPOCH: FAIL poolD.open(pdfA)\n"; out.flush(); return 1; }
             epochD = poolD.epoch();
             const double pwA = docA.pageSize(0).width();
             const int imgWD = qMax(8, static_cast<int>(pwA * 0.2));
@@ -4233,7 +4541,7 @@ int main(int argc, char* argv[]) {
             return true;
         };
 
-        if (!pool.open(pdfA)) { out << "THUMBRELOAD: FAIL pool.open(pdfA)\n"; out.flush(); return 1; }
+        if (!pool.open(pdfA, docA.raw())) { out << "THUMBRELOAD: FAIL pool.open(pdfA)\n"; out.flush(); return 1; }
         panel.setDocument(&docA, &rendererA, &pool, true);
         QCoreApplication::processEvents();
         if (!runPhase("mo", pool, panel, 5)) return 1;
@@ -4241,13 +4549,13 @@ int main(int argc, char* argv[]) {
         pool.close();
         docA.close();
         docB.open(pdfB);
-        if (!pool.open(pdfB)) { out << "THUMBRELOAD: FAIL pool.open(pdfB) insert\n"; out.flush(); return 1; }
+        if (!pool.open(pdfB, docB.raw())) { out << "THUMBRELOAD: FAIL pool.open(pdfB) insert\n"; out.flush(); return 1; }
         panel.setDocument(&docB, &rendererB, &pool, true);
         QCoreApplication::processEvents();
         if (!runPhase("insert", pool, panel, 5)) return 1;
 
         pool.close();
-        if (!pool.open(pdfB)) { out << "THUMBRELOAD: FAIL pool.open(pdfB) save\n"; out.flush(); return 1; }
+        if (!pool.open(pdfB, docB.raw())) { out << "THUMBRELOAD: FAIL pool.open(pdfB) save\n"; out.flush(); return 1; }
         panel.setDocument(&docB, &rendererB, &pool, false);
         QCoreApplication::processEvents();
         if (!runPhase("save", pool, panel, 5)) return 1;
@@ -4335,10 +4643,18 @@ int main(int argc, char* argv[]) {
 
         // Cho du waitMs: file CAD lon render tien-dan, chup som ra vung xem
         // TRANG TRON (bai hoc 08-14).
-        const int loops = qMax(waitMs / 50, 1);
-        for (int i = 0; i < loops; ++i) {
-            QCoreApplication::processEvents();
-            QThread::msleep(50);
+        const bool realLoop = !qEnvironmentVariableIsEmpty("TORREADER_UIPROBE_REALLOOP");
+        qDebug().noquote() << "[uiprobe] waitMode=" << (realLoop ? "realloop" : "sleep50");
+        if (realLoop) {
+            QEventLoop _probeLoop;
+            QTimer::singleShot(waitMs, &_probeLoop, &QEventLoop::quit);
+            _probeLoop.exec();
+        } else {
+            const int loops = qMax(waitMs / 50, 1);
+            for (int i = 0; i < loops; ++i) {
+                QCoreApplication::processEvents();
+                QThread::msleep(50);
+            }
         }
 
         // Khong goi probeSelectSidebarTab rieng — shotTab duoc truyen vao probeSnapshot
@@ -4469,6 +4785,19 @@ int main(int argc, char* argv[]) {
             QThread::msleep(50);
         }
 
+        // 🔴 THEM 2026-09-01: tham so 11 = ZOOM THU HAI. Bai do cu chi DAT zoom mot lan roi
+        // chup, nen khong bao gio di qua thao tac ZOOM (huy render + doi ty le). Owner bao mat
+        // hinh khi "zoom xuong 50", ma dung yen o 50 thi van du net ⇒ loi nam o CHINH THAO TAC.
+        if (argc >= 11) {
+            const double z2 = QString::fromLocal8Bit(argv[10]).toDouble();
+            if (z2 > 0) {
+                fprintf(stdout, "VIEWPROBE: zoom lan 2 -> %.0f%%\n", z2);
+                fflush(stdout);
+                if (continuous) w.probeSetZoom(z2 / 100.0);
+                else            w.probeSetZoomSingle(z2 / 100.0);
+                for (int k = 0; k < 400; ++k) { QCoreApplication::processEvents(); QThread::msleep(25); }
+            }
+        }
         QPixmap pm = w.grab();
         QImage img = pm.toImage();
         if (img.isNull()) {
@@ -4481,6 +4810,750 @@ int main(int argc, char* argv[]) {
         }
 
         fprintf(stdout, "VIEWPROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --viewfast-probe <input.pdf> <out.png> [waitMs]
+    // Probe (SPEC_VIEWFAST 2026-08-31): mo file KHI DANG O View Fast, giong dung
+    // tinh huong goc (settle timer + requestPage trong khi fast mode). Kiem log
+    // khong con [lockhold] > 5000 / [render done] > 10000 / [lockwait main=1] > 1000.
+    // ── BAI DO DONG TAB (2026-08-31, kich ban owner) ───────────────────────────
+    // Owner do duoc: mo 3 tab, DONG 2 tab nang, RAM van con 4,5 GB.
+    // Bai nay tai hien y het: mo f1,f2,f3 -> do -> dong tab 0 va 1 -> do lai.
+    //   --tabclose-probe <f1> <f2> <f3> [waitMs=20000]
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--tabclose-probe")) {
+        auto strip = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"'))) return v.mid(1, v.size()-2);
+            return v;
+        };
+        QString f1 = strip(QString::fromLocal8Bit(argv[2]));
+        QString f2 = strip(QString::fromLocal8Bit(argv[3]));
+        QString f3 = strip(QString::fromLocal8Bit(argv[4]));
+        int waitMs = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 20000;
+        if (waitMs <= 0) waitMs = 20000;
+
+        MainWindow w; w.resize(1400, 900); w.show();
+        QCoreApplication::processEvents();
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+        auto dump = [&](const char* moc) {
+            long long ws = 0, pv = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+                ws = (long long)(pmc.WorkingSetSize / 1048576);
+                pv = (long long)(pmc.PrivateUsage   / 1048576);
+            }
+#endif
+            fprintf(stdout, "TABCLOSE[%s] WorkingSet=%lldMB RIENG=%lldMB | tai lieu mo=%d dong=%d"
+                            " | pool mo=%d dong=%d | trang mo=%d dong=%d\n",
+                    moc, ws, pv,
+                    g_pdfiumDocOpen.loadRelaxed(),  g_pdfiumDocClose.loadRelaxed(),
+                    g_pdfiumPoolOpen.loadRelaxed(), g_pdfiumPoolClose.loadRelaxed(),
+                    g_pdfiumPageOpen.loadRelaxed(), g_pdfiumPageClose.loadRelaxed());
+            fprintf(stdout, "%s\n", w.probeMemBreakdown().toLocal8Bit().constData());
+            fflush(stdout);
+        };
+
+        w.probeResetThumbCounters();
+        w.openFile(f1); spin(waitMs); dump("sau tab 1");
+        fprintf(stdout, "[COLD] %s\n", w.probeThumbCounters().toLocal8Bit().constData()); fflush(stdout);
+        w.probeResetThumbCounters();
+        w.openFile(f2); spin(waitMs); dump("sau tab 2");
+        fprintf(stdout, "[COLD] %s\n", w.probeThumbCounters().toLocal8Bit().constData()); fflush(stdout);
+        w.probeResetThumbCounters();
+        w.openFile(f3); spin(waitMs); dump("sau tab 3");
+        fprintf(stdout, "[COLD] %s\n", w.probeThumbCounters().toLocal8Bit().constData()); fflush(stdout);
+        // ── NGHIEM THU CO POLLING: switch to each tab and wait until its list is
+        // FULL (or timeout). Immune to how slow the huge A0 files open/render.
+        for (int tab = 0; tab < 3; ++tab) {
+            fprintf(stdout, "%s\n", w.probeThumbVerify(tab, 90000).toLocal8Bit().constData());
+            fflush(stdout);
+        }
+        // Moi lan mo file o tren LA mot lan doi tab that (openFile -> tab moi len
+        // dau bang -> setDocument), nen 3 dong [COLD] tren da chung minh ca 3 tab
+        // gan duoc dung so trang. Khong can vong bam-tab nua (no da duoc path
+        // openFile bao pham va tung do ra nhan tab sai o ban cu).
+        // dong 2 tab NANG (index 0 va 1) — dong index 0 hai lan vi danh sach dich len
+        w.probeCloseTab(0); spin(5000);
+        w.probeCloseTab(0); spin(8000);
+        dump("sau khi DONG 2 tab nang");
+        fprintf(stdout, "TABCLOSE: DONE\n"); fflush(stdout);
+        return 0;
+    }
+
+    // ── BAI DO TRUOT CUA SO TRANG (2026-08-31) ─────────────────────────────────
+    // Cau hoi cua owner: neu chi nap 20 trang roi truot tung 5 trang, PDFium co NHA
+    // bo nho cua 5 trang truoc khong?
+    // Cach do: cham tung lo trang (render thumbnail nho), sau moi lo DONG het trang cu
+    // roi in RSS. RSS tang deu => KHONG nha. RSS phang => co nha.
+    //   --pagewindow-probe <file> [lo=5] [soLo=8]
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--pagewindow-probe")) {
+        auto strip = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"'))) return v.mid(1, v.size()-2);
+            return v;
+        };
+        QString f = strip(QString::fromLocal8Bit(argv[2]));
+        int batch = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 5;
+        int nBatch= (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 8;
+        int rw    = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 300;   // do rong render
+        // giuMo=1 => KHONG dong trang sau khi render (giong PageCache cua app giu trang mo).
+        // Day la bien duy nhat khac giua bai do PDFium thuan (140MB) va duong cua app.
+        const bool giuMo = (argc >= 7) && QString::fromLocal8Bit(argv[6]) == QLatin1String("giumo");
+        QVector<FPDF_PAGE> giuLai;
+        if (batch <= 0) batch = 5;
+        if (nBatch <= 0) nBatch = 8;
+
+        auto rssMB = []() -> long long {
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                return (long long)(pmc.WorkingSetSize / 1048576);
+#endif
+            return 0;
+        };
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = FPDF_LoadDocument(f.toUtf8().constData(), nullptr);
+        if (!doc) { fprintf(stdout, "PAGEWIN: FAIL mo file\n"); return 1; }
+        const int total = FPDF_GetPageCount(doc);
+        fprintf(stdout, "PAGEWIN: mo xong, %d trang, RSS=%lldMB\n", total, rssMB());
+        fflush(stdout);
+
+        int done = 0;
+        for (int b = 0; b < nBatch && done < total; ++b) {
+            const int from = done, to = qMin(done + batch, total);
+            for (int i = from; i < to; ++i) {
+                FPDF_PAGE pg = FPDF_LoadPage(doc, i);
+                if (!pg) continue;
+                // render nho de ep PDFium PHAN TICH noi dung trang (giong thumbnail)
+                const int w = rw, h = qMax(1, int(rw * 0.707));
+                FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
+                if (bmp) {
+                    FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
+                    FPDF_RenderPageBitmap(bmp, pg, 0, 0, w, h, 0,
+                                          FPDF_RENDER_LIMITEDIMAGECACHE);
+                    FPDFBitmap_Destroy(bmp);
+                }
+                if (giuMo) giuLai.push_back(pg);      // GIU MO — giong PageCache
+                else       FPDF_ClosePage(pg);        // DONG NGAY sau khi dung
+            }
+            done = to;
+            fprintf(stdout, "PAGEWIN: da cham %3d/%d trang | RSS=%lldMB\n",
+                    done, total, rssMB());
+            fflush(stdout);
+        }
+        if (giuMo) {
+            fprintf(stdout, "PAGEWIN: dang giu %d trang MO | RSS=%lldMB\n",
+                    int(giuLai.size()), rssMB());
+            fflush(stdout);
+            for (FPDF_PAGE pg : giuLai) FPDF_ClosePage(pg);
+            fprintf(stdout, "PAGEWIN: sau khi dong het trang | RSS=%lldMB\n", rssMB());
+            fflush(stdout);
+        }
+        FPDF_CloseDocument(doc);
+        fprintf(stdout, "PAGEWIN: sau khi DONG tai lieu | RSS=%lldMB\n", rssMB());
+        fprintf(stdout, "PAGEWIN: DONE\n"); fflush(stdout);
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // ── BAI DO VONG DOI BO NHO (2026-08-31) ────────────────────────────────────
+    // Cau hoi can tra loi: 2,4 GB moi tai lieu la CHI PHI GIU MO, hay la RO RI?
+    // Mo file -> do RSS -> DONG han tab -> do RSS lai. Lap N vong.
+    //   RSS tra ve gan muc ban dau  => chi phi giu mo (chua tai lieu it di / dong tab lau khong dung)
+    //   RSS KHONG tra ve, cong don  => RO RI THAT (moi lan mo la mat vinh vien)
+    //   --memcycle-probe <file> [soVong=3] [waitMs=15000]
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--memcycle-probe")) {
+        auto strip = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        QString f = strip(QString::fromLocal8Bit(argv[2]));
+        int cycles = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 3;
+        int waitMs = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 15000;
+        if (cycles <= 0) cycles = 3;
+        if (waitMs <= 0) waitMs = 15000;
+
+        MainWindow w; w.resize(1400, 900); w.show();
+        QCoreApplication::processEvents();
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+        auto rssMB = []() -> long long {
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+                return (long long)(pmc.WorkingSetSize / 1048576);
+#endif
+            return 0;
+        };
+        fprintf(stdout, "MEMCYCLE: bat dau RSS=%lldMB\n", rssMB()); fflush(stdout);
+        for (int c = 1; c <= cycles; ++c) {
+            w.openFile(f);
+            spin(waitMs);
+            long long afterOpen = rssMB();
+            w.probeCloseTab(0);
+            spin(4000);
+            long long afterClose = rssMB();
+            fprintf(stdout, "MEMCYCLE: vong %d | sau MO=%lldMB | sau DONG=%lldMB\n"
+                            "   tai lieu: mo=%d dong=%d | pool: mo=%d dong=%d | trang: mo=%d dong=%d\n",
+                    c, afterOpen, afterClose,
+                    g_pdfiumDocOpen.loadRelaxed(),  g_pdfiumDocClose.loadRelaxed(),
+                    g_pdfiumPoolOpen.loadRelaxed(), g_pdfiumPoolClose.loadRelaxed(),
+                    g_pdfiumPageOpen.loadRelaxed(), g_pdfiumPageClose.loadRelaxed());
+            fflush(stdout);
+        }
+        fprintf(stdout, "MEMCYCLE: DONE\n"); fflush(stdout);
+        return 0;
+    }
+
+    // ── BAI DO HAI TAB (2026-08-31) ──────────────────────────────────────────────
+    // Ly do dung: suot ca ngay moi ban va deu chi do duoc canh MOT file, nen loi
+    // "mo tab thu 2 khong nap gi" TAI DIEN HAI LAN ma khong bat duoc truoc khi giao.
+    // Bai nay mo file 1, cho, roi mo file 2 (thanh tab 2), cho, rooi in ra so lieu
+    // CUA TUNG TAI LIEU de biet tab nao khong nap duoc.
+    //   --twotab-probe <file1> <file2> [waitMs moi tab, mac dinh 20000]
+    // 🔴🔴 CHOT 2026-08-31: bai do PHAI CHET khi file khong ton tai.
+    // Da tra gia: `--twotab-probe` chay voi tab 2 tro vao file KHONG CO THAT, app mo ra tab rong,
+    // probe van in "TWOTAB: DONE" ⇒ moi so do hai tab tu truoc toi nay VO GIA TRI, va suyt bi
+    // dung lam bang chung "khong hoi quy". Bai do im lang khi thieu du lieu con te hon khong co.
+    auto _probeRequireFile = [](const QString& path, const char* nhan) -> bool {
+        if (QFile::exists(path)) return true;
+        fprintf(stderr, "PROBE_FAIL: %s khong ton tai: \"%s\"\n",
+                nhan, path.toLocal8Bit().constData());
+        return false;
+    };
+
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--twotab-probe")) {
+        auto strip = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        QString f1 = strip(QString::fromLocal8Bit(argv[2]));
+        QString f2 = strip(QString::fromLocal8Bit(argv[3]));
+        int waitMs = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 20000;
+        if (waitMs <= 0) waitMs = 20000;
+        if (!_probeRequireFile(f1, "tab 1") || !_probeRequireFile(f2, "tab 2")) return 2;
+
+        MainWindow w;
+        w.resize(1400, 900);
+        w.show();
+        QCoreApplication::processEvents();
+
+        // ── BANG KE BO NHO: in ra tung kho dang giu, de biet 90% RAM nam O DAU ──
+        auto memDump = [&](const char* moc) {
+            qint64 rssMB = 0, privMB = 0, peakMB = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+                rssMB  = qint64(pmc.WorkingSetSize) / 1048576;
+                privMB = qint64(pmc.PrivateUsage)   / 1048576;   // bo nho RIENG da cam ket
+                peakMB = qint64(pmc.PeakWorkingSetSize) / 1048576;
+            }
+#endif
+            const qint64 gCache = PdfRenderer::globalCacheBytes() / 1048576;
+            const qint64 pCache = PageCache::totalBytes() / 1048576;
+            fprintf(stdout,
+                "MEM[%s] WorkingSet=%lldMB | RIENG(commit)=%lldMB | dinh WS=%lldMB"
+                " | anhRaster=%lldMB | PageCache=%lldMB (%d trang)\n",
+                moc, (long long)rssMB, (long long)privMB, (long long)peakMB,
+                (long long)gCache, (long long)pCache, PageCache::entryCount());
+            fprintf(stdout, "%s\n", w.probeMemBreakdown().toLocal8Bit().constData());
+            fflush(stdout);
+        };
+
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+
+        fprintf(stdout, "TWOTAB: mo tab 1 = %s\n", f1.toLocal8Bit().constData());
+        fflush(stdout);
+        w.openFile(f1);
+        spin(waitMs);
+        fprintf(stdout, "TWOTAB: --- moc sau tab 1 ---\n"); fflush(stdout);
+        memDump("sau tab 1");
+
+        fprintf(stdout, "TWOTAB: mo tab 2 = %s\n", f2.toLocal8Bit().constData());
+        fflush(stdout);
+        w.openFile(f2);
+        spin(waitMs);
+        fprintf(stdout, "TWOTAB: --- moc sau tab 2 ---\n"); fflush(stdout);
+        memDump("sau tab 2");
+
+        // ── THU NGHIEM 31/08: bo nho kia CO PHAI chi la heap chua tra ve OS? ──
+        // Tren Windows heap duoc anh xa MEM_COMMIT|MEM_RESERVE nen Windows tinh HET vao RSS,
+        // ke ca phan da free ma thu vien C giu lai trong danh sach rong.
+        // _heapmin() ep tra phan chua dung ve OS. EmptyWorkingSet() day trang ra khoi
+        // working set. Neu RSS TUT MANH sau 2 lenh nay => khong phai bi chiem, chi la chua tra.
+#ifdef Q_OS_WIN
+        _heapmin();
+        memDump("sau _heapmin");
+        EmptyWorkingSet(GetCurrentProcess());
+        spin(1000);
+        memDump("sau EmptyWorkingSet");
+#endif
+        fprintf(stdout, "TWOTAB: DONE\n"); fflush(stdout);
+        return 0;
+    }
+
+    // usage: --scroll-probe <input.pdf> [soLanCuon] [msMoiLan]
+    // Ep dung tinh huong owner mo ta: LUOT qua cac trang nang. Moi lan cuon lam trang cu
+    // khong con nhin thay => render dang chay bi huy giua chung. Truoc 2026-08-31 anh ve do
+    // do van duoc phat ra nhu anh day du (chi may net, mat khung ten) va con bi ghi vao dia.
+    // usage: --zoommarkup-probe <file_co_markup.pdf>
+    // Tai hien "Continuous mat markup khi zoom": mo o View Fast, dem markup ve ra, ZOOM, dem lai.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--zoommarkup-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (!_probeRequireFile(inputPath, "file dau vao")) return 2;
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+        // tham so 3: "single" => do o View Quality; mac dinh do o View Fast
+        const bool doSingle = (argc >= 4 && QString::fromLocal8Bit(argv[3]) == QLatin1String("single"));
+        w.probeSetFastMode(!doSingle);
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        auto spin = [](int ms) {
+            for (int i = 0; i < qMax(1, ms / 25); ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        };
+        spin(8000);
+        fprintf(stdout, "ZM: === che do = %s ===\n", doSingle ? "SINGLE" : "FAST"); fflush(stdout);
+        fprintf(stdout, "ZM: === TRUOC ZOOM ===\n"); fflush(stdout);
+        spin(1500);
+        if (doSingle) w.probeSetZoomSingle(2.0); else w.probeSetZoom(2.0);
+        fprintf(stdout, "ZM: === DA ZOOM 2.0 ===\n"); fflush(stdout);
+        spin(8000);
+        if (doSingle) w.probeSetZoomSingle(4.0); else w.probeSetZoom(4.0);
+        fprintf(stdout, "ZM: === DA ZOOM 4.0 ===\n"); fflush(stdout);
+        spin(8000);
+        fprintf(stdout, "ZM_OK\n");
+        return 0;
+    }
+
+    // usage: --newannot-probe <file.pdf> [single]
+    // Tai hien DUNG canh owner: TAO Note va Text roi xem chung co hien NGAY khong.
+    // Do bang PIXEL tren chinh khung nhin — khong tin log, khong tin bo dem.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--newannot-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (!_probeRequireFile(inputPath, "file dau vao")) return 2;
+        const bool doSingle = (argc >= 4 && QString::fromLocal8Bit(argv[3]) == QLatin1String("single"));
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+        w.probeSetFastMode(!doSingle);
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        auto spin = [](int ms) {
+            for (int i = 0; i < qMax(1, ms / 25); ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        };
+        // Dem pixel VANG (icon Note cua PDFium) va pixel co mau trong khung nhin.
+        auto demMau = [&w](int& vang, int& coMau) {
+            vang = 0; coMau = 0;
+            QImage im = w.probeGrabView().convertToFormat(QImage::Format_ARGB32);
+            if (im.isNull()) { fprintf(stderr, "PROBE_FAIL: khong chup duoc khung nhin\n"); return; }
+            for (int y = 0; y < im.height(); y += 2) {
+                const QRgb* row = reinterpret_cast<const QRgb*>(im.constScanLine(y));
+                for (int x = 0; x < im.width(); x += 2) {
+                    const QRgb c = row[x];
+                    const int r = qRed(c), g = qGreen(c), b = qBlue(c);
+                    if (r > 200 && g > 200 && b > 200) continue;
+                    ++coMau;
+                    if (r > 200 && g > 140 && g < 215 && b < 110) ++vang;
+                }
+            }
+        };
+        spin(9000);
+        // 🔴 Bai do phai NHIN THAY duoc thu minh dinh do: o muc vua-khung, trang qua nho nen
+        // icon Note chi vai pixel va bi nhoe vao nen ⇒ so do khong nhay. Phong to va nhay ve
+        // trang 0 truoc khi dem.
+        const int naPage = qEnvironmentVariableIntValue("NA_PAGE");
+        // NA_ZOOM=<phan tram>: do o dung muc zoom owner dung (vd 75). Mac dinh 100.
+        const int naZoom = qEnvironmentVariableIntValue("NA_ZOOM");
+        const double zTest = (naZoom > 0 ? naZoom : 100) / 100.0;
+        if (doSingle) w.probeSetZoomSingle(zTest); else { w.probeSetZoom(zTest); w.probeScrollToPage(0); }
+        spin(4000);
+        int vangTruoc = 0, mauTruoc = 0; demMau(vangTruoc, mauTruoc);
+        fprintf(stdout, "NA: che do=%s | TRUOC: vang=%d coMau=%d\n",
+                doSingle ? "SINGLE" : "FAST", vangTruoc, mauTruoc);
+        fflush(stdout);
+
+        // NA_PAGE=<n>: tao chu thich tren trang n (0-based). Mac dinh 0.
+        // Trang khac nhau co the cho ket qua khac han — trang 3 cua tep owner co 41 chu thich.
+        // 🔴 NA_TEXT_TRUOC=1: tao TEXT truoc roi moi Note — dung thu tu owner lam khi gap loi
+        // "new text la mat trang, them Note thi noi dung tro lai". Thu tu tao co the doi ket qua.
+        if (!qEnvironmentVariableIsEmpty("NA_TEXT_TRUOC")) {
+            const bool okT0 = w.probeCreateText(naPage, 260.0, 320.0, 180.0, 40.0);
+            spin(6000);
+            int v1 = 0, m1 = 0; demMau(v1, m1);
+            fprintf(stdout, "NA: tao Text TRUOC ok=%d | SAU: coMau=%d (%+d)\n",
+                    okT0 ? 1 : 0, m1, m1 - mauTruoc);
+            fflush(stdout);
+            const bool okN0 = w.probeCreateNote(naPage, 200.0, 300.0);
+            spin(6000);
+            int v2 = 0, m2 = 0; demMau(v2, m2);
+            fprintf(stdout, "NA: tao Note SAU  ok=%d | SAU: coMau=%d (%+d)\n",
+                    okN0 ? 1 : 0, m2, m2 - m1);
+            fprintf(stdout, "NA_OK\n");
+            return 0;
+        }
+        const bool okNote = w.probeCreateNote(naPage, 200.0, 300.0);
+        spin(6000);
+        int vangSauNote = 0, mauSauNote = 0; demMau(vangSauNote, mauSauNote);
+        fprintf(stdout, "NA: tao Note ok=%d | SAU: vang=%d (+%d) coMau=%d (+%d)\n",
+                okNote ? 1 : 0, vangSauNote, vangSauNote - vangTruoc,
+                mauSauNote, mauSauNote - mauTruoc);
+        fflush(stdout);
+
+        const bool okText = w.probeCreateText(naPage, 260.0, 320.0, 180.0, 40.0);
+        spin(6000);
+        int vangSauText = 0, mauSauText = 0; demMau(vangSauText, mauSauText);
+        fprintf(stdout, "NA: tao Text ok=%d | SAU: coMau=%d (+%d so voi sau Note)\n",
+                okText ? 1 : 0, mauSauText, mauSauText - mauSauNote);
+        fprintf(stdout, "NA_OK\n");
+        return 0;
+    }
+
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--scroll-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (!_probeRequireFile(inputPath, "file dau vao")) return 2;
+        const int nScroll = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 12;
+        const int stepMs  = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 700;
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+        w.probeSetFastMode(true);
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+
+        auto spin = [](int ms) {
+            for (int i = 0; i < qMax(1, ms / 25); ++i) {
+                QCoreApplication::processEvents();
+                QThread::msleep(25);
+            }
+        };
+        spin(6000);   // cho bo cuc dung xong
+
+        const int nPg = qMax(1, w.probePageCount());
+        for (int k = 0; k < nScroll; ++k) {
+            const int target = k % nPg;
+            fprintf(stdout, "SCROLL_PROBE step=%d page=%d\n", k, target);
+            fflush(stdout);
+            w.probeScrollToPage(target);
+            spin(stepMs);
+        }
+        spin(8000);   // dung lai — trang cuoi phai duoc ve TRON VEN
+        fprintf(stdout, "SCROLL_PROBE_OK scrolls=%d pages=%d\n", nScroll, nPg);
+        return 0;
+    }
+
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--viewfast-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QString outPng = QString::fromLocal8Bit(argv[3]);
+        // WSL→cmd.exe co the them dau ngoac kep vao argv — loai bo
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (outPng.startsWith(QLatin1Char('"')) && outPng.endsWith(QLatin1Char('"')))
+            outPng = outPng.mid(1, outPng.size() - 2);
+        int waitMs = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toInt() : 60000;
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        // Vao Fast mode TRUOC khi openFile — dung nhu nguoi dung dang o View Fast
+        // roi mo file (goc cua 58,7s lockhold). probeSetFastMode chi set mode khi
+        // chua co doc (currentTab null) — set m_fastMode=true + show continuousView.
+        w.probeSetFastMode(true);
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+
+        const int loops = qMax(waitMs / 50, 80);
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QPixmap pm = w.grab();
+        QImage img = pm.toImage();
+        if (img.isNull()) {
+            fprintf(stderr, "VIEWFAST_PROBE: FAIL grab returned null\n");
+            return 1;
+        }
+        // Neu save khong duoc, thu format ARGB32 (mot so GL-backing store co van de)
+        if (!img.save(outPng, "PNG")) {
+            fprintf(stderr, "VIEWFAST_PROBE: WARN img.save failed size=%dx%d fmt=%d — try ARGB32\n",
+                    img.width(), img.height(), img.format());
+            img = img.convertToFormat(QImage::Format_ARGB32);
+            if (!img.save(outPng, "PNG")) {
+                fprintf(stderr, "VIEWFAST_PROBE: WARN ARGB32 also failed — try QImageWriter\n");
+                QImageWriter wr(outPng, "PNG");
+                if (!wr.write(img)) {
+                    fprintf(stderr, "VIEWFAST_PROBE: FAIL cannot save \"%s\" — %s\n",
+                            outPng.toLocal8Bit().constData(),
+                            wr.errorString().toLocal8Bit().constData());
+                    return 1;
+                }
+            }
+        }
+
+        fprintf(stdout, "VIEWFAST_PROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --viewfast-syncprobe <input.pdf> <page5Based>
+    // Probe (SPEC_VIEWFAST VIỆC 3): mo file o Quality, nhay toi trang page5Based,
+    // chuyen sang Fast (Continuous phai giu trang do), roi quay ve Quality (Single
+    // van giu trang do). In trang sau moi buoc de nghiem thu bang so.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--viewfast-syncprobe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        int target5Based = QString::fromLocal8Bit(argv[3]).toInt();
+        int target = target5Based - 1;
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        w.openFile(inputPath);
+        const qint64 openDeadline = QDateTime::currentMSecsSinceEpoch() + 120000;
+        while ((!w.currentTabForProbe() || !w.currentTabForProbe()->doc
+                || !w.currentTabForProbe()->doc->isOpen())
+               && QDateTime::currentMSecsSinceEpoch() < openDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(20);
+        }
+        if (!w.currentTabForProbe() || !w.currentTabForProbe()->doc
+            || !w.currentTabForProbe()->doc->isOpen()) {
+            fprintf(stderr, "VIEWFAST_SYNC: FAIL document did not open in 120s\n");
+            return 1;
+        }
+        const int total = w.currentTabForProbe()->doc->pageCount();
+        target = qBound(0, target, total - 1);
+
+        // Buoc 1: o Quality (mac dinh), nhay toi trang target.
+        w.probeSetPage(target);
+        QCoreApplication::processEvents();
+        const int pageAfterQualityJump = w.probeCurrentPage();
+        fprintf(stdout, "[viewfast-sync] after Quality jump to %d -> currentPage=%d fastMode=%d\n",
+                target, pageAfterQualityJump, w.probeIsFastMode() ? 1 : 0);
+
+        // Buoc 2: chuyen sang Fast — Continuous phai giu trang target.
+        w.probeSetFastMode(true);
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        const int pageAfterFast = w.probeCurrentPage();
+        fprintf(stdout, "[viewfast-sync] after switch to Fast -> currentPage=%d fastMode=%d\n",
+                pageAfterFast, w.probeIsFastMode() ? 1 : 0);
+
+        // Buoc 3: quay ve Quality — Single phai giu trang target.
+        w.probeSetFastMode(false);
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        const int pageAfterQualityBack = w.probeCurrentPage();
+        fprintf(stdout, "[viewfast-sync] after switch back to Quality -> currentPage=%d fastMode=%d\n",
+                pageAfterQualityBack, w.probeIsFastMode() ? 1 : 0);
+
+        bool pass = (pageAfterFast == target) && (pageAfterQualityBack == target);
+        fprintf(stdout, "VIEWFAST_SYNC: %s (target=%d)\n", pass ? "PASS" : "FAIL", target);
+        return pass ? 0 : 1;
+    }
+
+    // usage: --viewfast-twodoc-probe <doc1.pdf> <doc2.pdf> <out.png> [waitMs]
+    // Probe (SPEC_PAGECACHE_THRASH_2026-08-31): mo HAI tai lieu cung luc o View Fast
+    // (doc1 -> tab 0, doc2 -> tab 1), luan phien chuyen tab de tai trang tu ca 2 doc
+    // trong khi doc kia la inactive. Nghiem thu log khong con LOAD+evict cung trang
+    // cung thoi diem, khong co trang nap >2 lan, [stall] < 1000.
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--viewfast-twodoc-probe")) {
+        QString pathA = QString::fromLocal8Bit(argv[2]);
+        QString pathB = QString::fromLocal8Bit(argv[3]);
+        QString outPng = QString::fromLocal8Bit(argv[4]);
+        // WSL→cmd.exe co the them dau ngoac kep vao argv — loai bo
+        if (pathA.startsWith(QLatin1Char('"')) && pathA.endsWith(QLatin1Char('"')))
+            pathA = pathA.mid(1, pathA.size() - 2);
+        if (pathB.startsWith(QLatin1Char('"')) && pathB.endsWith(QLatin1Char('"')))
+            pathB = pathB.mid(1, pathB.size() - 2);
+        if (outPng.startsWith(QLatin1Char('"')) && outPng.endsWith(QLatin1Char('"')))
+            outPng = outPng.mid(1, outPng.size() - 2);
+        int waitMs = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toInt() : 60000;
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        // Vao Fast mode TRUOC khi mo file (giong --viewfast-probe).
+        w.probeSetFastMode(true);
+        QCoreApplication::processEvents();
+
+        // Mo doc A (tab 0) — giong viewfast-probe: pump den khi doc that su mo
+        w.openFile(pathA);
+        {
+            const qint64 dl = QDateTime::currentMSecsSinceEpoch() + 90000;
+            while ((!w.currentTabForProbe() || !w.currentTabForProbe()->doc
+                    || !w.currentTabForProbe()->doc->isOpen())
+                   && QDateTime::currentMSecsSinceEpoch() < dl) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                QThread::msleep(20);
+            }
+            fprintf(stdout, "[twodoc] doc A open=%d fast=%d tab0\n",
+                    (w.currentTabForProbe() && w.currentTabForProbe()->doc
+                     && w.currentTabForProbe()->doc->isOpen()) ? 1 : 0,
+                    w.probeIsFastMode() ? 1 : 0);
+        }
+
+        // Mo doc B (tab 1) — doc B tro thanh active, doc A thanh background
+        w.openFile(pathB);
+        {
+            const qint64 dl = QDateTime::currentMSecsSinceEpoch() + 90000;
+            while ((!w.currentTabForProbe() || !w.currentTabForProbe()->doc
+                    || !w.currentTabForProbe()->doc->isOpen())
+                   && QDateTime::currentMSecsSinceEpoch() < dl) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                QThread::msleep(20);
+            }
+            fprintf(stdout, "[twodoc] doc B open=%d fast=%d tab1\n",
+                    (w.currentTabForProbe() && w.currentTabForProbe()->doc
+                     && w.currentTabForProbe()->doc->isOpen()) ? 1 : 0,
+                    w.probeIsFastMode() ? 1 : 0);
+        }
+
+        // Luan phien chuyen tab 3 lan de tai trang tu ca 2 doc (doc kia inactive)
+        for (int rep = 0; rep < 3; ++rep) {
+            w.probeActivateTab(0);
+            for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+            w.probeActivateTab(1);
+            for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+            fprintf(stdout, "[twodoc] switch rep=%d done\n", rep);
+        }
+
+        // Doc o tab 1 de chup anh
+        const int loops = qMax(waitMs / 50, 80);
+        for (int i = 0; i < loops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QPixmap pm = w.grab();
+        QImage img = pm.toImage();
+        if (img.isNull()) {
+            fprintf(stderr, "TWODOC: FAIL grab returned null\n");
+            // Khong return 1 — van tiep tuc dem pixel neu co the
+        } else if (!img.save(outPng, "PNG")) {
+            fprintf(stderr, "TWODOC: WARN img.save failed, size=%dx%d format=%d\n",
+                    img.width(), img.height(), img.format());
+            // Thu luu bang QPixmap
+            if (!pm.save(outPng, "PNG"))
+                fprintf(stderr, "TWODOC: WARN pm.save also failed\n");
+        } else {
+            // Dem mau khac nhau
+            QSet<QRgb> colors;
+            for (int y = 0; y < img.height() && colors.size() <= 5000; ++y)
+                for (int x = 0; x < img.width() && colors.size() <= 5000; ++x)
+                    colors.insert(img.pixel(x, y));
+            fprintf(stdout, "TWODOC distinctColors=%d img=%dx%d\n", colors.size(), img.width(), img.height());
+        }
+
+        fprintf(stdout, "VIEWFAST_TWODOC_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --contvec-probe <input.pdf> <out.png> <zoomPercent> <page1Based> <awayPages> [waitMs]
+    // Nghiem thu Viec A/B/C voi trang nang (owner 2026-08-30): mo file o Continuous,
+    // cuon xuong awayPages trang roi quay lai trang dau. Chot log that khi quay lai:
+    //   - KHONG con [torvec] SKIP ... reason=nokey
+    //   - Co [torvec] HIT page= 0 (nap cache ~100 ms) thay vi [contvec] SKIP-HEAVY
+    //   - Khong con [cont] paint LOWRES page= 0
+    if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--contvec-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        QString outPng = QString::fromLocal8Bit(argv[3]);
+        bool zoomOk = false;
+        double zoomPercent = QString::fromLocal8Bit(argv[4]).toDouble(&zoomOk);
+        int page1Based = QString::fromLocal8Bit(argv[5]).toInt();
+        int awayPages = QString::fromLocal8Bit(argv[6]).toInt();
+        int waitMs = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toInt() : 8000;
+        if (!zoomOk || awayPages < 0) {
+            fprintf(stderr, "CONTVEC_PROBE: FAIL tham so khong hop le\n");
+            return 1;
+        }
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+
+        auto* tab = w.currentTabForProbe();
+        const qint64 openDeadline = QDateTime::currentMSecsSinceEpoch() + 120000;
+        while ((!tab || !tab->doc || !tab->doc->isOpen())
+               && QDateTime::currentMSecsSinceEpoch() < openDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(20);
+            tab = w.currentTabForProbe();
+        }
+        if (!tab || !tab->doc || !tab->doc->isOpen()) {
+            fprintf(stderr, "CONTVEC_PROBE: FAIL document did not open in 120s\n");
+            return 1;
+        }
+        qDebug().noquote() << "[contvec-probe] doc open pages=" << tab->doc->pageCount();
+
+        // Continuous che do xem, trang dau, zoom cho truoc.
+        w.probeSetView(true, zoomPercent, page1Based,
+                       std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::quiet_NaN());
+        const int page0 = qBound(0, page1Based - 1, tab->doc->pageCount() - 1);
+
+        // Cho lop vector trang dau nap xong tu cache (~100ms) hoac build (~7s).
+        const int warmLoops = qMax(waitMs / 50, 80);
+        for (int i = 0; i < warmLoops; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+        qDebug().noquote() << "[contvec-probe] warmed page=" << page0;
+
+        // Cuon xuong awayPages trang (nap bien: trang nang phai roi ngoai vung giu).
+        w.probeContScrollTo(page0 + awayPages);
+        qDebug().noquote() << "[contvec-probe] scrolled away to page=" << (page0 + awayPages);
+
+        // Quay lai trang dau — phai HIT cache .torvec.
+        w.probeContScrollTo(page0);
+        qDebug().noquote() << "[contvec-probe] returned page=" << page0;
+
+        for (int i = 0; i < qMax(waitMs / 50, 80); ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+        }
+
+        QPixmap pm = w.grab();
+        QImage img = pm.toImage();
+        if (img.isNull()) {
+            fprintf(stderr, "CONTVEC_PROBE: FAIL grab returned null\n");
+            return 1;
+        }
+        if (!img.save(outPng, "PNG")) {
+            fprintf(stderr, "CONTVEC_PROBE: FAIL cannot save %s\n", outPng.toLocal8Bit().constData());
+            return 1;
+        }
+        fprintf(stdout, "CONTVEC_PROBE_OK %s\n", outPng.toLocal8Bit().constData());
         return 0;
     }
 
@@ -5611,14 +6684,177 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // usage: --torvec-test <input.pdf> <page1Based> [outfile=.torvec tam]
+    // Headless self-test (SPEC_PERF_HEAVYPAGE buoc A): build VectorLayer cho 1
+    // trang nang, ghi ra file, doc lai va so khop TUNG MANG giua doi tuong goc
+    // `a` va doi tuong nap lai `b` bang DU LIEU that (khong chi so so phan tu).
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--torvec-test")) {
+        QTextStream out(stdout);
+        const QString inputPath = QString::fromLocal8Bit(argv[2]);
+        bool pageOk = false;
+        const int page1 = QString::fromLocal8Bit(argv[3]).toInt(&pageOk);
+        if (!pageOk || page1 < 1) {
+            out << "TORVEC_FAIL invalid page\n"; out.flush(); return 1;
+        }
+        const int page0 = page1 - 1;
+        const QString outPath = (argc >= 5) ? QString::fromLocal8Bit(argv[4])
+                                            : inputPath + QStringLiteral(".torvec");
+
+        PdfDocument::libAddRef();
+
+        PdfDocument doc;
+        if (!doc.open(inputPath) || page0 >= doc.pageCount()) {
+            out << "TORVEC_FAIL cannot open " << inputPath << "\n";
+            out.flush();
+            PdfDocument::libRelease();
+            return 1;
+        }
+
+        VectorLayer a;
+        QElapsedTimer t; t.start();
+        const bool built = a.build(doc.raw(), page0);
+        const qint64 buildMs = t.elapsed();
+        if (!built) {                       // trang nhe -> build tra false
+            out << "TORVEC_SKIP trang nhe\n";
+            out.flush();
+            PdfDocument::libRelease();
+            return 0;
+        }
+        out << "TORVEC build_ms=" << buildMs << "\n";
+        out.flush();
+
+        {
+            QFile f(outPath);
+            if (!f.open(QIODevice::WriteOnly)) {
+                out << "TORVEC_FAIL cannot write " << outPath << "\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+            t.start();
+            const bool ok = a.saveTo(f);
+            const qint64 saveMs = t.elapsed();
+            const qint64 size = f.size();
+            f.close();
+            out << "TORVEC save_ms=" << saveMs << " bytes=" << size << "\n";
+            out << "TORVEC approx_bytes=" << a.approxBytes() << "\n";
+            out.flush();
+            if (!ok) { out << "TORVEC_FAIL saveTo\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        }
+
+        VectorLayer b;
+        {
+            QFile f(outPath);
+            if (!f.open(QIODevice::ReadOnly)) {
+                out << "TORVEC_FAIL cannot read " << outPath << "\n";
+                out.flush(); PdfDocument::libRelease(); return 1;
+            }
+            t.start();
+            const bool ok = b.loadFrom(f);
+            const qint64 loadMs = t.elapsed();
+            f.close();
+            out << "TORVEC load_ms=" << loadMs << "\n";
+            out.flush();
+            if (!ok) { out << "TORVEC_FAIL loadFrom\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        }
+
+        QString firstFail;
+        auto fail = [&](const char* name) { if (firstFail.isEmpty()) firstFail = QLatin1String(name); };
+
+        auto emitCmp = [&](const char* name, bool same, int na, int nb, int idx) {
+            if (same) {
+                out << "TORVEC cmp " << name << "=OK\n";
+            } else {
+                out << "TORVEC cmp " << name << "=MISMATCH(" << na << " vs " << nb
+                    << " | " << (idx < 0 ? -1 : idx) << ")\n";
+                fail(name);
+            }
+        };
+        auto cmpFloats = [&](const char* name, const QVector<float>& fa, const QVector<float>& fb) {
+            bool same = (fa.size() == fb.size()); int idx = -1;
+            if (same)
+                for (int i = 0; i < fa.size(); ++i)
+                    if (fa[i] != fb[i]) { same = false; idx = i; break; }
+            emitCmp(name, same, fa.size(), fb.size(), idx);
+        };
+        auto cmpU8s = [&](const char* name, const QVector<uint8_t>& fa, const QVector<uint8_t>& fb) {
+            bool same = (fa.size() == fb.size()); int idx = -1;
+            if (same)
+                for (int i = 0; i < fa.size(); ++i)
+                    if (fa[i] != fb[i]) { same = false; idx = i; break; }
+            emitCmp(name, same, fa.size(), fb.size(), idx);
+        };
+        auto cmpInts = [&](const char* name, const QVector<int>& fa, const QVector<int>& fb) {
+            bool same = (fa.size() == fb.size()); int idx = -1;
+            if (same)
+                for (int i = 0; i < fa.size(); ++i)
+                    if (fa[i] != fb[i]) { same = false; idx = i; break; }
+            emitCmp(name, same, fa.size(), fb.size(), idx);
+        };
+        auto cmpRects = [&](const char* name, const QVector<QRectF>& fa, const QVector<QRectF>& fb) {
+            bool same = (fa.size() == fb.size()); int idx = -1;
+            if (same)
+                for (int i = 0; i < fa.size(); ++i)
+                    if (fa[i] != fb[i]) { same = false; idx = i; break; }
+            emitCmp(name, same, fa.size(), fb.size(), idx);
+        };
+        auto cmpTiles = [&](const char* name, const QVector<TextTile>& ta, const QVector<TextTile>& tb) {
+            bool same = (ta.size() == tb.size()); int idx = -1;
+            if (same)
+                for (int i = 0; i < ta.size(); ++i) {
+                    const TextTile& x = ta[i]; const TextTile& y = tb[i];
+                    if (x.rectPt != y.rectPt || x.depth != y.depth || x.clipIdx != y.clipIdx
+                        || x.color != y.color || x.isAlpha != y.isAlpha || x.isNote != y.isNote
+                        || !(x.img == y.img)) { same = false; idx = i; break; }
+                }
+            emitCmp(name, same, ta.size(), tb.size(), idx);
+        };
+        auto cmpScalar = [&](const char* name, bool eq) {
+            emitCmp(name, eq, 1, 1, -1);
+        };
+
+        cmpFloats("verts", a.verts(), b.verts());
+        cmpU8s("colors", a.colors(), b.colors());
+        cmpFloats("widths", a.widths(), b.widths());
+        cmpFloats("fillVerts", a.fillVerts(), b.fillVerts());
+        cmpU8s("fillColors", a.fillColors(), b.fillColors());
+        cmpFloats("depths", a.depths(), b.depths());
+        cmpFloats("fillDepths", a.fillDepths(), b.fillDepths());
+        cmpFloats("clipIdx", a.clipIdx(), b.clipIdx());
+        cmpFloats("fillClipIdx", a.fillClipIdx(), b.fillClipIdx());
+        cmpRects("clips", a.clips(), b.clips());
+        cmpTiles("texts", a.textTiles(), b.textTiles());
+        cmpTiles("images", a.imageTiles(), b.imageTiles());
+        cmpScalar("page", a.pageIndex() == b.pageIndex());
+        cmpScalar("rotation", a.rotation() == b.rotation());
+        cmpScalar("pageSizePt", a.pageSizePt() == b.pageSizePt());
+        cmpScalar("fillOpaqueFloats", a.fillOpaqueFloats() == b.fillOpaqueFloats());
+        cmpScalar("tilesGeneration", a.tilesGeneration() == b.tilesGeneration());
+        cmpScalar("isReady", a.isReady() == b.isReady());
+        cmpScalar("isComplete", a.isComplete() == b.isComplete());
+        out.flush();
+
+        PdfDocument::libRelease();
+        if (!firstFail.isEmpty()) {
+            out << "TORVEC_FAIL " << firstFail << "\n";
+            out.flush();
+            return 1;
+        }
+        out << "TORVEC_OK\n";
+        out.flush();
+        return 0;
+    }
+
     MainWindow window;
     window.setWindowTitle("TorReader PDF");
     window.resize(1280, 800);
     window.show();
 
     // Open file passed via command line (e.g. drag-to-exe)
-    if (argc > 1)
-        window.openFile(QString::fromLocal8Bit(argv[1]));
+    // Use QCoreApplication::arguments() (Qt uses GetCommandLineW on Windows,
+    // preserving Unicode) instead of argv, which is ANSI codepage (CP1258) and
+    // breaks Vietnamese two-sign filenames like "TRIẾN".
+    const QStringList cliArgs = QCoreApplication::arguments();
+    if (cliArgs.size() > 1)
+        window.openFile(cliArgs.at(1));
 #endif
 
     return app.exec();

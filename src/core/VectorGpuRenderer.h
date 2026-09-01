@@ -13,6 +13,7 @@ public:
     void initialize();
     void release();
     void draw(VectorLayer& layer, const QMatrix4x4& mvp, const QSize& viewportPx, float pxPerPt);
+    void setCovFloor(float v) { m_covFloor = v; }
 
 private:
     struct Buffers {
@@ -23,12 +24,13 @@ private:
         quint32 tilesGen = 0xFFFFFFFFu;
         int segs = 0, fillVerts = 0;
         bool uploaded = false;
+        qint64 bytes = 0;
     };
     QHash<quint64, Buffers> m_bufs;
     QSet<quint64> m_usedKeys;
 
     QOpenGLShaderProgram* m_vecProg = nullptr;
-    int m_vecMvpLoc = -1, m_vecViewportLoc = -1, m_vecPxPerPtLoc = -1;
+    int m_vecMvpLoc = -1, m_vecViewportLoc = -1, m_vecPxPerPtLoc = -1, m_vecCovFloorLoc = -1;
 
     QOpenGLShaderProgram* m_fillProg = nullptr;
     int m_fillMvpLoc = -1;
@@ -36,6 +38,7 @@ private:
     QOpenGLShaderProgram* m_tileProg = nullptr;
     int m_tileMvpLoc = -1, m_tileRectLoc = -1, m_tileDepthLoc = -1, m_tileTexLoc = -1;
     int m_tileIsAlphaLoc = -1, m_tileColorLoc = -1;
+    float m_covFloor = 0.85f;
 
     void uploadBuffers(VectorLayer& layer, Buffers& buf);
     void destroyBuffers(Buffers& buf);

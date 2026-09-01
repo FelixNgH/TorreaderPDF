@@ -1,5 +1,6 @@
 #include "TextSearch.h"
 #include "PdfCoords.h"
+#include "PdfiumLock.h"
 #include <QtConcurrent>
 #include <QMutex>
 #include <QThread>
@@ -99,7 +100,7 @@ void TextSearch::search(PdfDocument* doc, const QString& query, Qt::CaseSensitiv
 QList<SearchResult> TextSearch::searchPageExact(FPDF_DOCUMENT doc, int pageIndex,
                                                 const QString& query, Qt::CaseSensitivity cs) {
     QList<SearchResult> results;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) return results;
 
@@ -152,7 +153,7 @@ QList<SearchResult> TextSearch::searchPageExact(FPDF_DOCUMENT doc, int pageIndex
 QList<SearchResult> TextSearch::searchPageFolded(FPDF_DOCUMENT doc, int pageIndex,
                                                  const QString& query, Qt::CaseSensitivity cs) {
     QList<SearchResult> results;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) return results;
 

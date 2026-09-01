@@ -68,6 +68,12 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.4.1" date="2026-09-01">
+      <description>
+        <p>Markups now appear instantly instead of re-rendering the page, and stay visible through zoom and in continuous mode. Comments made in other PDF software are drawn by the PDF engine itself, so they keep their own font and background, and pages carrying them stay sharp when zoomed. Large CAD drawings reopen in a fraction of a second instead of a minute and a half. Fixes opening files whose names contain Vietnamese letters with two diacritics, the missing highlight on the current thumbnail, a crash when opening a second tab, and noise blocks in embedded logos on merged documents.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.4.1</url>
+    </release>
     <release version="2.4.0" date="2026-08-17">
       <description>
         <p>New high-contrast interface in light and dark mode. OCR for scanned documents — 10 languages, fully offline, your file is never modified. Select, find (diacritic-insensitive) and copy text in PDFs and scans. Links inside PDFs now work. Opening and flipping pages no longer wait on background work.</p>

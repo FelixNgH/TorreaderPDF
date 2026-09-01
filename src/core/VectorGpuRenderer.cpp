@@ -21,10 +21,13 @@ void VectorGpuRenderer::initialize()
         uniform mat4  uMvp;
         uniform vec2  uViewport;
         uniform float uPxPerPt;
+        uniform float uCovFloor;   // san do duc cho net mong hon 1px
         uniform vec4  uClips[64];
         out vec4 vColor;
         flat out vec4 vClip;
         out vec2 vPagePos;
+        out float vHalfW;
+        out float vDistPx;
         void main() {
             vec4 c0 = uMvp * vec4(aP0, 0.0, 1.0);
             vec4 c1 = uMvp * vec4(aP1, 0.0, 1.0);
@@ -36,13 +39,18 @@ void VectorGpuRenderer::initialize()
             vec2 n  = vec2(-d.y, d.x);
             float wRaw = aWidthPt * uPxPerPt;
             float cov  = 1.0;
-            if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, 0.15);
+            if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, uCovFloor);
             float wpx  = max(wRaw, 1.0);
-            vec2 p = mix(s0, s1, aCorner.x) + n * (aCorner.y - 0.5) * wpx;
+            // ponytail: chi noi quad de khu rang cua khi net > 1px; net <= 1px da du xu ly bang cov
+            float aaPad = (wRaw > 1.0) ? 1.5 : 0.0;
+            float wAA   = wpx + aaPad;
+            vec2 p = mix(s0, s1, aCorner.x) + n * (aCorner.y - 0.5) * wAA;
             gl_Position = vec4((p / uViewport) * 2.0 - 1.0, aDepth * 2.0 - 1.0, 1.0);
             vColor = vec4(aColor.rgb, aColor.a * cov);
             vClip = uClips[int(aClipIdx)];
             vPagePos = mix(aP0, aP1, aCorner.x);
+            vHalfW  = wpx * 0.5;
+            vDistPx = (aCorner.y - 0.5) * wAA;
         }
     )";
     static const char* vecFsrc = R"(
@@ -50,11 +58,17 @@ void VectorGpuRenderer::initialize()
         in vec4 vColor;
         flat in vec4 vClip;
         in vec2 vPagePos;
+        in float vHalfW;
+        in float vDistPx;
         out vec4 fragColor;
         void main() {
             if (vClip.z > 0.0 && (vPagePos.x < vClip.x || vPagePos.x > vClip.x + vClip.z ||
                                   vPagePos.y < vClip.y || vPagePos.y > vClip.y + vClip.w)) discard;
-            fragColor = vColor;
+            float d = abs(vDistPx);
+            // ponytail: net <= 1px (vHalfW=0.5) giu sac, net > 1px moi lam mem mep
+            float aa = (vHalfW <= 0.5) ? 1.0 : clamp(vHalfW + 0.5 - d, 0.0, 1.0);
+            if (aa <= 0.0) discard;
+            fragColor = vec4(vColor.rgb, vColor.a * aa);
         }
     )";
     m_vecProg = new QOpenGLShaderProgram();
@@ -67,6 +81,7 @@ void VectorGpuRenderer::initialize()
         m_vecMvpLoc = m_vecProg->uniformLocation("uMvp");
         m_vecViewportLoc = m_vecProg->uniformLocation("uViewport");
         m_vecPxPerPtLoc = m_vecProg->uniformLocation("uPxPerPt");
+        m_vecCovFloorLoc = m_vecProg->uniformLocation("uCovFloor");
     }
 
     static const char* fillVsrc = R"(
@@ -331,6 +346,12 @@ void VectorGpuRenderer::uploadBuffers(VectorLayer& layer, Buffers& buf)
     }
 
     buf.uploaded = true;
+
+    buf.bytes = qint64(layer.verts().size() + layer.colors().size()
+                        + layer.widths().size() + layer.depths().size()
+                        + layer.clipIdx().size() + layer.fillVerts().size()
+                        + layer.fillColors().size() + layer.fillDepths().size()
+                        + layer.fillClipIdx().size()) * 4;
 }
 
 void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
@@ -366,18 +387,26 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
         buf.tilesGen = gen;
     }
 
-    if (m_bufs.size() > 6) {
-        auto it = m_bufs.begin();
-        while (it != m_bufs.end()) {
-            if (!m_usedKeys.contains(it.key())) {
+    // Chan theo BYTE, khong theo so luong: mot lop CAD nang co the ~200 MB bo dem GPU,
+    // giu 6 lop la hon 1 GB => het bo nho GPU => crash trong Qt6Gui.
+    // Luon giu lop DANG VE (uid), chi don cac lop khac.
+    {
+        constexpr qint64 kGpuBudget = 256LL * 1024 * 1024;
+        qint64 total = 0;
+        for (auto it = m_bufs.cbegin(); it != m_bufs.cend(); ++it) total += it.value().bytes;
+        if (total > kGpuBudget) {
+            auto it = m_bufs.begin();
+            while (it != m_bufs.end() && total > kGpuBudget) {
+                if (it.key() == uid) { ++it; continue; }
+                qDebug().noquote() << "[vgr] EVICT buffers uid=" << it.key()
+                                   << " bytes=" << it.value().bytes;
+                total -= it.value().bytes;
                 destroyBuffers(it.value());
                 it = m_bufs.erase(it);
-            } else {
-                ++it;
             }
+            m_usedKeys.clear();
+            m_usedKeys.insert(uid);
         }
-        m_usedKeys.clear();
-        m_usedKeys.insert(uid);
     }
 
     GLboolean blendWasOn = glIsEnabled(GL_BLEND);
@@ -404,7 +433,11 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
         m_fillProg->setUniformValue(m_fillMvpLoc, mvp);
         uploadClips(m_fillProg);
         glx->glBindVertexArray(buf.fillVao);
-        glDrawArrays(GL_TRIANGLES, 0, buf.fillVerts);
+
+        // Luot 1: chi ve fill DUC. Fill trong suot de sau cung (giong che do don).
+        const int opaqueVerts = layer.fillOpaqueFloats() / 2;
+        if (opaqueVerts > 0) glDrawArrays(GL_TRIANGLES, 0, opaqueVerts);
+
         glx->glBindVertexArray(0);
         m_fillProg->release();
     }
@@ -415,6 +448,7 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
         uploadClips(m_vecProg);
         glUniform2f(m_vecViewportLoc, float(viewportPx.width()), float(viewportPx.height()));
         glUniform1f(m_vecPxPerPtLoc, pxPerPt);
+        glUniform1f(m_vecCovFloorLoc, m_covFloor);
 
         glx->glBindVertexArray(buf.vao);
         glx->glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, buf.segs);
@@ -454,8 +488,16 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, src.width(), src.height(), 0,
                                  GL_RGBA, GL_UNSIGNED_BYTE, src.constBits());
                 }
-                glGenerateMipmap(GL_TEXTURE_2D);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                // 🔴 CHI sinh mipmap cho tile CHU (anh mot kenh alpha). Tile ANH la RGBA
+                //    KHONG nhan san alpha: diem trong suot co RGB = den, mipmap tron chung
+                //    vao lam anh nga den khi thu nho (bug logo o che do don, da va 19/08).
+                //    Anh khong mipmap chi hoi ram rang cua khi thu rat nho — doi lai mau DUNG.
+                if (tt.isAlpha) {
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                } else {
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                }
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -474,6 +516,11 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
         }
     };
 
+    // Tile (anh + chu) la lop ban trong suot, KHONG duoc ghi chieu sau: mot tile anh do duc 34%
+    // ma ghi depth se loai cac tile CHU ve sau qua phep kiem chieu sau, du chu phai hien ra o
+    // cac khe ho. (Giong PdfGpuView.cpp truoc khoi tile.)
+    glDepthMask(GL_FALSE);
+
     if (m_tileProg && buf.tileVao) {
         m_tileProg->bind();
         glUniformMatrix4fv(m_tileMvpLoc, 1, GL_FALSE, mvp.constData());
@@ -483,6 +530,23 @@ void VectorGpuRenderer::draw(VectorLayer& layer, const QMatrix4x4& mvp,
         drawTilesLocal(layer.textTiles(), buf.texText);
         glx->glBindVertexArray(0);
         m_tileProg->release();
+    }
+
+    // Luot 2: fill TRONG SUOT — ve sau cung de tron alpha dung thu tu nhu che do don
+    // (PdfGpuView.cpp:2268-2276). Thieu luot nay lam mat cac net rat mo.
+    if (m_fillProg && buf.fillVao && !layer.fillVerts().isEmpty()) {
+        const int allVerts    = layer.fillVerts().size() / 2;
+        const int opaqueVerts = layer.fillOpaqueFloats() / 2;
+        const int alphaVerts  = allVerts - opaqueVerts;
+        if (alphaVerts > 0) {
+            m_fillProg->bind();
+            m_fillProg->setUniformValue(m_fillMvpLoc, mvp);
+            uploadClips(m_fillProg);
+            glx->glBindVertexArray(buf.fillVao);
+            glDrawArrays(GL_TRIANGLES, opaqueVerts, alphaVerts);
+            glx->glBindVertexArray(0);
+            m_fillProg->release();
+        }
     }
 
     glDisable(GL_DEPTH_TEST);

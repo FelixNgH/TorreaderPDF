@@ -24,6 +24,8 @@ class QComboBox;
 class QLabel;
 class QFrame;
 
+class ThumbCurrentPageDelegate;
+
 class ThumbnailPanel : public QWidget {
     Q_OBJECT
 public:
@@ -78,6 +80,11 @@ public:
 
 public slots:
     void onPageReady(int pageIndex, const QImage& image, quint64 epoch);
+    // 🔴 2026-08-31: nhan anh trang DAY DU da render san, thu nho lam thumbnail.
+    // Do duoc: thumbnail cua trang quai vat ton 11.942 ms — gan bang mot luot render day du,
+    // vi PDFium phai DOC LAI toan bo 2,54 trieu doi tuong du anh ra chi 300px.
+    // Anh day du DA co san => chi can scale, khoi doc lai.
+    void acceptFromFullRender(int pageIndex, const QImage& fullImg);
 
 signals:
     void pageClicked(int pageIndex);
@@ -89,12 +96,18 @@ signals:
     void pagesReordered(QList<int> newOrder);
     void bookmarksReordered(QList<int> newOrder);
     void annotToolSelected(int toolId);
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): nguoi dung bam nut "Insert" trong
+    // tab Comments — MainWindow mo hộp chon anh roi chen vao PDF thanh Stamp.
+    void insertImageRequested();
     void commentActivated(int pageIndex, int annotIndex);
     void commentTextEdited(int page, int indexInPage, const QString& text);
     void annotStyleChanged(QColor color, double width, bool fill, int fillOpacityPct, double fontSize);
     void requestComments();
+    void sidebarTabChanged(int newIndex);
+    void lowResPageAvailable(int pageIndex, const QImage& img);
 
 private:
+    friend class ThumbCurrentPageDelegate;
     bool eventFilter(QObject* o, QEvent* e) override;
     void requestVisibleThumbnails();
     void resizeEvent(QResizeEvent* event) override;
@@ -107,6 +120,7 @@ private:
     void applyToolButtonStyles();
     void updateColorBtnStyle();
     QColor currentPageHighlight() const;
+    int currentPageIndex() const { return m_currentPage; }
 
     // Tab navigation: 2×2 button grid + stacked content widget
     QStackedWidget* m_stack          = nullptr;

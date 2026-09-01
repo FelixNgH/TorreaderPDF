@@ -11,12 +11,14 @@ enum class CacheZoom : uint8_t { Thumb=0, Full=1, Double=2, Quad=3 };
 CacheZoom zoomBandFor(double scaleFactor);
 double canonicalScale(CacheZoom band);
 
-// Disk cache — stores per-page PNG images. Magic bump to TORCACH4 invalidates
+// Disk cache — stores per-page PNG images. Magic bump to TORCACH6 invalidates
 // old caches from the pre-tiling era. Per-tile disk caching is deferred (the
 // in-memory tile cache in PdfRenderer handles the primary working set).
 #pragma pack(push, 1)
 struct TorCacheHeader {
-    char     magic[8];       // "TORCACH4"
+    char     magic[8];       // "TORCACH6" — nang tu 4 len 5 ngay 2026-08-31: ban 4 co the chua ANH VE DO
+                             // (render bi cat giua chung van duoc ghi nhu anh day du). Doi magic de
+                             // moi bo dem cu tu dong bi coi la khong hop le va dung lai tu dau.
     uint64_t pdfHash;
     uint64_t pdfSize;
     uint32_t pageCount;

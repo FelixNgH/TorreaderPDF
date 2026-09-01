@@ -59,7 +59,7 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
                 m_file.seek(0);
                 m_file.read(reinterpret_cast<char*>(&m_header), sizeof(TorCacheHeader));
 
-                bool valid = std::strncmp(m_header.magic, "TORCACH4", 8) == 0
+                bool valid = std::strncmp(m_header.magic, "TORCACH6", 8) == 0
                           && m_header.pdfHash   == pdfHash
                           && m_header.pdfSize   == pdfSize
                           && m_header.pageCount == (uint32_t)pageCount;
@@ -84,7 +84,7 @@ bool TileCacheFile::open(const QString& pdfPath, uint64_t pdfHash, uint64_t pdfS
     if (!m_file.open(QIODevice::ReadWrite | QIODevice::Truncate)) return false;
 
     std::memset(&m_header, 0, sizeof(m_header));
-    std::memcpy(m_header.magic, "TORCACH4", 8);
+    std::memcpy(m_header.magic, "TORCACH6", 8);
     m_header.pdfHash    = pdfHash;
     m_header.pdfSize    = pdfSize;
     m_header.pageCount  = static_cast<uint32_t>(pageCount);

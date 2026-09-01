@@ -5,7 +5,7 @@
 #include "AnnotationTypes.h"
 
 struct MarkupUndoEntry {
-    enum Kind { AddShape, DeleteShape, MoveAnnot, RetextAnnot, RestyleAnnot, AddNote, DeleteNote, ContentsEdit };
+    enum Kind { AddShape, DeleteShape, MoveAnnot, RetextAnnot, RestyleAnnot, AddNote, DeleteNote, ContentsEdit, ResizeStamp };
     Kind          kind = AddShape;
     int           page = -1;
     QString       uid;
@@ -32,4 +32,7 @@ struct MarkupUndoEntry {
     float   noteFontSize = 11.0f;
     bool    noteWithBackground = false;
     bool    noteIsPopup = false;
+
+    // ResizeStamp (Insert Image 2026-08-30): rect co gian toa do hien thi.
+    QRectF  rectOld, rectNew;
 };

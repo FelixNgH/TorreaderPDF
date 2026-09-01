@@ -1,6 +1,8 @@
 #include "AnnotationManager.h"
 #include "../core/PdfCoords.h"
 #include "../core/PageCache.h"
+#include "../core/PdfiumLock.h"
+#include "../core/OwnAnnotHideGuard.h"
 #include <fpdf_edit.h>
 #include <fpdf_save.h>
 #include <QMutex>
@@ -15,6 +17,7 @@
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QCoreApplication>
 #include <QDebug>
 #include <QUuid>
 
@@ -74,8 +77,130 @@ static QString subtypeName(FPDF_ANNOTATION_SUBTYPE t) {
         case FPDF_ANNOT_CIRCLE:      return "Ellipse";
         case FPDF_ANNOT_LINE:        return "Line";
         case FPDF_ANNOT_INK:         return "Freehand";
+        case FPDF_ANNOT_STAMP:       return "Stamp";
         case FPDF_ANNOT_WIDGET:      return "Widget";
         default:                     return "Annotation";
+    }
+}
+
+// ── Insert Image (SPEC_INSERT_IMAGE_2026-08-30) ──────────────────────────────
+// Tao FPDF_PAGEOBJECT IMAGE tu QImage (giu kenh alpha - Format_ARGB32_Premultiplied
+// giong het FPDFBitmap_BGRA). Matrix fill dung rect trong toa do PDF CHUA xoay.
+// Ben goi PHAI giu s_pdfiumMutex + mo trang.
+static FPDF_PAGEOBJECT makeStampImageObject(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                            const QImage& src,
+                                            double a, double d, double e, double f) {
+    QImage img = src.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    if (img.isNull()) return nullptr;
+    // FPDFBitmap_CreateEx KHONG sao chep: chi tro toi bo dem cua img. SetBitmap
+    // giu con tro do, ma img (bien cuc bo) chet khi ham ket thuc ⇒ doc vung chet.
+    // Dung FPDFBitmap_Create de PDFium SO HUU bo nho, roi copy tung dong vao
+    // (stride cua PDFium co the khac cua QImage).
+    FPDF_BITMAP bmp = FPDFBitmap_Create(img.width(), img.height(), /*alpha=*/1);
+    if (!bmp) return nullptr;
+    {
+        const int dstStride = FPDFBitmap_GetStride(bmp);
+        uint8_t* dst = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bmp));
+        for (int y = 0; y < img.height(); ++y)
+            memcpy(dst + y * dstStride, img.constScanLine(y),
+                   qMin<int>(dstStride, img.bytesPerLine()));
+    }
+    FPDF_PAGEOBJECT obj = FPDFPageObj_NewImageObj(doc);
+    if (!obj) { FPDFBitmap_Destroy(bmp); return nullptr; }
+    if (!FPDFImageObj_SetBitmap(&page, 1, obj, bmp)) {
+        FPDFBitmap_Destroy(bmp);
+        FPDFPageObj_Destroy(obj);
+        return nullptr;
+    }
+    FPDFBitmap_Destroy(bmp);
+    if (!FPDFImageObj_SetMatrix(obj, a, 0.0, 0.0, d, e, f)) {
+        FPDFPageObj_Destroy(obj);
+        return nullptr;
+    }
+    return obj;
+}
+
+// Doc anh goc cua Stamp annot (object IMAGE dau tien) ra QImage de overlay ve
+// + de snapshot/hoan tac. Rong = khong co object imgae (vi du Stamp FORM cua
+// phan mem khac — khong ve duoc qua overlay). Ben goi PHAI giu s_pdfiumMutex.
+//
+// PNG trong suot: PDFium luu alpha thanh SMask; FPDFImageObj_GetBitmap() (fpdf_edit
+// .h:807-809) BO QUA mask + matrix => tra bitmap rong voi anh trong suot => annot
+// bi loai khoi danh sach ve (chi con vien select). Dung FPDFImageObj_GetRendered
+// Bitmap() (fpdf_edit.h:820-833, "takes the image mask and image matrix into
+// account") truoc; NULL moi lui ve GetBitmap (du phong cho anh khong mask).
+static void captureStampImage(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                              FPDF_ANNOTATION annot, QImage& out) {
+    out = QImage();
+    const int n = FPDFAnnot_GetObjectCount(annot);
+    for (int i = 0; i < n; ++i) {
+        FPDF_PAGEOBJECT obj = FPDFAnnot_GetObject(annot, i);
+        if (!obj) continue;
+        if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
+        const char* src = "FAIL";
+        FPDF_BITMAP bmp = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+        if (bmp) {
+            // Do phan giai cua GetRenderedBitmap = ty le matrix (diem PDF ~ px).
+            // Stamp ve nho => bitmap ti hon anh goc. Phong matrix tam (nhu
+            // VectorLayer.cpp:892-922) de lay lai do phan giai gan nhat roi
+            // TRA LAI NGAY — buoc nay mới ra mask ratio dung + alpha sạch.
+            const int rw0 = FPDFBitmap_GetWidth(bmp), rh0 = FPDFBitmap_GetHeight(bmp);
+            FPDF_IMAGEOBJ_METADATA md{};
+            unsigned int natW = 0, natH = 0;
+            if (FPDFImageObj_GetImageMetadata(obj, page, &md)) { natW = md.width; natH = md.height; }
+            FS_MATRIX om{};
+            if (rw0 > 0 && rh0 > 0 && natW > 0 && natH > 0
+                && FPDFPageObj_GetMatrix(obj, &om) != 0) {
+                const double k = qMin(qMin(double(natW) / double(rw0),
+                                           double(natH) / double(rh0)),
+                                      std::sqrt(4000000.0 / double(qMax(1, rw0 * rh0))));
+                if (k > 1.5) {
+                    FS_MATRIX big{ float(om.a * k), float(om.b * k),
+                                   float(om.c * k), float(om.d * k), om.e, om.f };
+                    if (FPDFPageObj_SetMatrix(obj, &big)) {
+                        FPDF_BITMAP bmp2 = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                        FPDFPageObj_SetMatrix(obj, &om);
+                        if (bmp2) { FPDFBitmap_Destroy(bmp); bmp = bmp2; }
+                    }
+                }
+            }
+            src = "rendered";
+        } else {
+            bmp = FPDFImageObj_GetBitmap(obj);
+            if (bmp) src = "legacy";
+        }
+        if (!bmp) {
+            qDebug().noquote() << "[imgstamp] capture w=0 h=0 fmt=0 src=FAIL";
+            continue;
+        }
+        const int w = FPDFBitmap_GetWidth(bmp), h = FPDFBitmap_GetHeight(bmp);
+        qDebug().noquote() << "[imgstamp] capture w=" << w << " h=" << h
+                           << " fmt=" << FPDFBitmap_GetFormat(bmp) << " src=" << src;
+        const int fmt = FPDFBitmap_GetFormat(bmp);
+        const int stride = FPDFBitmap_GetStride(bmp);
+        const unsigned char* buf =
+            reinterpret_cast<const unsigned char*>(FPDFBitmap_GetBuffer(bmp));
+        if (w <= 0 || h <= 0 || !buf) { FPDFBitmap_Destroy(bmp); continue; }
+        const bool hasAlpha = (fmt == FPDFBitmap_BGRA);
+        QImage img(w, h, hasAlpha ? QImage::Format_ARGB32_Premultiplied
+                                  : QImage::Format_RGB32);
+        for (int y = 0; y < h && y < img.height(); ++y) {
+            const QRgb* s = reinterpret_cast<const QRgb*>(buf + qint64(y) * stride);
+            QRgb* d = reinterpret_cast<QRgb*>(img.scanLine(y));
+            if (hasAlpha) {
+                std::memcpy(d, s, size_t(w) * 4);
+            } else {
+                for (int x = 0; x < w; ++x)
+                    d[x] = qRgb(qRed(s[x]), qGreen(s[x]), qBlue(s[x]));
+            }
+        }
+        FPDFBitmap_Destroy(bmp);
+        // Giu bo nho: overlay ve theo /Rect nen chi can nguon vua phai.
+        const int kMax = 1024;
+        if (img.width() > kMax || img.height() > kMax)
+            img = img.scaled(QSize(kMax, kMax), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        out = img;
+        break;
     }
 }
 
@@ -129,12 +254,17 @@ FPDF_FONT AnnotationManager::unicodeFont() {
 
 void AnnotationManager::setDocument(FPDF_DOCUMENT doc, const QString& filePath) {
     {
-        QMutexLocker lk(&s_pdfiumMutex);
-        const auto pend = m_pendingGen;
-        for (int p : pend) flushGenerate_locked(p);
-        if (m_doc && m_doc != doc) {
-            // Tai lieu cu sap bi dong — xoa trang cua no khoi PageCache (con tro chet).
-            PageCache::forgetDocument(m_doc);
+        // 🔴 VIỆC 1: GUI chi duoc tryLock(0). Neu khong lay duoc, pending gen
+        // se flush luc saveDocument, forgetDocument(tai lieu cu) o ~PdfDocument::close.
+        TryPdfiumLock lk(__FILE__, __LINE__);
+        if (lk.held()) {
+            const auto pend = m_pendingGen;
+            for (int p : pend) flushGenerate_locked(p);
+            if (m_doc && m_doc != doc) {
+                PageCache::forgetDocument(m_doc);
+            }
+        } else {
+            qDebug().noquote() << "[annot] setDocument SKIP flush — khoa ban";
         }
     }
     m_doc  = doc;
@@ -145,10 +275,17 @@ void AnnotationManager::setDocument(FPDF_DOCUMENT doc, const QString& filePath) 
 
 AnnotationManager::~AnnotationManager() {
     {
-        QMutexLocker lk(&s_pdfiumMutex);
-        const auto pend = m_pendingGen;
-        for (int p : pend) flushGenerate_locked(p);
-        if (m_doc) PageCache::forgetDocument(m_doc);
+        // 🔴 VIỆC 1: destructor chay o background (closeJob: delete t) hoac GUI
+        // (MainWindow::~MainWindow). Neu GUI khong lay duoc khoa, bo qua flush
+        // (pending gen duoc flush luc save, forgetDocument o ~PdfDocument::close).
+        TryPdfiumLock lk(__FILE__, __LINE__);
+        if (lk.held()) {
+            const auto pend = m_pendingGen;
+            for (int p : pend) flushGenerate_locked(p);
+            if (m_doc) PageCache::forgetDocument(m_doc);
+        } else {
+            qDebug().noquote() << "[annot] ~AnnotationManager SKIP flush — khoa ban";
+        }
     }
 }
 
@@ -158,16 +295,18 @@ FPDF_PAGE AnnotationManager::acquireSharedPage(int pageIndex) {
 
 void AnnotationManager::pinPage_locked(int pageIndex) {
     PageCache::acquire(m_doc, pageIndex);
+    // R1: cap doi acquire() — warm cache, release ngay sau khi nap (trang o lai MRU).
+    PageCache::PageBorrow _b(m_doc, pageIndex);
 }
 
-void AnnotationManager::pinPage(int pageIndex) { QMutexLocker lk(&s_pdfiumMutex); pinPage_locked(pageIndex); }
+void AnnotationManager::pinPage(int pageIndex) { TimedPdfiumLock lk(__FILE__, __LINE__); pinPage_locked(pageIndex); }
 
 bool AnnotationManager::isSharedPage(int pageIndex) const {
     return PageCache::tryAcquire(m_doc, pageIndex) != nullptr;
 }
 
 void AnnotationManager::releaseSharedPage() {
-    QMutexLocker lk(&s_pdfiumMutex);
+    TimedPdfiumLock lk(__FILE__, __LINE__);
     releaseSharedPage_locked();
 }
 
@@ -179,6 +318,7 @@ void AnnotationManager::flushGenerate_locked(int pageIndex) {
     if (!m_pendingGen.contains(pageIndex) || !m_doc) return;
     FPDF_PAGE p = PageCache::acquire(m_doc, pageIndex);
     if (p) {
+        PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
         QElapsedTimer _gt; _gt.start();
         setOwnNoteObjectsActive(p, true);
         FPDFPage_GenerateContent(p);
@@ -187,13 +327,39 @@ void AnnotationManager::flushGenerate_locked(int pageIndex) {
     m_pendingGen.remove(pageIndex);
 }
 
-QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
+QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex, bool* outOk) {
     QList<AnnotInfo> result;
+    if (outOk) *outOk = false;
     if (!m_doc) return result;
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    // 🔴 VIỆC 1 (SPEC_SMOOTH_123 31/08): LUONG GIAO DIEN chi duoc tryLock(0).
+    // Lay duoc thi lam; KHONG lay duoc thi tra du lieu cu + day viec that sang
+    // luong nen (ben goi goi loadPage voi outOk==nullptr tren QtConcurrent se
+    // blocking hop le). TUYET DOI khong con "thu 3 lan roi cho that" (livelock).
+    const bool isMain = (QThread::currentThread() == QCoreApplication::instance()->thread());
+    if (isMain && outOk) {
+        TryPdfiumLock lock(__FILE__, __LINE__);
+        if (!lock.held()) {
+            qDebug().noquote() << "[annot] loadPage SKIP — khoa ban, day sang luong nen page=" << pageIndex;
+            return result;   // *outOk = false — ben goi GIU du lieu cu
+        }
+        result = loadPage_locked(pageIndex);
+        if (outOk) *outOk = true;
+        return result;
+    }
+
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    result = loadPage_locked(pageIndex);
+    if (outOk) *outOk = true;
+    return result;
+}
+
+QList<AnnotInfo> AnnotationManager::loadPage_locked(int pageIndex) {
+    QList<AnnotInfo> result;
+    if (!m_doc) return result;
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return result;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
@@ -205,6 +371,7 @@ QList<AnnotInfo> AnnotationManager::loadPage(int pageIndex) {
     _parseT.start();
 
     for (int i = 0; i < count; ++i) {
+        if (m_stopScan.load()) break;
         FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
         if (!annot) continue;
 
@@ -277,7 +444,10 @@ void AnnotationManager::loadAllStreaming(int pageCount, int startPage) {
     }
 
     for (int i : order) {
-        if (m_stopScan.load()) return;
+        if (m_stopScan.load()) {
+            qDebug().noquote() << "[comments] scan CANCEL";
+            return;
+        }
         QElapsedTimer pageTimer;
         pageTimer.start();
         QList<AnnotInfo> pageAnnots = loadPage(i);
@@ -296,8 +466,23 @@ void AnnotationManager::loadAllStreaming(int pageCount, int startPage) {
         if (pagesScanned % 5 == 0)
             emit scanProgress(pagesScanned, pageCount);
 
+        // Giu nhip nhuong buoc giua cac trang: nha khoa (loadPage da unlock),
+        // roi msleep truoc khi lay lai. QMutex barging — lay lai NGAY khong
+        // cuu duoc ai, PHAI nghi mot nhip (bai hoc 19/08).
         QThread::yieldCurrentThread();
-        QThread::msleep(1);
+        if (m_userBusy.load()) {
+            // Uu tien THAP: nguoi dung dang thao tac (markup/scroll/zoom) →
+            // nhuong buoc rong rai hon, tra khoa cho giao dien.
+            QThread::msleep(30);
+            qDebug().noquote() << "[comments] scan yield page=" << i << "userBusy";
+        } else {
+            QThread::msleep(1);
+            qDebug().noquote() << "[comments] scan yield page=" << i;
+        }
+        if (m_stopScan.load()) {
+            qDebug().noquote() << "[comments] scan CANCEL";
+            return;
+        }
     }
     emit scanProgress(pageCount, pageCount);
     qint64 totalMs = totalTimer.elapsed();
@@ -314,7 +499,8 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
     bool drawable = (sub == FPDF_ANNOT_INK || sub == FPDF_ANNOT_SQUARE ||
                      sub == FPDF_ANNOT_CIRCLE || sub == FPDF_ANNOT_HIGHLIGHT ||
                      sub == FPDF_ANNOT_LINE || sub == FPDF_ANNOT_POLYGON ||
-                     sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT);
+                     sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT ||
+                     sub == FPDF_ANNOT_STAMP);
     if (!drawable) return false;
 
     double Wd = FPDF_GetPageWidth(page);
@@ -410,6 +596,21 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
         }
     }
 
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): Stamp annot cung them anh goc
+    // de overlay ve (giu kenh alpha). Stamp FORM cua phan mem khac khong co object
+    // IMAGE → khong bao hinh, de raster/foreign layer lo ve (khong ve doi).
+    if (sub == FPDF_ANNOT_STAMP) {
+        captureStampImage(m_doc, page, annot, out.image);
+        if (out.image.isNull()) return false;
+    }
+
+    // 🔴🔴 2026-09-01, sua LAI: CA FreeText LAN Note deu de PDFium ve.
+    // Truoc do tôi cho overlay ve huy hieu "N" cho Note vi tuong PDFium khong ve icon.
+    // SAI: PDFium CO ve (icon vang, dung /AP). Hau qua: huy hieu CAM cua ta de len icon vang
+    // that ⇒ owner thay "mau cam, be net, zoom vao nhay nhay ra icon vang dung".
+    // ⭐ Single KHONG he co `case FPDF_ANNOT_TEXT` — no khong tu ve gi ca, va no dep nhat.
+    //   ⇒ Da co ban dung thi dung di lam ban gan dung. Ly do that khien Note "khong hien" la
+    //     anh trang khong duoc ve lai sau khi tao — da sua rieng o pageContentChanged.
     if (sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT)
         out.paintByOverlay = false;
 
@@ -431,9 +632,22 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
     QElapsedTimer _perf;
     _perf.start();
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    // 🔴 VIỆC 1 (SPEC_SMOOTH_123 31/08): GUI chi duoc tryLock(0). Neu GUI khong lay duoc
+    // khoa → tra rong + overlayCapable=false (ben goi GIU du lieu cu, khong xoa markup),
+    // viec that se chay o QtConcurrent (ben goi da co refreshAnnotVisuals). Duong GUI
+    // goi truc tiep nay la DEFENSE-IN-DEPTH — MainWindow da day cache-miss sang nen.
+    TryPdfiumLock lock(__FILE__, __LINE__);
+    if (!lock.held()) {
+        qDebug().noquote() << "[annot] loadPageVisuals SKIP — khoa ban page=" << page
+                           << "(day sang luong nen)";
+        if (outOverlayCapable) *outOverlayCapable = false;
+        if (hasForeign) *hasForeign = false;
+        return result;
+    }
+    QElapsedTimer _w; _w.start();
     FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (!fpage) { if (outOverlayCapable) *outOverlayCapable = false; return result; }
+    PageCache::PageBorrow _b(m_doc, page);   // R1: cap doi acquire()
 
     int count = FPDFPage_GetAnnotCount(fpage);
     bool capable = true;
@@ -443,11 +657,32 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
         if (!annot) continue;
 
         int sub = FPDFAnnot_GetSubtype(annot);
-        bool drawable = (sub == FPDF_ANNOT_INK || sub == FPDF_ANNOT_SQUARE ||
-                         sub == FPDF_ANNOT_CIRCLE || sub == FPDF_ANNOT_HIGHLIGHT ||
-                         sub == FPDF_ANNOT_LINE || sub == FPDF_ANNOT_POLYGON ||
-                         sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT);
-        if (!drawable && !(FPDFAnnot_GetFlags(annot) & FPDF_ANNOT_FLAG_HIDDEN) && sub != FPDF_ANNOT_POPUP) {
+        // TAP drawable duoc dinh nghia O MOT CHO duy nhat: isOverlayDrawnAnnot()
+        // (OwnAnnotHideGuard.h) — KHONG dinh nghia lai o day (SPEC_OVERLAY_LAYER 31/08).
+        // FreeText/Text bi LOAI khoi tap drawable: buildVisual() dat paintByOverlay=false
+        // cho dung 2 loai nay (dong ~419) => overlay THUC SU khong ve chung. De chung
+        // trong tap drawable lam trang toan FreeText van bi danh overlayCapable=1 =>
+        // canFastPath giu lop vector (khong chua annot) => markup tàng hình
+        // (hoi quy dot 19/08, do 2026-08-30: 37 FreeText deu /AP, drawn=4).
+        // ⚠️ Neu sau nay overlay ve duoc FreeText/Text, phai sua CA HAI cho:
+        //    isOverlayDrawnAnnot() VA `paintByOverlay` trong buildVisual() (dong ~419).
+        //
+        // 🔴 capable co nghia: "overlay ve duoc MỌI markup CỦA TA (co TRUID) tren trang".
+        //    Annot NGOAI (KHONG TRUID) KHONG duoc hạ capable — no nam trong anh nen, ve
+        //    MOT LAN luc mo trang, thêm/xoa markup cua ta khong dung toi no (SPEC_OVERLAY_LAYER).
+        //    Annot khong /AP khong tao ra pixel nao => khong duoc hạ capable
+        //    (mat fast-path vo co). LINK va POPUP cung khong ve ra pixel nao (Link
+        //    khong co /AP, PDFium cung khong tu sinh AP) => giu nguyen loai tru.
+        //    Chi hạ capable khi annot CO TRUID (markup cua ta) ma overlay khong ve duoc
+        //    (vi du FreeText do chinh ta tao) — truong hop do van phai di duong raster.
+        //    Dung chung isOverlayDrawnAnnot() voi anh nen (PdfRenderer) de KHONG co hai
+        //    ban logic. (Bệnh cũ 30/08 da tra gia: FreeText ngoai /AP lam ca trang mat
+        //    fast-path => ve 1 rectangle lai render 2,54 trieu doi tuong 6 giay.)
+        if (FPDFAnnot_HasKey(annot, "TRUID")
+            && !isOverlayDrawnAnnot(annot)
+            && FPDFAnnot_HasKey(annot, "AP") != 0
+            && !(FPDFAnnot_GetFlags(annot) & FPDF_ANNOT_FLAG_HIDDEN)
+            && sub != FPDF_ANNOT_POPUP && sub != FPDF_ANNOT_LINK) {
             capable = false;
             qDebug() << "[annot] page=" << page << "overlayCapable=0 reason=subtype=" << sub;
         }
@@ -488,9 +723,15 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
 bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
                                          const QString& text, const QString& author) {
     if (!m_doc) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     AnnotInfo info;
     bool ok = createPopupNote_locked(page, pageIndex, pointDisp, text, author, &info);
     if (ok) {
@@ -499,8 +740,8 @@ bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
         FPDFPage_GenerateContent(page);
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
         // Trang da bi sua: bo entry cu (cac he khac khong dung handle cu) roi nap lai cho am.
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
     }
     lock.unlock();
     if (ok) {
@@ -516,9 +757,15 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
                                           float fontSize) {
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     AnnotInfo info;
     bool ok = createInlineNote_locked(page, pageIndex, rectPdf, textIn, author,
                                        withBackground, textColor, fontSize, &info);
@@ -531,8 +778,8 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
     }
     int finalAnnotCount = FPDFPage_GetAnnotCount(page);
     if (ok) {
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
     }
     lock.unlock();
     if (ok) {
@@ -548,9 +795,15 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
@@ -608,8 +861,8 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     lock.unlock();
     bumpPageRevision(pageIndex);
     emit annotationAdded(pageIndex, info);
@@ -620,9 +873,10 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
 bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double dyU) {
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, index);
     if (!a) return false;
 
@@ -704,8 +958,8 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
             }
             FPDFPage_CloseAnnot(a2);
         }
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
         if (a2) bumpPageRevision(pageIndex);
         return a2 != nullptr;
     }
@@ -723,28 +977,144 @@ bool AnnotationManager::moveAnnot(int pageIndex, int index, double dxU, double d
     }
 
     if (ok) {
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
     }
     if (ok) bumpPageRevision(pageIndex);
     qDebug().noquote() << "[perf] note moveAnnot total ms=" << _totalT.elapsed();
     return ok;
 }
 
+QString AnnotationManager::insertStampImage(int pageIndex, const QImage& image,
+                                            QRectF rectDisp) {
+    if (!m_doc || image.isNull()) { m_lastError = "Image is empty"; return QString(); }
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
+    if (!page) { m_lastError = "Cannot load page"; return QString(); }
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
+
+    const double pageW = FPDF_GetPageWidth(page);
+    const double pageH = FPDF_GetPageHeight(page);
+    const int    rot   = FPDFPage_GetRotation(page);
+    const QPointF box  = pdfBoxOrigin(page);
+
+    // rectDisp (Y-down) -> rect PDF chua xoay qua 4 goc (dung doi phap createInlineNote).
+    QPointF tl = dispToPdf(rectDisp.left(),  rectDisp.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF tr = dispToPdf(rectDisp.right(), rectDisp.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF bl = dispToPdf(rectDisp.left(),  rectDisp.bottom(), pageW, pageH, rot, box.x(), box.y());
+    QPointF br = dispToPdf(rectDisp.right(), rectDisp.bottom(), pageW, pageH, rot, box.x(), box.y());
+    double xu_min = (std::min)({tl.x(), tr.x(), bl.x(), br.x()});
+    double xu_max = (std::max)({tl.x(), tr.x(), bl.x(), br.x()});
+    double yu_min = (std::min)({tl.y(), tr.y(), bl.y(), br.y()});
+    double yu_max = (std::max)({tl.y(), tr.y(), bl.y(), br.y()});
+    // Toi thieu 20x20 pt (de quan ly bang tay nam):
+    if (xu_max - xu_min < 20.0) { double c = (xu_min + xu_max) / 2.0; xu_min = c - 10.0; xu_max = c + 10.0; }
+    if (yu_max - yu_min < 20.0) { double c = (yu_min + yu_max) / 2.0; yu_min = c - 10.0; yu_max = c + 10.0; }
+
+    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_STAMP);
+    if (!annot) { m_lastError = "Cannot create Stamp annotation"; PageCache::bumpAnnotGeneration(m_doc, pageIndex); return QString(); }
+
+    FS_RECTF rr{ static_cast<float>(xu_min), static_cast<float>(yu_max),
+                 static_cast<float>(xu_max), static_cast<float>(yu_min) };
+    FPDFAnnot_SetRect(annot, &rr);
+
+    const double w = xu_max - xu_min, h = yu_max - yu_min;
+    FPDF_PAGEOBJECT obj = makeStampImageObject(m_doc, page, image,
+                                               w / double(qMax(1, image.width())),
+                                               h / double(qMax(1, image.height())),
+                                               xu_min, yu_min);
+    if (!obj) {
+        m_lastError = "Cannot build image object";
+        FPDFPage_CloseAnnot(annot);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        return QString();
+    }
+
+    // Anh goc vao annot content stream: /AP tu dong sinh ra tu object nay,
+    // giu nguyen kenh alpha (overlay hien thi doc lai qua captureStampImage).
+    FPDFAnnot_AppendObject(annot, obj);
+
+    m_lastCreatedUid = generateUid();
+    FPDFAnnot_SetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
+    FPDFAnnot_SetStringValue(annot, "TRTOOL", reinterpret_cast<FPDF_WIDESTRING>(QStringLiteral("Stamp").utf16()));
+
+    FPDFPage_CloseAnnot(annot);
+
+    // Sinh /AP ngay de file luu ra hien hinh + giu kenh alpha (ProcessAnnotation
+    // trong GenerateContent tao /AP/N form cua annot). PHAI truoc invalidate —
+    // invalidate pha huy page dang dang giu.
+    QElapsedTimer _gt; _gt.start();
+    FPDFPage_GenerateContent(page);
+    qDebug().noquote() << "[imgstamp] insert page=" << pageIndex
+                       << "genMs=" << _gt.elapsed() << "uid=" << m_lastCreatedUid;
+
+    // Chup index + snapshot TRUOC invalidate — nguoi goi (MainWindow) khong phai goi
+    // findAnnotIndexByUid/snapshotAnnot sau commit (trang vua invalidate => re-load 2 giay).
+    m_lastCreatedIndex = FPDFPage_GetAnnotCount(page) - 1;
+    m_lastCreatedSnapshot = snapshotAnnot_locked(page, pageIndex, m_lastCreatedIndex);
+
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
+    lock.unlock();
+    bumpPageRevision(pageIndex);
+    return m_lastCreatedUid;
+}
+
+bool AnnotationManager::setAnnotRectDisplay(int pageIndex, int index, QRectF rectDisp) {
+    if (!m_doc) return false;
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
+    if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, index);
+    if (!a) return false;
+
+    const double pageW = FPDF_GetPageWidth(page);
+    const double pageH = FPDF_GetPageHeight(page);
+    const int    rot   = FPDFPage_GetRotation(page);
+    const QPointF box  = pdfBoxOrigin(page);
+    QPointF tl = dispToPdf(rectDisp.left(),  rectDisp.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF tr = dispToPdf(rectDisp.right(), rectDisp.top(),    pageW, pageH, rot, box.x(), box.y());
+    QPointF bl = dispToPdf(rectDisp.left(),  rectDisp.bottom(), pageW, pageH, rot, box.x(), box.y());
+    QPointF br = dispToPdf(rectDisp.right(), rectDisp.bottom(), pageW, pageH, rot, box.x(), box.y());
+    double xu_min = (std::min)({tl.x(), tr.x(), bl.x(), br.x()});
+    double xu_max = (std::max)({tl.x(), tr.x(), bl.x(), br.x()});
+    double yu_min = (std::min)({tl.y(), tr.y(), bl.y(), br.y()});
+    double yu_max = (std::max)({tl.y(), tr.y(), bl.y(), br.y()});
+    if (xu_max - xu_min < 20.0) { double c = (xu_min + xu_max) / 2.0; xu_min = c - 10.0; xu_max = c + 10.0; }
+    if (yu_max - yu_min < 20.0) { double c = (yu_min + yu_max) / 2.0; yu_min = c - 10.0; yu_max = c + 10.0; }
+
+    FS_RECTF nr{ static_cast<float>(xu_min), static_cast<float>(yu_max),
+                 static_cast<float>(xu_max), static_cast<float>(yu_min) };
+    bool ok = FPDFAnnot_SetRect(a, &nr);
+    FPDFPage_CloseAnnot(a);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
+    if (ok) bumpPageRevision(pageIndex);
+    return ok;
+}
+
 int AnnotationManager::annotCount(int pageIndex) {
     if (!m_doc) return 0;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return 0;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     int count = FPDFPage_GetAnnotCount(page);
     return count;
 }
 
 bool AnnotationManager::isOwnAnnot(int pageIndex, int index) {
     if (!m_doc) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
     bool own = FPDFAnnot_HasKey(annot, "TRUID") || FPDFAnnot_HasKey(annot, "TRID");
@@ -756,9 +1126,15 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     if (!m_doc) return false;
     QElapsedTimer _totalT; _totalT.start();
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
@@ -835,8 +1211,8 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     lock.unlock();
     bumpPageRevision(pageIndex);
     emit annotationAdded(pageIndex, info);
@@ -846,9 +1222,10 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
 
 bool AnnotationManager::removeAnnot(int pageIndex, int index) {
     if (!m_doc) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     bool needsGen = false;
     bool ok = removeAnnot_locked(page, index, &needsGen);
     if (ok && needsGen) {
@@ -859,8 +1236,8 @@ bool AnnotationManager::removeAnnot(int pageIndex, int index) {
         invalidateNoteObjCache_locked(pageIndex);
     }
     if (ok) {
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
         bumpPageRevision(pageIndex);
     }
     return ok;
@@ -894,14 +1271,24 @@ bool AnnotationManager::setAnnotStyle(int pageIndex, int index, QColor color, fl
 AnnotSnapshot AnnotationManager::snapshotAnnot(int pageIndex, int index) {
     AnnotSnapshot s;
     if (!m_doc) return s;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
+    if (!page) return s;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
+    return snapshotAnnot_locked(page, pageIndex, index);
+}
+
+AnnotSnapshot AnnotationManager::snapshotAnnot_locked(FPDF_PAGE page, int pageIndex, int index) {
+    AnnotSnapshot s;
     if (!page) return s;
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (annot) {
         s.subtype = FPDFAnnot_GetSubtype(annot);
         FS_RECTF r{};
         if (FPDFAnnot_GetRect(annot, &r)) { s.rl = r.left; s.rt = r.top; s.rr = r.right; s.rb = r.bottom; }
+        // Insert Image: Stamp giu luon anh goc de hoan tac/xoa-dung lai dung net.
+        if (s.subtype == FPDF_ANNOT_STAMP)
+            captureStampImage(m_doc, page, annot, s.stamp);
         s.hasColor = FPDFAnnot_HasKey(annot, "C") && FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_Color, &s.r, &s.g, &s.b, &s.a) != 0;
         s.hasFill = FPDFAnnot_HasKey(annot, "IC") && FPDFAnnot_GetColor(annot, FPDFANNOT_COLORTYPE_InteriorColor, &s.fr, &s.fg, &s.fb, &s.fa) != 0 && s.fa > 0;
         if (!s.hasColor) {
@@ -960,9 +1347,10 @@ AnnotSnapshot AnnotationManager::snapshotAnnot(int pageIndex, int index) {
 
 bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
     if (!m_doc || !s.valid) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, static_cast<FPDF_ANNOTATION_SUBTYPE>(s.subtype));
     if (annot) {
         FS_RECTF r{ s.rl, s.rt, s.rr, s.rb };
@@ -988,14 +1376,29 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
             for (const auto& p : stroke) pts.push_back(FS_POINTF{ static_cast<float>(p.x()), static_cast<float>(p.y()) });
             if (pts.size() >= 2) FPDFAnnot_AddInkStroke(annot, pts.data(), pts.size());
         }
-        FPDFPage_CloseAnnot(annot);
+        // Insert Image: dung lai Stamp can gan lai anh goc (giu kenh alpha).
+        if (s.subtype == FPDF_ANNOT_STAMP && !s.stamp.isNull()) {
+            const double w = double(s.rr - s.rl);
+            const double h = double(s.rt - s.rb);
+            FPDF_PAGEOBJECT obj = makeStampImageObject(
+                m_doc, page, s.stamp,
+                w / double(qMax(1, s.stamp.width())),
+                h / double(qMax(1, s.stamp.height())),
+                s.rl, s.rb);
+            if (obj) FPDFAnnot_AppendObject(annot, obj);
+            // Sinh /AP ngay (nhu insertStampImage) de file luu ra hien dung.
+            FPDFPage_CloseAnnot(annot);
+            FPDFPage_GenerateContent(page);
+        } else {
+            FPDFPage_CloseAnnot(annot);
+        }
         // GenerateContent deferred to save time — annotations in /Annots are
         // preserved by FPDF_SaveAsCopy without explicit GenerateContent.
     }
     bool ok = (annot != nullptr);
     if (ok) {
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
     }
     if (ok) bumpPageRevision(pageIndex);
     return ok;
@@ -1006,9 +1409,10 @@ bool AnnotationManager::getAnnotEditState(int pageIndex, int index,
                                           float& outWidth, float& outFontSize,
                                           bool* outHasFill, int* outFillAlpha) {
     if (!m_doc) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
 
@@ -1078,9 +1482,15 @@ bool AnnotationManager::getAnnotEditState(int pageIndex, int index,
 bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString& newText) {
     if (!m_doc) { m_lastError = "No document"; return false; }
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, annotIndex);
     if (!annot) {
@@ -1096,8 +1506,7 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
     QElapsedTimer _gt; _gt.start();
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
     lock.unlock();
 
     bumpPageRevision(pageIndex);
@@ -1109,9 +1518,10 @@ bool AnnotationManager::updateNote(int pageIndex, int annotIndex, const QString&
 
 int AnnotationManager::findAnnotIndexByUid(int pageIndex, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return -1;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return -1;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     int count = FPDFPage_GetAnnotCount(page);
     for (int i = 0; i < count; ++i) {
         FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
@@ -1133,9 +1543,10 @@ int AnnotationManager::findAnnotIndexByUid(int pageIndex, const QString& uid) {
 
 int AnnotationManager::findAnnotIndexByAnyUid(int pageIndex, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return -1;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return -1;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     int count = FPDFPage_GetAnnotCount(page);
     for (int i = 0; i < count; ++i) {
         FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
@@ -1159,9 +1570,10 @@ int AnnotationManager::findAnnotIndexByAnyUid(int pageIndex, const QString& uid)
 
 QString AnnotationManager::ensureExternalUid(int pageIndex, int index) {
     if (!m_doc) return {};
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return {};
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return {};
     QString existing = readAnnotString(annot, "TRXUID");
@@ -1172,38 +1584,45 @@ QString AnnotationManager::ensureExternalUid(int pageIndex, int index) {
     QString newUid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     FPDFAnnot_SetStringValue(annot, "TRXUID", reinterpret_cast<FPDF_WIDESTRING>(newUid.utf16()));
     FPDFPage_CloseAnnot(annot);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     bumpPageRevision(pageIndex);
     return newUid;
 }
 
 bool AnnotationManager::setAnnotUid(int pageIndex, int index, const QString& uid) {
     if (!m_doc || uid.isEmpty()) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
     FPDFAnnot_SetStringValue(annot, "TRUID", reinterpret_cast<FPDF_WIDESTRING>(uid.utf16()));
     FPDFPage_CloseAnnot(annot);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     bumpPageRevision(pageIndex);
     return true;
 }
 
 bool AnnotationManager::setAnnotContents(int pageIndex, int index, const QString& text) {
     if (!m_doc) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, index);
     if (!annot) return false;
     FPDFAnnot_SetStringValue(annot, "Contents", reinterpret_cast<FPDF_WIDESTRING>(text.utf16()));
     FPDFPage_CloseAnnot(annot);
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     lock.unlock();
     bumpPageRevision(pageIndex);
     return true;
@@ -1221,9 +1640,15 @@ void AnnotationManager::bumpPageRevision(int page) {
 bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const QString& text) {
     if (!m_doc) return false;
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) { m_lastError = "Cannot load page"; return false; }
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
 
     FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT);
     if (!annot) { m_lastError = "Cannot create annotation"; return false; }
@@ -1256,8 +1681,8 @@ bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const
     QElapsedTimer _gt; _gt.start();
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
-    PageCache::invalidate(m_doc, pageIndex);
-    PageCache::acquire(m_doc, pageIndex);
+    PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+
     lock.unlock();
 
     bumpPageRevision(pageIndex);
@@ -1736,9 +2161,10 @@ QImage AnnotationManager::buildForeignAnnotLayer(int pageIndex, int wPx, int hPx
     QVector<int> hiddenByUs;
     QImage plain, withA;
     {
-        QMutexLocker lock(&s_pdfiumMutex);
+        TimedPdfiumLock lock(__FILE__, __LINE__);
         page = PageCache::acquire(m_doc, pageIndex);
         if (!page) return QImage();
+        PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
         int foreignCount = 0;
         const int n = FPDFPage_GetAnnotCount(page);
         for (int i = 0; i < n; ++i) {
@@ -1840,9 +2266,10 @@ int AnnotationManager::setOwnNoteObjectsActive(FPDF_PAGE page, bool active) {
 
 int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId) {
     if (!m_doc) return 0;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return 0;
+    PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
     int removed = removeNotePageObjects_locked(page, noteId);
     if (removed > 0) {
         setOwnNoteObjectsActive(page, true);
@@ -1850,8 +2277,8 @@ int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId)
         FPDFPage_GenerateContent(page);
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
         invalidateNoteObjCache_locked(pageIndex);
-        PageCache::invalidate(m_doc, pageIndex);
-        PageCache::acquire(m_doc, pageIndex);
+        PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+        
     }
     if (removed > 0) bumpPageRevision(pageIndex);
     return removed;
@@ -1859,15 +2286,16 @@ int AnnotationManager::removeNotePageObjects(int pageIndex, unsigned int noteId)
 
 void AnnotationManager::generateContentForPage(int page) {
     if (!m_doc) return;
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (fpage) {
+        PageCache::PageBorrow _b(m_doc, page);   // R1: cap doi acquire()
         setOwnNoteObjectsActive(fpage, true);
         QElapsedTimer _gt; _gt.start();
         FPDFPage_GenerateContent(fpage);
         qDebug().noquote() << "[perf] genContent page=" << page << "ms=" << _gt.elapsed();
-        PageCache::invalidate(m_doc, page);
-        PageCache::acquire(m_doc, page);
+        PageCache::bumpAnnotGeneration(m_doc, page);
+
         bumpPageRevision(page);
     }
 }
@@ -1877,14 +2305,15 @@ void AnnotationManager::flushPendingGenerate(int page) {
     if (!m_doc) { m_pendingGenerate.remove(page); return; }
     QElapsedTimer _gt;
     _gt.start();
-    QMutexLocker lock(&s_pdfiumMutex);
+    TimedPdfiumLock lock(__FILE__, __LINE__);
     FPDF_PAGE fpage = PageCache::acquire(m_doc, page);
     if (fpage) {
+        PageCache::PageBorrow _b(m_doc, page);   // R1: cap doi acquire()
         setOwnNoteObjectsActive(fpage, true);
         FPDFPage_GenerateContent(fpage);
         qDebug().noquote() << "[perf] genContent page=" << page << "ms=" << _gt.elapsed();
-        PageCache::invalidate(m_doc, page);
-        PageCache::acquire(m_doc, page);
+        PageCache::bumpAnnotGeneration(m_doc, page);
+
         bumpPageRevision(page);
     }
     m_pendingGenerate.remove(page);
@@ -1911,7 +2340,12 @@ bool AnnotationManager::saveDocument() {
     fw.base.WriteBlock = FileWriter::WriteBlock;
     fw.file = &file;
 
-    QMutexLocker lock(&s_pdfiumMutex);
+    QElapsedTimer _w; _w.start();
+    TimedPdfiumLock lock(__FILE__, __LINE__);
+    if (_w.elapsed() > 300)
+        qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
+                           << "at" << __FILE__ << ":" << __LINE__ << "main="
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
     {
         const auto pend = m_pendingGen;
         for (int p : pend) flushGenerate_locked(p);

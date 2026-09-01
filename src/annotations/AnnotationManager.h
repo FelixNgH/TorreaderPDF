@@ -42,6 +42,9 @@ struct AnnotSnapshot {
     QString contents;
     QString uid;
     QVector<QVector<QPointF>> ink;
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): hic anh goc cua Stamp annot
+    // (pixel giu kenh alpha) de snapshot/addSnapshot hoan tac dugoc.
+    QImage  stamp;
 };
 
 // Overlay annotation data — coordinates in display space (Y-down, rotation applied).
@@ -61,6 +64,9 @@ struct AnnotVisual {
     bool     hasColor = false;  // /C co trong annot dict
     bool     hasFill  = false;  // /IC co trong annot dict
     bool     hasAP    = false;  // /AP co trong annot dict
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): anh goc cua Stamp annot de
+    // overlay ve (giu kenh alpha). Rong = khong ve duoc qua overlay.
+    QImage   image;
     // ponytail: FreeText/Note are drawn as page objects in renderer, not by overlay
     bool     paintByOverlay = true;
 };
@@ -76,7 +82,14 @@ public:
     void setDocument(FPDF_DOCUMENT doc, const QString& filePath);
 
     // Read all annotations from one page (fast, called per-page).
-    QList<AnnotInfo> loadPage(int pageIndex);
+    // outOk (optional): when provided, loadPage MUST NOT block the GUI — it uses
+    // tryLock and reports whether the page was actually read. *outOk=false means
+    // "chua doc duoc (khoa ban)" — NOT "khong co annot". Caller must keep old data
+    // and reschedule. When outOk==nullptr, loadPage blocks like before (background
+    // scan / headless tests).
+    QList<AnnotInfo> loadPage(int pageIndex, bool* outOk = nullptr);
+    // GIA DINH ben goi DA giu s_pdfiumMutex. Than xu ly thuc su cua loadPage.
+    QList<AnnotInfo> loadPage_locked(int pageIndex);
 
     // Read all annotations across the whole document.
     QList<AnnotInfo> loadAll(int pageCount);
@@ -128,6 +141,15 @@ public:
     // INK (Freehand): snapshot + remove + add (vi PDFium khong cho sua InkList tai cho).
     bool moveAnnot(int pageIndex, int index, double dxU, double dyU);
 
+    // ── Insert Image (SPEC_INSERT_IMAGE_2026-08-30) ─────────────────────────
+    // Tao STAMP annot tu anh (giu kenh alpha); rectDisp o TOA DO HIEN THI
+    // (Y-down, da ap /Rotate + pageBoxOrigin). Sinh /AP ngay de file luu ra
+    // hien dung, giu trong suot. Tra TRUID neu xong, rong neu that bai.
+    QString insertStampImage(int pageIndex, const QImage& image, QRectF rectDisp);
+    // Co giãn Stamp annot: dat /Rect moi (toa do hien thi) — PDFium tu scale
+    // AP form vua /Rect nen chi can /Rect. Toi thieu 20x20 pt. Goi bumpPageRevision.
+    bool setAnnotRectDisplay(int pageIndex, int index, QRectF rectDisp);
+
     // Annot cua TorReader co TRUID (moi) hoac TRID (note cu). Khong co ca hai = cua phan mem khac.
     bool isOwnAnnot(int pageIndex, int index);
 
@@ -135,6 +157,9 @@ public:
     int annotCount(int pageIndex);
 
     AnnotSnapshot snapshotAnnot(int pageIndex, int index);
+    // GIA DINH: ben goi DA giu s_pdfiumMutex va co `page` mo — dung de chup snapshot
+    // NGAY TRUOC invalidate (khong re-load trang 2 giay nhu snapshotAnnot sau commit).
+    AnnotSnapshot snapshotAnnot_locked(FPDF_PAGE page, int pageIndex, int index);
     bool addSnapshot(int pageIndex, const AnnotSnapshot& s);
 
     // Read-back for Properties dialog. Returns false if annot does not exist.
@@ -150,6 +175,10 @@ public:
 
     void stopScan()  { m_stopScan.store(true); }
     void resetScan() { m_stopScan.store(false); }
+    bool scanStopped() const { return m_stopScan.load(); }
+    // Low-priority: user dang thao tac (markup/scroll/zoom) → scan nhuong buoc.
+    void setUserBusy(bool b) { m_userBusy.store(b); }
+    bool isUserBusy() const { return m_userBusy.load(); }
 
     // Generate content for a single page (called just before save from deferred set).
     static int setOwnNoteObjectsActive(FPDF_PAGE page, bool active);
@@ -162,6 +191,8 @@ public:
     bool saveDocument();
     QString lastError() const { return m_lastError; }
     QString lastCreatedUid() const { return m_lastCreatedUid; }
+    int lastCreatedIndex() const { return m_lastCreatedIndex; }
+    AnnotSnapshot lastCreatedSnapshot() const { return m_lastCreatedSnapshot; }
 
     // Kept for --foreignbench headless benchmark (main.cpp). Not used by GUI.
     QImage buildForeignAnnotLayer(int pageIndex, int wPx, int hPx);
@@ -200,16 +231,24 @@ private:
     void invalidateNoteObjCache_locked(int pageIndex);
 
     std::atomic<bool> m_stopScan{false};
+    std::atomic<bool> m_userBusy{false};
     QHash<int, quint32> m_pageRev;
     QSet<int> m_pendingGenerate;
     QSet<int> m_pendingGen;                  // trang co page object doi, chua sinh noi dung
     QHash<QPair<int,quint32>, QVector<int>> m_noteObjIdxCache;
+
+    // Livelock fix (2026-08-31): dem so lan tryLock truot LIEN TIEP theo trang cho
+    // duong loadPage (chi khi outOk!=nullptr = duong GUI). >= 3 lan thi CHO THAT
+    // (khoa blocking) de dut diem, khong hen lai nhap nhay mai. Reset khi lay duoc khoa.
+    QHash<int,int> m_loadPageRetry;
 
     FPDF_DOCUMENT m_doc     = nullptr;
     QString       m_path;
     QString       m_lastError;
     unsigned int  m_nextNoteId = 1;
     QString m_lastCreatedUid;
+    int m_lastCreatedIndex = -1;
+    AnnotSnapshot m_lastCreatedSnapshot;
 
 public:
     // BO LOP DEM CŨ (m_pinLru + m_scratchPage) — thay bang PageCache chung
@@ -217,6 +256,9 @@ public:
     // MainWindow / harness cũ dung duoc; than noi duoi la PageCache::acquire /
     // forgetDocument. PageCache la chu so huu duy nhat cua FPDF_PAGE.
     bool isSharedPage(int pageIndex) const;
+    // Tra FPDF_PAGE muon tu PageCache (borrow++). Ben goi PHAI goi
+    // PageCache::release(m_doc, pageIndex) / PageCache::PageBorrow khi dung xong
+    // (SPEC_PERF_HEAVYPAGE R1 — moi acquire phai di cap release).
     FPDF_PAGE acquireSharedPage(int pageIndex);
     void pinPage(int pageIndex);
     void pinPage_locked(int pageIndex);

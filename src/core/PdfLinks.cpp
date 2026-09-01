@@ -1,6 +1,7 @@
 #include "PdfLinks.h"
 #include "PdfCoords.h"
 #include "PageCache.h"
+#include "PdfiumLock.h"
 #include <fpdf_doc.h>
 #include <fpdf_edit.h>
 #include <QtConcurrent>
@@ -22,6 +23,8 @@ static void computePage(FPDF_DOCUMENT doc, int pageIndex,
     if (!doc || pageIndex < 0) return;
     QElapsedTimer t; t.start();
     FPDF_PAGE page = PageCache::acquire(doc, pageIndex);
+    // R1: cap doi acquire() — tu dong release khi ra khoi ham (moi duong thoat).
+    PageCache::PageBorrow _borrow(doc, pageIndex);
     if (page) {
         info.dispW = FPDF_GetPageWidth(page);
         info.dispH = FPDF_GetPageHeight(page);
@@ -90,7 +93,7 @@ QVector<PdfLink> PdfLinks::forPage(FPDF_DOCUMENT doc, int pageIndex) {
     QVector<PdfLink> links;
     PageInfo info;
     if (doc && pageIndex >= 0) {
-        QMutexLocker lk(&s_pdfiumMutex);
+        TimedPdfiumLock lk(__FILE__, __LINE__);
         computePage(doc, pageIndex, links, info);
     }
 
@@ -131,7 +134,7 @@ void PdfLinks::requestPage(FPDF_DOCUMENT doc, int pageIndex) {
         {
             // Giu s_pdfiumMutex de doc->close() (cung giu mutex nay) khong the
             // giai phong doc trong luc LoadPage.
-            QMutexLocker lk(&s_pdfiumMutex);
+            TimedPdfiumLock lk(__FILE__, __LINE__);
             {
                 QMutexLocker ck(&PdfLinks::s_mutex);
                 if (ep != PdfLinks::s_epoch || !PdfLinks::s_pending.contains(k)) {

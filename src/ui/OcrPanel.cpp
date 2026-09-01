@@ -2,7 +2,9 @@
 #include "ThemeTokens.h"
 #include "../core/PdfDocument.h"
 #include "../core/OcrTextLayer.h"
+#include "../core/PageCache.h"
 #include "../core/OcrEngine.h"
+#include "../core/PdfiumLock.h"
 
 #include <QSettings>
 #include <QFileInfo>
@@ -19,6 +21,9 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QMutex>
+#include <QtConcurrent>
+#include <QPointer>
+#include <QApplication>
 #include <fpdfview.h>
 #include <fpdf_text.h>
 
@@ -40,21 +45,6 @@ int pageHasTextCachedFlag(FPDF_DOCUMENT doc, int pageIndex) {
     auto pIt = dIt->constFind(pageIndex);
     if (pIt == dIt->cend()) return -1;
     return pIt.value() ? 1 : 0;
-}
-
-// Trang co chu THUC SU (FPDFText_CountChars > 0) khong? Khong LoadPage lien tuc
-// voi nhau qua con tro; tra so ky tu qua charsOut (nullptr = khong can).
-bool pageHasTextCount(FPDF_DOCUMENT doc, int pageIndex, int* charsOut) {
-    if (!doc || pageIndex < 0) return false;
-    QMutexLocker lock(&s_pdfiumMutex);
-    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
-    if (!page) return false;
-    int n = 0;
-    FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
-    if (tp) { n = FPDFText_CountChars(tp); FPDFText_ClosePage(tp); }
-    FPDF_ClosePage(page);
-    if (charsOut) *charsOut = n;
-    return n > 0;
 }
 
 }  // namespace
@@ -223,6 +213,7 @@ OcrPanel::OcrPanel(QWidget* parent) : QWidget(parent) {
 void OcrPanel::setDocument(PdfDocument* doc) {
     m_doc = doc;
     m_wordsByPage.clear();
+    m_hasTextChecking.clear();   // trang kiem thuoc doc cu — bo het
     m_currentPage = -1;
     setOcrRunning(false);
     m_hasRun = false;   // doc moi -> chua OCR
@@ -269,9 +260,51 @@ void OcrPanel::setPageWords(int page, int words) {
 void OcrPanel::refresh() { updateStatus(); }
 
 void OcrPanel::updateStatus() {
+    ensureHasTextKnown();
     m_statusFull = statusText();
     elideStatus();
     updateButtonState();
+}
+
+// Dam bao bo dem "trang co chu" da co gia tri truoc khi statusText doc (chi doc
+// bo dem — khong parse dong bo). Parse FPDF o LUONG NEN: trang CAD nang ton 2,4
+// giay giu s_pdfiumMutex, lam tren UI la dung hinh (SPEC_PERF_HEAVYPAGE). Trang
+// phai di qua PageCache (R1), khong FPDF_LoadPage/ClosePage o day.
+// Cay an toan: worker set cache roi updateStatus() -> ensureHasTextKnown() thay
+// hasTextStatus != -1 nen return ngay — het vong lap. QPointer phong panel bi xoa
+// khi check con chay.
+void OcrPanel::ensureHasTextKnown() {
+    if (!m_doc || !m_doc->isOpen()) return;
+    const int page = m_currentPage >= 0 ? m_currentPage : 0;
+    FPDF_DOCUMENT raw = m_doc->raw();
+    if (!raw) return;
+    const auto dh = reinterpret_cast<OcrTextCache::DocHandle>(raw);
+    if (OcrTextCache::hasTextStatus(dh, page) != -1) return;  // da biet
+    if (m_hasTextChecking.contains(page)) return;             // dang kiem roi
+    m_hasTextChecking.insert(page);
+
+    FPDF_DOCUMENT d = raw;
+    const int pg = page;
+    QPointer<OcrPanel> self(this);
+    (void)QtConcurrent::run([d, pg, self]() {
+        bool has = false;
+        {
+            TimedPdfiumLock lk(__FILE__, __LINE__);
+            FPDF_PAGE p = PageCache::acquire(d, pg);
+            if (p) {
+                PageCache::PageBorrow _b(d, pg);   // RAII tra muon khi het scope
+                FPDF_TEXTPAGE tp = PageCache::textPage(d, pg);
+                if (tp) has = (FPDFText_CountChars(tp) > 0);
+            }
+        }
+        // setHasText + xoa trang kiem + cap nhat UI PHAI o luong chinh.
+        QMetaObject::invokeMethod(qApp, [self, d, pg, has]() {
+            if (!self) return;
+            OcrTextCache::setHasText(reinterpret_cast<OcrTextCache::DocHandle>(d), pg, has);
+            self->m_hasTextChecking.remove(pg);
+            self->updateStatus();
+        }, Qt::QueuedConnection);
+    });
 }
 
 void OcrPanel::elideStatus() {
@@ -320,8 +353,14 @@ QString OcrPanel::statusText() const {
     FPDF_DOCUMENT raw = m_doc->raw();
     if (!raw) return QStringLiteral("No document open");
     const QString pageLabel = QString::number(page + 1);
-    if (pageHasTextCount(raw, page, nullptr))
+    // CHI doc bo dem — khong parse dong bo (SPEC_PERF_HEAVYPAGE). ensureHasTextKnown()
+    // da khoi dong kiem o luong nen; worker xong set cache roi goi updateStatus lai.
+    const int st = OcrTextCache::hasTextStatus(
+        reinterpret_cast<OcrTextCache::DocHandle>(raw), page);
+    if (st == 1)
         return QStringLiteral("Page %1 — has text").arg(pageLabel);
+    if (st == -1)   // chua biet — dang kiem o luong nen
+        return QStringLiteral("Page %1 — checking text…").arg(pageLabel);
     if (OcrTextLayer::pageDone(raw, page)) {
         const int w = m_wordsByPage.value(page, -1);
         if (w > 0) return QStringLiteral("Page %1 — recognized (%2 words)").arg(pageLabel).arg(w);

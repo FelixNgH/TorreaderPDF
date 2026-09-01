@@ -1,9 +1,11 @@
 #include "PdfGpuView.h"
+#include "../core/PdfiumLock.h"
 #include "../core/PdfDocument.h"
 #include <QOpenGLExtraFunctions>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QPainter>
+#include <QOpenGLFramebufferObject>
 #include <QPainterPath>
 #include <QDebug>
 #include <QApplication>
@@ -11,6 +13,7 @@
 #include <cmath>
 #include <QVector4D>
 #include <QDateTime>
+#include <QElapsedTimer>
 
 // ponytail: max live tiles = 120 (~30 MB at 512×512 RGBA). Prevents unbounded
 // accumulation during pan; farthest-from-viewport tiles evicted when exceeded.
@@ -125,7 +128,8 @@ PdfGpuView::~PdfGpuView() {
         if (m_vecProg) { delete m_vecProg; m_vecProg = nullptr; }
         if (m_fillProg) { delete m_fillProg; m_fillProg = nullptr; }
         if (m_tileProg) { delete m_tileProg; m_tileProg = nullptr; }
-        QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+        QOpenGLContext* cur = QOpenGLContext::currentContext();
+        QOpenGLExtraFunctions* glx = cur ? cur->extraFunctions() : nullptr;
         if (glx && m_vecVao) { glx->glDeleteVertexArrays(1, &m_vecVao); m_vecVao = 0; }
         if (m_vecVboPos) { glDeleteBuffers(1, &m_vecVboPos); m_vecVboPos = 0; }
         if (m_vecVboCol) { glDeleteBuffers(1, &m_vecVboCol); m_vecVboCol = 0; }
@@ -183,6 +187,7 @@ void PdfGpuView::initializeGL() {
         uniform mat4  uMvp;
         uniform vec2  uViewport;
         uniform float uPxPerPt;
+        uniform float uCovFloor;   // san do duc cho net mong hon 1px
         uniform vec4  uClips[64];
         out vec4 vColor;
         flat out vec4 vClip;
@@ -200,7 +205,7 @@ void PdfGpuView::initializeGL() {
             vec2 n  = vec2(-d.y, d.x);
             float wRaw = aWidthPt * uPxPerPt;
             float cov  = 1.0;
-            if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, 0.15);
+            if (aWidthPt > 0.0 && wRaw < 1.0) cov = max(wRaw, uCovFloor);
             float wpx  = max(wRaw, 1.0);
             // ponytail: chi noi quad de khu rang cua khi net > 1px; net <= 1px da du xu ly bang cov
             float aaPad = (wRaw > 1.0) ? 1.5 : 0.0;
@@ -242,6 +247,7 @@ void PdfGpuView::initializeGL() {
         m_vecMvpLoc = m_vecProg->uniformLocation("uMvp");
         m_vecViewportLoc = m_vecProg->uniformLocation("uViewport");
         m_vecPxPerPtLoc = m_vecProg->uniformLocation("uPxPerPt");
+        m_vecCovFloorLoc = m_vecProg->uniformLocation("uCovFloor");
     }
 
     static const char* fillVsrc = R"(
@@ -354,7 +360,8 @@ void PdfGpuView::initializeGL() {
     }
 
     static const float tileQuad[] = { 0,0, 0,1, 1,0, 1,1 };
-    QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+    QOpenGLContext* curCtx = QOpenGLContext::currentContext();
+    QOpenGLExtraFunctions* glx = curCtx ? curCtx->extraFunctions() : nullptr;
     if (!glx) return;
     glx->glGenVertexArrays(1, &m_tileVao);
     glx->glBindVertexArray(m_tileVao);
@@ -401,6 +408,7 @@ void PdfGpuView::uploadTexture(const QImage& img) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
     } else {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
+        g_gpuTexBytes.fetchAndAddOrdered(qint64(w) * h * 4); g_gpuTexAlive.fetchAndAddOrdered(1);
         m_texW = w;
         m_texH = h;
     }
@@ -437,13 +445,16 @@ QMatrix4x4 PdfGpuView::computeTransform() const {
 }
 
 QMatrix4x4 PdfGpuView::vectorTransform() const {
-    // Dinh vector o DON VI DIEM PDF CHUA XOAY, Y-down. Doi sang pixel widget, co ap /Rotate.
+    return vectorTransform(width(), height(), m_zoom, pageOrigin());
+}
+
+QMatrix4x4 PdfGpuView::vectorTransform(int vpW, int vpH, double zoom, QPointF orig) const {
+    // Dinh vector o DON VI DIEM PDF CHUA XOAY, Y-down. Doi sang pixel viewport, co ap /Rotate.
     const QSizeF vp = m_vecLayer ? m_vecLayer->pageSizePt() : QSizeF();
     if (vp.width() <= 0 || vp.height() <= 0) return QMatrix4x4();
 
-    const double pw   = m_pageSizePt.width()  * m_zoom;   // be ngang trang tren man, px (DA xoay)
-    const double ph   = m_pageSizePt.height() * m_zoom;
-    const QPointF orig = pageOrigin();                    // DA gom m_panOffset
+    const double pw   = m_pageSizePt.width()  * zoom;   // be ngang trang tren viewport, px (DA xoay)
+    const double ph   = m_pageSizePt.height() * zoom;
     const int rot = m_vecLayer->rotation() & 3;
 
     // Voi rot le, be ngang tren man ung voi CHIEU CAO hop chua xoay va nguoc lai.
@@ -451,7 +462,7 @@ QMatrix4x4 PdfGpuView::vectorTransform() const {
     const double sy = (rot & 1) ? (ph / vp.width())  : (ph / vp.height());
 
     QMatrix4x4 m;
-    m.ortho(0.f, (float)width(), (float)height(), 0.f, -1.f, 1.f);
+    m.ortho(0.f, (float)vpW, (float)vpH, 0.f, -1.f, 1.f);
     m.translate((float)orig.x(), (float)orig.y(), 0.f);
     switch (rot) {
         case 1: m.translate((float)pw, 0.f, 0.f);        m.rotate(90.f,  0.f, 0.f, 1.f); break;
@@ -478,14 +489,15 @@ void PdfGpuView::paintGL() {
             m_selecting || m_drawingShape ||
             (m_sigPickMode && m_sigActive) ||
             (m_loading && !m_hasImage) ||
-            (m_hasImage && !m_pageSizePt.isEmpty());
+            (m_hasImage && !m_pageSizePt.isEmpty()) ||
+            (pureVector && !m_pageSizePt.isEmpty());     // lop vector du de ve, khong can raster
         if (!_needQP) return;
     }
 
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
-    if (!m_hasImage && !m_loading) {
+    if (!m_hasImage && !m_loading && !pureVector) {
         p.setPen(QColor(200, 200, 200));
         QFont f = p.font(); f.setPointSize(13); p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter,
@@ -494,7 +506,7 @@ void PdfGpuView::paintGL() {
         return;
     }
 
-    if (m_hasImage && !m_pageSizePt.isEmpty()) {
+    if ((m_hasImage || pureVector) && !m_pageSizePt.isEmpty()) {
         double pw = m_pageSizePt.width()  * m_zoom;
         double ph = m_pageSizePt.height() * m_zoom;
         QPointF orig = pageOrigin();
@@ -582,6 +594,15 @@ void PdfGpuView::paintGL() {
             p.setBrush(Qt::NoBrush);
             p.setPen(QPen(QColor(0, 120, 215), 1.5, Qt::DashLine));
             p.drawRect(wr);
+            // Insert Image: 4 tay nam goc khi Stamp dang chon (co gian duoc).
+            if (m_selResizable) {
+                p.setBrush(QColor(0, 120, 215));
+                p.setPen(Qt::NoPen);
+                for (int c = 0; c < 4; ++c) {
+                    QPointF hp = pdfToWidget(selHandlePos(c));
+                    p.drawRect(QRectF(hp.x() - 5, hp.y() - 5, 10, 10));
+                }
+            }
         }
 
 
@@ -713,7 +734,11 @@ void PdfGpuView::paintGL() {
     //    ma pureVector van true => nhanh raster bi bo, neu bo not anh mo tam thi
     //    man hinh TRANG TRON (do that 2026-08-09: 4 khung 0,0% muc).
     //    Luat §2.1: moi thao tac phai hien ra thu gi do NGAY, du mo.
-    if (m_loading) {
+    // Co lop vector DAY DU cho dung trang nay thi da co noi dung that de ve — ve de
+    // "trang trang dang tai" len se che mat no (loi man hinh trang, do 2026-08-19).
+    // Van giu nguyen lop phu nay cho moi truong hop khac: luat §2.1 "phai hien ra thu
+    // gi do NGAY" duoc dam bao boi chinh lop vector.
+    if (m_loading && !pureVector) {
         if (!m_hasImage) {
             if (!m_placeholder.isNull() && !m_pageSizePt.isEmpty()) {
                 // Draw thumbnail placeholder scaled to page rect
@@ -777,6 +802,13 @@ void PdfGpuView::paintGL() {
 // ── Page management ───────────────────────────────────────────────────────────
 
 void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSizePt) {
+    // 🔴 Anh raster DAY DU cua trang da ve toi ⇒ no CO chu thich moi ⇒ cho phep dung lai nen
+    // vector tu day (xem MainWindow: tao chu thich thi cam tam thoi).
+    if (!pageImage.isNull() && !m_vecAnnotSafe.value(pageIndex, true)) {
+        m_vecAnnotSafe[pageIndex] = true;
+        qDebug().noquote() << "[vector] trang" << pageIndex
+                           << "mo lai nen vector (da co anh raster day du)";
+    }
     bool pageChanged = (pageIndex != m_pageIndex);
     bool newPage = pageChanged || !m_hasImage;
     int oldPage = m_pageIndex;
@@ -883,7 +915,22 @@ QSize PdfGpuView::currentPageImageSize() const {
     return m_lastImage.size();
 }
 
+qint64 PdfGpuView::bytesVectorLayer() const {
+    if (!m_vecLayer) return 0;
+    auto V = [](const auto& v){ return qint64(v.size()) * qint64(sizeof(v[0])); };
+    return V(m_vecLayer->verts()) + V(m_vecLayer->colors()) + V(m_vecLayer->widths())
+         + V(m_vecLayer->depths()) + V(m_vecLayer->clipIdx())
+         + V(m_vecLayer->fillVerts()) + V(m_vecLayer->fillColors())
+         + V(m_vecLayer->fillDepths()) + V(m_vecLayer->fillClipIdx());
+}
+
 void PdfGpuView::showPartial(int page, double scale, QImage img) {
+    struct _SlotMs {
+        QElapsedTimer t; const char* name; int pg;
+        _SlotMs(const char* n, int p) : name(n), pg(p) { t.start(); }
+        ~_SlotMs() { if (t.elapsed() > 50) qDebug().noquote() << "[slotms]" << name << "ms=" << t.elapsed() << "page=" << pg; }
+    };
+    _SlotMs _sm("gpuShowPartial", page);
     if (page != m_pageIndex) {
         qDebug() << "[GpuView] showPartial SKIP wrong page=" << page << "current=" << m_pageIndex;
         return;
@@ -892,8 +939,11 @@ void PdfGpuView::showPartial(int page, double scale, QImage img) {
         qDebug() << "[GpuView] showPartial SKIP null image page=" << page;
         return;
     }
-    // Only replace if resolution is higher or we have no image yet
-    if (m_hasImage && !m_lastImage.isNull() && img.width() <= m_lastImage.width()) {
+    // Only replace if resolution is meaningfully higher or we have no image yet.
+    // Same tolerance as setPage (0.9): block only truly lower-res images, let
+    // same-resolution content through — otherwise a re-render at the SAME size
+    // (e.g. after deleting an annot) is never shown. SPEC_MARKUP_FIX_2026-08-31.
+    if (m_hasImage && !m_lastImage.isNull() && img.width() < m_lastImage.width() * 0.9) {
         qDebug() << "[GpuView] showPartial SKIP lowres page=" << page
                  << "newW=" << img.width() << "lastW=" << m_lastImage.width();
         return;
@@ -984,7 +1034,7 @@ void PdfGpuView::centerPage() {
 }
 
 void PdfGpuView::requestTiles() {
-    if (!m_hasImage || m_pageSizePt.isEmpty()) return;
+    if (!hasPageContent() || m_pageSizePt.isEmpty()) return;
     if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->pageIndex() == m_pageIndex
         && m_vecLayer->isComplete() && shouldUseVectorOverlay()) {
         m_sharpPage = -1; m_sharpImage = {};
@@ -1166,7 +1216,7 @@ void PdfGpuView::clearSelectionRects() {
 
 bool PdfGpuView::resolvePageSpacePos(const QPointF& widgetPos, QPointF* pagePt,
                                      bool load) const {
-    if (!m_linksDoc || !m_linksDoc->isOpen() || !m_hasImage || m_pageSizePt.isEmpty())
+    if (!m_linksDoc || !m_linksDoc->isOpen() || !hasPageContent() || m_pageSizePt.isEmpty())
         return false;
     // widgetToPdf = toa do hien thi (Y-down, goc trai tren).
     const QPointF disp = widgetToPdf(widgetPos);
@@ -1274,8 +1324,15 @@ void PdfGpuView::setSelectedAnnot(const QRectF& rectPdf) {
     update();
 }
 
+void PdfGpuView::setSelectResizable(bool on) {
+    m_selResizable = on;
+    update();
+}
+
 void PdfGpuView::clearSelectedAnnot() {
     m_hasSel = false;
+    m_selResizable = false;
+    m_resizingCorner = -1;
     clearDragTarget();
     update();
 }
@@ -1303,7 +1360,54 @@ void PdfGpuView::clearDragState() {
     m_dragNoteRect = QRectF();
     m_dragNoteOffsetPt = QPointF();
     m_dragUid.clear();
+    m_resizingCorner = -1;
     update();
+}
+
+// ── Resize handles (Insert Image, SPEC_INSERT_IMAGE_2026-08-30) ───────────────
+// m_selRect o toa do hien thi (Y-down) = khong gian pdfToWidget (chi chia zoom).
+
+QPointF PdfGpuView::selHandlePos(int corner) const {
+    const QRectF r = m_selRect;
+    switch (corner) {
+        case 1: return QPointF(r.right(), r.top());
+        case 2: return QPointF(r.right(), r.bottom());
+        case 3: return QPointF(r.left(),  r.bottom());
+        default: return QPointF(r.left(), r.top());
+    }
+}
+
+int PdfGpuView::handleAt(const QPointF& dispPt) const {
+    if (!m_hasSel || !m_selResizable) return -1;
+    const double tol = 8.0 / m_zoom;   // 8 px (widget) duoi con tro
+    for (int c = 0; c < 4; ++c) {
+        const QPointF h = selHandlePos(c);
+        if (qAbs(dispPt.x() - h.x()) <= tol && qAbs(dispPt.y() - h.y()) <= tol)
+            return c;
+    }
+    return -1;
+}
+
+QRectF PdfGpuView::resizeRectFor(int corner, const QPointF& drag, bool keepAspect) const {
+    const QRectF orig = m_resizeOrigRect;
+    // goc doi dien (anchor) giu nguyen
+    const QPointF anchor = selHandlePos((corner + 2) % 4);
+    const double kMin = 20.0 / m_zoom;   // 20 pt toi thieu (he hien thi = PDD pt)
+    const double kAspect = orig.height() / qMax(0.1, orig.width());
+
+    double w = drag.x() - anchor.x();
+    double h = drag.y() - anchor.y();
+    if (keepAspect) {
+        const bool dir = (w * h >= 0.0);         // keo cheo xuong -> cung dau voi x
+        const double hw = qMax(qAbs(w), kMin);
+        w = (w >= 0.0 ? 1.0 : -1.0) * hw;
+        h = (dir ? (w >= 0.0 ? 1.0 : -1.0) : (w >= 0.0 ? -1.0 : 1.0)) * hw * kAspect;
+    }
+    // Rect moi: tu anchor den goc dang keo (gio ty le duoc tinh o tren).
+    QRectF nr = QRectF(anchor, QPointF(anchor.x() + w, anchor.y() + h)).normalized();
+    if (nr.width()  < kMin) { double c = nr.center().x(); nr.setLeft(c - kMin / 2); nr.setRight(c + kMin / 2); }
+    if (nr.height() < kMin) { double c = nr.center().y(); nr.setTop(c - kMin / 2);  nr.setBottom(c + kMin / 2); }
+    return nr;
 }
 
 void PdfGpuView::setHighlights(const QList<QRectF>& rects) {
@@ -1444,10 +1548,10 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
     // Link: chi khi tool la Pan hoac Select, khong bat Ctrl. Bam vao link thi
     // di theo link truoc khi bat dau pan/chon chu (SPEC_PDF_LINKS muc 3).
     if ((m_tool == ViewTool::Pan || m_tool == ViewTool::SelectText)
-        && e->button() == Qt::LeftButton && m_hasImage) {
+        && e->button() == Qt::LeftButton && hasPageContent()) {
         if (tryActivateLink(e)) return;
     }
-    if (m_hasImage) {
+    if (hasPageContent()) {
         if (e->button() == Qt::RightButton) {
             if (m_tool == ViewTool::SelectText && m_selAnchorChar >= 0) {
                 emit copySelectionRequested(e->globalPosition().toPoint());
@@ -1457,8 +1561,20 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
             return;
         }
     }
-    if (m_tool == ViewTool::Pan && m_hasImage) {
+    if (m_tool == ViewTool::Pan && hasPageContent()) {
         if (e->button() == Qt::LeftButton) {
+            // Insert Image: bam trung tay nam goc cua Stamp dang chon => co gian.
+            if (m_hasSel && m_selResizable) {
+                const int corner = handleAt(widgetToPdf(e->position()));
+                if (corner >= 0) {
+                    m_resizingCorner = corner;
+                    m_resizeOrigRect = m_selRect;
+                    m_dragPixelDelta = QPointF();
+                    m_dragNoteRect = QRectF();
+                    m_dragNoteOffsetPt = QPointF();
+                    return;
+                }
+            }
             if (m_hasSel) {
                 QPointF a = pdfToWidget(m_selRect.topLeft());
                 QPointF b = pdfToWidget(m_selRect.bottomRight());
@@ -1476,7 +1592,7 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
             emit annotationPickRequested(m_pageIndex, widgetToPdf(e->position()));
         }
     }
-    if (e->button() == Qt::LeftButton && m_hasImage) {
+    if (e->button() == Qt::LeftButton && hasPageContent()) {
         if (m_tool == ViewTool::PlaceNote) {
             emit noteRequested(m_pageIndex, widgetToPdf(e->position()));
             return;
@@ -1499,7 +1615,7 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         }
     }
     // Select tool: left drag = select text by CHAR INDEX (no modifier needed).
-    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && m_hasImage) {
+    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && hasPageContent()) {
         if (m_clickValid && m_clickClock.elapsed() > QApplication::doubleClickInterval())
             m_clickValid = false;
         m_clickClock.restart();
@@ -1526,6 +1642,14 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
 void PdfGpuView::mouseMoveEvent(QMouseEvent* e) {
     if (m_sigPickMode && m_sigActive) {
         m_sigEnd = e->position();
+        update();
+        return;
+    }
+    // Insert Image: keo tay nam goc de co gian (Shift = tu do, giu ty le mac dinh).
+    if (m_resizingCorner >= 0) {
+        const QPointF dispPt = widgetToPdf(e->position());
+        const bool keep = !(e->modifiers() & Qt::ShiftModifier);
+        m_selRect = resizeRectFor(m_resizingCorner, dispPt, keep);
         update();
         return;
     }
@@ -1615,6 +1739,17 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
         update();
         return;
     }
+    if (m_resizingCorner >= 0 && e->button() == Qt::LeftButton) {
+        m_resizingCorner = -1;
+        m_dragPixelDelta = QPointF();
+        m_dragNoteRect = QRectF();
+        m_dragNoteOffsetPt = QPointF();
+        update();
+        // Chi ghi vao PDF khi KET THUC keo (spec: khong ghi moi khung hinh).
+        if (m_hasSel)
+            emit annotationResizeRequested(m_pageIndex, m_selRect);
+        return;
+    }
     if (m_draggingAnnot) {
         m_draggingAnnot = false;
         m_dragPixelDelta = QPointF();
@@ -1693,7 +1828,7 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
 
         update();
 
-        if (m_hasImage && !m_pageSizePt.isEmpty() && (p1.x() - p0.x()) > 2.0) {
+        if (hasPageContent() && !m_pageSizePt.isEmpty() && (p1.x() - p0.x()) > 2.0) {
             // widgetToPdf: (widget - pageOrigin) / zoom  →  (x from page-left, y from page-top)
             // PDF coords: y=0 at bottom, increasing upward
             QPointF pdf0 = widgetToPdf(p0);
@@ -1724,7 +1859,7 @@ void PdfGpuView::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void PdfGpuView::mouseDoubleClickEvent(QMouseEvent* e) {
-    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && m_hasImage) {
+    if (m_tool == ViewTool::SelectText && e->button() == Qt::LeftButton && hasPageContent()) {
         // Nhay ba = dblclick thu 2 lien tiep trong doubleClickInterval.
         const bool isTriple = m_clickValid
             && m_clickClock.elapsed() <= QApplication::doubleClickInterval();
@@ -1741,7 +1876,7 @@ void PdfGpuView::mouseDoubleClickEvent(QMouseEvent* e) {
 void PdfGpuView::updateLinkHover(const QPointF& widgetPos) {
     const bool linkTool = (m_tool == ViewTool::Pan || m_tool == ViewTool::SelectText);
     QString hoverTxt;
-    if (linkTool && m_linksDoc && m_linksDoc->isOpen() && m_hasImage) {
+    if (linkTool && m_linksDoc && m_linksDoc->isOpen() && hasPageContent()) {
         const QPointF dispPt = widgetToPdf(widgetPos);
         QElapsedTimer _lt; _lt.start();
         const PdfLinks::CachedPage cp = PdfLinks::cachedForPage(m_linksDoc->raw(), m_pageIndex);
@@ -1815,7 +1950,8 @@ void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> layer) {
     m_vecUploadedPage = -1;
     if (!layer && m_vecVao) {
         makeCurrent();
-        QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+        QOpenGLContext* cur = QOpenGLContext::currentContext();
+        QOpenGLExtraFunctions* glx = cur ? cur->extraFunctions() : nullptr;
         if (glx) glx->glDeleteVertexArrays(1, &m_vecVao);
         if (m_vecVboPos) glDeleteBuffers(1, &m_vecVboPos);
         if (m_vecVboCol) glDeleteBuffers(1, &m_vecVboCol);
@@ -1835,6 +1971,15 @@ void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> layer) {
         m_tileTexText.clear();
         m_tileTexImg.clear();
         doneCurrent();
+    }
+    // Duong cache .torvec: lop vector san sang TRUOC khi co bat ky `pageReady` nao (R2 da
+    // chan raster). `m_loading` chi duoc go trong setPage() tu duong pageReady, nen neu khong
+    // go o day thi paintGL ve de "trang trang dang tai" len — MAN HINH TRANG (da do 2026-08-19).
+    // Chi go khi lop DAY DU va DUNG trang hien tai: luc do overlay chac chan ve ra noi dung
+    // that, khong pha luat "luon hien ra thu gi do ngay" (§2.1).
+    if (m_vecLayer && m_vecLayer->isReady() && m_vecLayer->isComplete()
+        && m_vecLayer->pageIndex() == m_pageIndex && !m_pageSizePt.isEmpty()) {
+        m_loading = false;
     }
     update();
 }
@@ -1859,11 +2004,28 @@ void PdfGpuView::setForeignAnnotRegion(int page, double scale, QRect regionPx, c
     update();
 }
 
+// 🔴🔴 BAT BIEN 2026-09-01 — "NEN VECTOR KHONG DUOC NUOT MARKUP".
+// Lop vector dung tu NOI DUNG TRANG; annotation KHONG nam trong do. Khi overlay ve duoc
+// het markup (overlayCapable) thi khong sao. Nhung khi overlayCapable=false, thiet ke cu
+// trong cay vao ANH RASTER de ve markup (`pagesNeedGenerate`) — ma o nen vector thi
+// KHONG CO raster nao ca ⇒ markup BIEN MAT. Lop vector dung xong luc nao thi mat luc do,
+// va zoom chinh la thu kich hoat dung vector ⇒ trieu chung "mat markup khi zoom" o CA
+// Single lan Continuous. ⇒ Trang nao chua an toan thi O LAI voi raster.
+void PdfGpuView::setVectorAnnotSafe(int page, bool safe) {
+    const bool old = m_vecAnnotSafe.value(page, true);
+    if (old == safe) return;
+    m_vecAnnotSafe[page] = safe;
+    qDebug().noquote() << "[vector] trang" << page << (safe ? "AN TOAN" : "KHONG an toan")
+                       << "cho nen vector (markup)";
+    update();
+}
+
 bool PdfGpuView::shouldUseVectorOverlay() const {
     const double onScreenW = m_pageSizePt.width() * m_zoom;
     bool result = m_vecLayer && m_vecLayer->isReady()
         && m_vecLayer->isComplete()
-        && m_vecLayer->pageIndex() == m_pageIndex;
+        && m_vecLayer->pageIndex() == m_pageIndex
+        && m_vecAnnotSafe.value(m_pageIndex, true);   // xem setVectorAnnotSafe: chu thich ngoai
     if (result != m_vecLastOverlayState) {
         m_vecLastOverlayState = result;
         qDebug().noquote() << "[vector] overlay" << (result ? "ON" : "OFF")
@@ -1875,12 +2037,94 @@ bool PdfGpuView::shouldUseVectorOverlay() const {
     return result;
 }
 
+// R3 (SPEC_PERF_HEAVYPAGE): thumbnail trang nang dung PDFium ton 5.355 ms (do 2026-08-19,
+// trang 2,54 trieu path) vi PDFium phai duyet het tung path du anh ra be bang con tem.
+// Lop vector DA nam san trong VBO tren GPU — ve lai no o co thumbnail chi ton vai chuc ms.
+QImage PdfGpuView::renderVectorThumbnail(double scale) {
+    if (!m_vecLayer || !m_vecLayer->isReady() || !m_vecLayer->isComplete()) return QImage();
+    if (m_vecLayer->pageIndex() != m_pageIndex) return QImage();
+    if (m_pageSizePt.width() <= 0 || m_pageSizePt.height() <= 0 || scale <= 0.0) return QImage();
+    if (!isValid() || !context()) {
+        qDebug().noquote() << "[thumb] renderVectorThumbnail: KHONG co GL context — bo qua";
+        return QImage();
+    }
+
+    const int tw = qMax(1, int(m_pageSizePt.width()  * scale));
+    const int th = qMax(1, int(m_pageSizePt.height() * scale));
+    // 🔴 SIEU LAY MAU x3: o ty le 0,15 net ve mong hon 1 pixel nen mo han di — do duoc
+    //    muc chi con 30,6% so voi 45,5% cua ban PDFium (2026-08-19). Ve lon gap 3 roi thu
+    //    nho MUOT giu lai net manh, giong cach PDFium ep toi thieu 1 px.
+    constexpr int kSS = 3;
+    const int rw = tw * kSS, rh = th * kSS;
+    QElapsedTimer _t; _t.start();
+
+    QImage out;
+    makeCurrent();
+    if (!QOpenGLContext::currentContext()) {
+        doneCurrent();
+        qDebug().noquote() << "[thumb] renderVectorThumbnail: makeCurrent KHONG co context — bo qua";
+        return QImage();
+    }
+    {
+        QOpenGLFramebufferObjectFormat fmt;
+        // Lop vector dung DEPTH de xep thu tu ve — thieu depth la sai thu tu chong lop.
+        fmt.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+        QOpenGLFramebufferObject fbo(rw, rh, fmt);
+        if (fbo.bind()) {
+            GLint prevVp[4] = {0, 0, 0, 0};
+            glGetIntegerv(GL_VIEWPORT, prevVp);
+            glViewport(0, 0, rw, rh);
+            glClearColor(1.f, 1.f, 1.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            // dpr = 1: FBO khong co he so man hinh net cao.
+            // Net CAD ~0,25pt o ty le thumbnail cho wRaw ~0,04 => shader ve o 15% do duc
+            // (san mac dinh) nen anh nhat trang. PDFium ve hairline DAC 1px. Nang san len
+            // cho lan ve nay de thumbnail ro nhu ban PDFium (do 2026-08-19: muc 30,6% vs 45,5%).
+            const float _covSave = m_vecCovFloor;
+            m_vecCovFloor = 0.90f;
+            drawVectorContent(rw, rh, scale * kSS, QPointF(0.0, 0.0), 1.0);
+            m_vecCovFloor = _covSave;
+            fbo.release();
+            glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+            out = fbo.toImage().scaled(tw, th, Qt::IgnoreAspectRatio,
+                                       Qt::SmoothTransformation);
+        }
+    }
+    doneCurrent();
+    qDebug().noquote() << "[vecthumb] page=" << m_pageIndex
+                       << "size=" << tw << "x" << th
+                       << "ms=" << _t.elapsed()
+                       << "null=" << out.isNull();
+    return out;
+}
+
 void PdfGpuView::drawVectorOverlay() {
+    drawVectorContent(width(), height(), m_zoom, pageOrigin(), devicePixelRatioF());
+}
+
+void PdfGpuView::drawVectorContent(int vpW, int vpH, double zoom, QPointF orig, qreal dprIn) {
     if (!m_vecLayer || !m_vecLayer->isReady()) return;
     if (m_vecLayer->widths().isEmpty() && m_vecLayer->fillVerts().isEmpty()) return;
-
-    QOpenGLExtraFunctions* glx = QOpenGLContext::currentContext()->extraFunctions();
+    QOpenGLContext* cur = QOpenGLContext::currentContext();
+    QOpenGLExtraFunctions* glx = cur ? cur->extraFunctions() : nullptr;
     if (!glx) return;
+
+    // 2026-08-24: TAM thoi quay ve duong ve CU lam mac dinh — duong gop lam VANG app tren
+    // trang 15,9 trieu dinh cua Combine.pdf (VectorGpuRenderer giu toi 6 lop trong m_bufs,
+    // moi lop ~200 MB bo dem GPU => het bo nho => crash trong Qt6Gui.dll).
+    // Bat lai bang TORREADER_VEC_UNIFIED=1 sau khi da chan bo dem theo BYTE.
+    static const bool kUnified = !qEnvironmentVariableIsEmpty("TORREADER_VEC_UNIFIED");
+    if (kUnified) {
+        if (!m_vgrUnifiedInit) { m_vgrUnified.initialize(); m_vgrUnifiedInit = true; }
+        const QMatrix4x4 mvpU = vectorTransform(vpW, vpH, zoom, orig);
+        const QSizeF vpU = m_vecLayer->pageSizePt();
+        const double vpRefU = (m_vecLayer->rotation() & 1) ? vpU.height() : vpU.width();
+        const float pxPerPtU = (vpRefU > 0.0)
+            ? float(m_pageSizePt.width() * zoom / vpRefU) : float(zoom);
+        m_vgrUnified.setCovFloor(m_vecCovFloor);
+        m_vgrUnified.draw(*m_vecLayer, mvpU, QSize(vpW, vpH), pxPerPtU);
+        return;
+    }
 
     // Upload VBOs once per page
     if (m_vecUploadedPage != m_vecLayer->pageIndex()) {
@@ -2010,12 +2254,12 @@ void PdfGpuView::drawVectorOverlay() {
     glDepthMask(GL_TRUE);
     glClear(GL_DEPTH_BUFFER_BIT);
 
-    const QPointF pgOrig = pageOrigin();
-    const double  pgW = m_pageSizePt.width()  * m_zoom;
-    const double  pgH = m_pageSizePt.height() * m_zoom;
-    const qreal   dpr = devicePixelRatioF();
+    const QPointF pgOrig = orig;
+    const double  pgW = m_pageSizePt.width()  * zoom;
+    const double  pgH = m_pageSizePt.height() * zoom;
+    const qreal   dpr = dprIn;
     const int sx = int(std::floor(pgOrig.x() * dpr));
-    const int sy = int(std::floor((height() - (pgOrig.y() + pgH)) * dpr));
+    const int sy = int(std::floor((vpH - (pgOrig.y() + pgH)) * dpr));
     const int sw = int(std::ceil(pgW * dpr));
     const int sh = int(std::ceil(pgH * dpr));
     GLint prevScissor[4] = {0, 0, 0, 0};
@@ -2024,7 +2268,7 @@ void PdfGpuView::drawVectorOverlay() {
     glEnable(GL_SCISSOR_TEST);
     glScissor(sx, sy, qMax(0, sw), qMax(0, sh));
 
-    QMatrix4x4 mvp = vectorTransform();
+    QMatrix4x4 mvp = vectorTransform(vpW, vpH, zoom, orig);
 
     auto uploadClips = [&](QOpenGLShaderProgram* prog) {
         if (!prog) return;
@@ -2056,9 +2300,10 @@ void PdfGpuView::drawVectorOverlay() {
         const QSizeF vp = m_vecLayer->pageSizePt();
         const double vpRef = (m_vecLayer->rotation() & 1) ? vp.height() : vp.width();
         const float pxPerPt = (vpRef > 0.0)
-            ? float(m_pageSizePt.width() * m_zoom / vpRef) : float(m_zoom);
-        glUniform2f(m_vecViewportLoc, float(width()), float(height()));
+            ? float(m_pageSizePt.width() * zoom / vpRef) : float(zoom);
+        glUniform2f(m_vecViewportLoc, float(vpW), float(vpH));
         glUniform1f(m_vecPxPerPtLoc, pxPerPt);
+        glUniform1f(m_vecCovFloorLoc, m_vecCovFloor);
 
         glx->glBindVertexArray(m_vecVao);
         glx->glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, m_vecLayer->widths().size());
@@ -2076,7 +2321,13 @@ void PdfGpuView::drawVectorOverlay() {
     auto drawTiles = [&](const QVector<TextTile>& tiles, QVector<GLuint>& texs) {
         if (tiles.isEmpty()) return;
         const quint32 gen = m_vecLayer->tilesGeneration();
-        if (texs.size() != tiles.size() || m_tileTexGen != gen) {
+        // 🔴 PHAI kiem ca UID CUA LOP. Hai trang khac nhau co the co CUNG so tile va CUNG
+        //    tilesGeneration (deu = 0 khi khong co note) => dieu kien cu cho la "van con dung"
+        //    va DUNG LAI texture cua TRANG CU cho tile cua TRANG MOI: anh trang truoc bi keo
+        //    vao o cua trang sau => logo ra KHOI VAN NGANG (loi owner bao 2026-08-19).
+        //    `VectorLayer::uid()` moi cho tung the hien nen phan biet duoc.
+        const quint64 uid = m_vecLayer->uid();
+        if (texs.size() != tiles.size() || m_tileTexGen != gen || m_tileTexUid != uid) {
             for (GLuint t : texs) if (t) glDeleteTextures(1, &t);
             texs.fill(0, tiles.size());
         }
@@ -2102,16 +2353,27 @@ void PdfGpuView::drawVectorOverlay() {
                 if (tt.isAlpha) {
                     const QImage& src = tt.img;
                     glPixelStorei(GL_UNPACK_ROW_LENGTH, src.bytesPerLine());
+                    g_gpuTexBytes.fetchAndAddOrdered(qint64(src.width()) * src.height()); g_gpuTexAlive.fetchAndAddOrdered(1);
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, src.width(), src.height(), 0,
                                  GL_RED, GL_UNSIGNED_BYTE, src.constBits());
                     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
                 } else {
                     QImage src = tt.img.convertToFormat(QImage::Format_RGBA8888);
+                    g_gpuTexBytes.fetchAndAddOrdered(qint64(src.width()) * src.height() * 4); g_gpuTexAlive.fetchAndAddOrdered(1);
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, src.width(), src.height(), 0,
                                  GL_RGBA, GL_UNSIGNED_BYTE, src.constBits());
                 }
-                glGenerateMipmap(GL_TEXTURE_2D);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                // 🔴 CHI sinh mipmap cho tile CHU (anh mot kenh alpha). Tile ANH la RGBA
+                //    KHONG nhan san alpha: diem trong suot co RGB = den, mipmap tron chung
+                //    vao diem nhin thay => thu nho la ca logo NGA DEN (do that 2026-08-19:
+                //    logo CC1/CONINCO ra khoi den o zoom 42%). Anh khong mipmap chi hoi ram
+                //    rang cua khi thu rat nho — doi lai mau DUNG.
+                if (tt.isAlpha) {
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                } else {
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                }
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -2142,6 +2404,7 @@ void PdfGpuView::drawVectorOverlay() {
         drawTiles(m_vecLayer->imageTiles(), m_tileTexImg);
         drawTiles(m_vecLayer->textTiles(),  m_tileTexText);
         m_tileTexGen = m_vecLayer->tilesGeneration();
+        m_tileTexUid = m_vecLayer->uid();
         glx->glBindVertexArray(0);
         m_tileProg->release();
     }
@@ -2285,6 +2548,7 @@ void PdfGpuView::drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVe
     p.save();
     p.setRenderHint(QPainter::Antialiasing, true);
     int cntVis = 0, cntSticky = 0, cntDrawn = 0;
+
     for (const AnnotVisual& av : m_annotVisuals) {
         if (av.page != m_pageIndex) continue;
         ++cntVis;
@@ -2356,15 +2620,27 @@ void PdfGpuView::drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVe
                 p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
                 break;
             }
+            case FPDF_ANNOT_STAMP: {
+                // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): ve anh goc giu kenh
+                // alpha (de trong suot nhu nay khong do nen trang).
+                if (!av.image.isNull()) {
+                    p.save();
+                    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+                    p.drawImage(dRect, av.image);
+                    p.restore();
+                }
+                break;
+            }
             default: break;
         }
         if (isDragged) p.restore();
     }
     {
         static int sV = -1, sS = -1, sD = -1;
-        if (cntVis != sV || cntSticky != sS || cntDrawn != sD) {
-            sV = cntVis; sS = cntSticky; sD = cntDrawn;
-            qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector;
+        static double sZ = -1;
+        if (cntVis != sV || cntSticky != sS || cntDrawn != sD || qAbs(m_zoom - sZ) > 1e-9) {
+            sV = cntVis; sS = cntSticky; sD = cntDrawn; sZ = m_zoom;
+            qDebug().noquote() << "[badge] visualsPage=" << cntVis << "stickyNotes=" << cntSticky << "drawn=" << cntDrawn << "pureVector=" << pureVector << "zoom=" << m_zoom;
         }
     }
     p.restore();

@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QVector>
 #include <QElapsedTimer>
+#include <QThreadPool>
 #include <memory>
 #include "core/VectorLayer.h"
 #include "core/VectorGpuRenderer.h"
@@ -33,7 +34,11 @@ public:
     void setDocument(PdfDocument* doc, PdfRenderer* renderer);
     void clearDocument();
 
+    // Khoa cache .torvec, MainWindow day sang (ContinuousView khong tu biet duong dan goc).
+    void setVectorCacheKey(const QString& keyPath, quint64 keyHash);
+
     void setZoom(double scale);
+    double zoom() const { return m_zoom; }
     void setDarkMode(bool dark);
 
     // Animate-scroll the scrollbar to the top of page pageIndex.
@@ -70,7 +75,43 @@ public:
     void setSelectionRects(const QHash<int, QList<QRectF>>& byPage);
     void clearSelectionRects();
     void invalidatePage(int pageIndex);
+    void setVectorAnnotSafe(int page, bool safe);
+    // 🔴🔴 2026-09-01: sau khi bo anh cu vi chu thich doi, PHAI dat lai lenh ve.
+    // ⚠️ KHONG dung `requestVisiblePages()` — toan bo than ham do nam trong `if (primaryChanged)`,
+    //   nen khi van dung o trang cu (dung canh vua tao chu thich) no KHONG LAM GI CA.
+    //   Do duoc: invalidatePage chay 6 lan ma khong mot lenh render nao duoc dat.
+    // ⇒ Dat lenh THANG cho dung trang do.
+    void datLaiLenhVeTrang(int page);
     void setAnnotVisualsForPage(int page, const QList<AnnotVisual>& visuals);
+    void setPageLowRes(int pageIndex, const QImage& img);
+    // Bai do bo nho: dung luong 2 kho anh cua Continuous
+    qint64 bytesPageImages() const {
+        qint64 t=0; for (auto it=m_pageImages.constBegin(); it!=m_pageImages.constEnd(); ++it)
+            t += qint64(it.value().width())*it.value().height()*4; return t; }
+    qint64 bytesPageLowRes() const {
+        qint64 t=0; for (auto it=m_pageLowRes.constBegin(); it!=m_pageLowRes.constEnd(); ++it)
+            t += qint64(it.value().width())*it.value().height()*4; return t; }
+    int countPageImages() const { return m_pageImages.size(); }
+    int countPageLowRes() const { return m_pageLowRes.size(); }
+    // Trang co markup khong overlay duoc (SPEC_CONT_MARKUP_TAB_SAFE muc 1): cam dung
+    // lop vector cho trang nay, markup hien qua duong raster (setPageAnnotRender).
+    // Chi dat/xoa co — KHONG go lop vector dang dung (GPU renderer con giu uid), de
+    // co che EVICT san co don. setDocument() xoa sach co nay.
+    void setPageRasterOnly(int page, bool on);
+
+    // ── Lop bu annot phan mem khac (lam giong Single/PdfGpuView) ─────────────
+    // MainWindow day lop bu da build (ForeignAnnotLayer) xuong theo tung trang.
+    // ContinuousView ve lop nay DE LEN lop vector ngay sau endNativePainting.
+    // Giu TOI DA 3 trang, evict theo khoang cach toi trang chinh (giong m_vecLayers).
+    // Truyen nullptr de xoa lop cua trang.
+    void setForeignAnnotLayer(int page, std::shared_ptr<ForeignAnnotLayer> layer);
+    // Trang da co noi dung de ve (lop vector san sang HOAC da co anh raster)?
+    // C3: lop bu chi dung SAU KHI trang hien ra roi, tranh chan hien thi trang nang.
+    bool pageHasContent(int page) const;
+    // Trang DANG ve bang lop vector (m_vecLayers san san + not rasterOnly)? C3 / 30-08:
+    // lop bu chi can khi NEN la vector (lop nay khong chua annotation). Nen raster da
+    // nung san annotation nen khong can lop bu.
+    bool pageHasVector(int page) const;
 
     // ── Chon/keo markup (SPEC_CONTINUOUS_MARKUP_EDIT_2026-08-16) ─────────────
     // Giong PdfGpuView: MainWindow goi setSelectedAnnot khi bam trung annot de
@@ -78,6 +119,14 @@ public:
     // /Rotate + pageBoxOrigin) — cung khong gian voi AnnotInfo.rect.
     void setSelectedAnnot(int page, const QRectF& rectPdf);
     void clearSelectedAnnot();
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): cho phep co gian bang 4 tay nam
+    // goc (chi Stamp cua TorReader). Goi tu MainWindow.
+    void setSelectResizable(bool on);
+    bool selectResizable() const { return m_selResizable; }
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): trang + diem giua vung nhin
+    // (toa do hien thi) de dat anh moi. Tra false neu khong co trang hop le.
+    bool probeViewportCenter(int* page, QPointF* dispCenter) const;
+    QSizeF pageSizePt(int page) const { return (page >= 0 && page < m_pageSizePt.size()) ? m_pageSizePt[page] : QSizeF(); }
     // Drag-ghost: uid cua annot dang keo (MainWindow day tu annotationPickRequested).
     void setDragTarget(const QString& uid, const QString& ghostText,
                        float fontSizePt, const QColor& ghostColor);
@@ -117,6 +166,11 @@ signals:
     void annotationPickRequested(int pageIndex, QPointF pagePt);
     void annotationContextRequested(int pageIndex, QPointF pagePt, QPoint globalPos);
     void annotationMoveRequested(int pageIndex, double dx, double dy);
+    // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): ket thuc keo tay nam goc.
+    void annotationResizeRequested(int pageIndex, QRectF newRectDisp);
+    // VIỆC 3 (SPEC_SMOOTH_123 31/08): trang visible chua co anh to/lop vector → xin
+    // thumbnail (bac 0) de KHONG BAO GIO ve o trong. MainWindow noi toi ThumbnailRenderPool.
+    void needThumbnail(int page);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -130,12 +184,22 @@ protected:
     void scrollContentsBy(int dx, int dy) override;
 
 private:
-    // Gap in pixels between successive pages.
-    static constexpr int    kGap        = 12;
-    // Horizontal padding added to the canvas width beyond the widest page.
-    static constexpr int    kHPad       = 40;
-    // Drop-shadow size in pixels.
-    static constexpr int    kShadow     = 4;
+// Gap in pixels between successive pages.
+     static constexpr int    kGap        = 12;
+     // Horizontal padding added to the canvas width beyond the widest page.
+     static constexpr int    kHPad       = 40;
+     // Drop-shadow size in pixels.
+     static constexpr int    kShadow     = 4;
+     // Vector build grace period (ms) to allow raster fallback after vector build starts.
+     static constexpr qint64 kVectorGraceMs = 400;
+     // Radius (in pages) around center to keep vector layers/builds active.
+     static constexpr int    kKeepRadius    = 1;
+     // Trang nang phai DUNG MOI vai giay moi hien lai — noi long ban kinh giu lop
+     // vector (Viec C 2026-08-30): cuon di 2-3 trang roi quay lai khong phai xay lai.
+     static constexpr int    kHeavyKeepRadius = 3;
+     // Object-count threshold above which a page is "heavy": raster can never finish
+     // (2,5 trieu path), so rasterOnly is bypassed and the vector layer stays allowed.
+     static constexpr int    kHeavyObjectThreshold = 400000;
 
     // ── Layout ────────────────────────────────────────────────────────────────
     // Recompute m_pageTopY, canvas size, and scrollbar ranges.
@@ -150,6 +214,12 @@ private:
     void requestVisiblePages();
     // True if any part of page i overlaps the current scrolled viewport.
     bool pageVisible(int i) const;
+    // Request a continuous render for page at scale, but skip if an identical
+    // (page, scale) render is already in flight (m_pendingRenderScale). If a
+    // render for the page is pending at a DIFFERENT scale, cancel it first
+    // instead of stacking a duplicate. All continuous render requests must
+    // route through here (settle timer, retry timer, neighbor pages).
+    void requestContinuousRender(int page, double scale);
 
     // ── Coordinate helpers ────────────────────────────────────────────────────
     // Canvas Y of the top edge of page i (before scrolling).
@@ -174,16 +244,32 @@ private:
 
     // ── Render cache ──────────────────────────────────────────────────────────
     QHash<int, QPixmap> m_pageImages; // keyed by page index
+    QHash<int, QPixmap> m_pageLowRes; // low-res placeholders for fast scroll
     QHash<int, double>  m_pageImageZoom; // zoom level when each image was rendered
     QSet<int>           m_continuousRequested; // pages currently being rendered
+    // Yeu cau render dang bay theo cap (page, scale): lan chong bom viec trung —
+    // trang 2,54 trieu path render lau, setDocument/scroll retry hoi lai lien tuc
+    // cung (page, scale) lam render CU chua xong da bi da di lam lai tu dau.
+    // Xoa khi anh ve xong (continuousPageReady) va khi doi tai lieu/reset zoom.
+    QHash<int, double>  m_pendingRenderScale;
 
-    // ── View state ────────────────────────────────────────────────────────────
-    double  m_zoom     = 1.0;
-    bool    m_darkMode = false;
-    PdfGpuView::ViewTool m_tool = PdfGpuView::ViewTool::Pan;
+// ── View state ────────────────────────────────────────────────────────────
+     double  m_zoom     = 1.0;
+     // Dang zoom: cam moi yeu cau anh (requestVisiblePages/requestNeighborPages) de
+     // khong doc cache dia DONG BO o luong giao dien giua setZoom. Chi huy sau khi
+     // zoom dung (cuoi setZoom) — anh cu van duoc ve scale tam trong paintEvent.
+     bool    m_zooming  = false;
+     bool    m_darkMode = false;
+     bool    m_fastMode = true;   // default to fast mode
+     PdfGpuView::ViewTool m_tool = PdfGpuView::ViewTool::Pan;
 
     // ── Drag-pan state ────────────────────────────────────────────────────────
     bool    m_panning      = false;
+    int     m_vecGen = 0;
+    bool    m_pickCandidate = false;
+    int     m_pickPage = -1;
+    QPointF m_pickPt;
+    QPoint  m_panPressPos;
     QPoint  m_lastMousePos;
 
     // ── Chon/keo markup (SPEC_CONTINUOUS_MARKUP_EDIT_2026-08-16) ─────────────
@@ -197,6 +283,15 @@ private:
     QString m_dragUid;
     QRectF  m_dragNoteRect;
     QPointF m_dragNoteOffsetPt;
+    // Insert Image: co gian Stamp bang 4 tay nam goc (giu ty le, Shift = tu do).
+    bool    m_selResizable   = false;
+    int     m_resizingCorner = -1;   // 0=TL,1=TR,2=BR,3=BL
+    QRectF  m_resizeOrigRect;
+    QPointF selHandlePos(int corner) const;
+    int     handleAt(const QPointF& dispPt) const;
+    QRectF  resizeRectFor(int corner, const QPointF& dragDisp, bool keepAspect) const;
+    // Widget pos (viewport) -> toa do hien thi cua m_selPage.
+    QPointF selPageWidgetToDisp(const QPoint& widgetPos) const;
     // Widget pos → trang + diem hien thi (Y-down, da ap /Rotate + pageBoxOrigin).
     // Giong PdfGpuView::widgetToPdf — MainWindow hit-test AnnotInfo.rect cung khong gian.
     bool resolvePageDisplayPos(const QPoint& widgetPos, int* page, QPointF* dispPt) const;
@@ -268,6 +363,9 @@ private:
     // current continuous zoom. Cleared on zoom change.
     QHash<int, double> m_cacheProbed;
 
+    // Retry timer for primary page when rendering is skipped due to maxConcurrent limit.
+    QTimer* m_retryTimer = nullptr;
+
     // ── Sharp-region overlay ─────────────────────────────────────────────────
     // Renders only the visible region at full zoom when the base page image is
     // clamped (kMaxPx limit), providing crisp text at high zoom levels.
@@ -281,25 +379,65 @@ private:
     // viewport) and treats it like single-mode: cache-first, then 400ms settle
     // timer, then render. Neighbors only after primary is done.
     QTimer* m_contSettleTimer = nullptr;
+    // 🔴 2026-08-31: cong cho phep DUNG lop vector. Mac dinh TAT.
+    // Chi bat khi (a) cuon da dung han va (b) trang do DA co thu gi day du de nhin.
+    bool m_vecBuildArmed = false;
+    QHash<int, bool> m_vecAnnotSafe;   // trang -> nen vector co nuot markup khong
     int     m_primaryPage = -1;
     double  m_lastRequestZoom = -1.0;
     bool    m_primaryRequested = false;
     void requestNeighborPages();
 
+    // Vector layer build timer for primary page (700ms debounce, single-shot)
+    QTimer* m_vecBuildTimer = nullptr;
+    void buildPrimaryVectorLayer();
+
     // ── Annotation overlay visuals (per page) ─────────────────────────────
     QHash<int, QList<AnnotVisual>> m_pageAnnotVisuals;
+
+    // Cache trang xoay (de khong phai khoa PDFium o main thread).
+    QHash<int, int> m_pageRot;
 
     // ── Search highlights (nhieu trang cung luc) ─────────────────────────
     QHash<int, QList<QRectF>> m_highlightsByPage;
     int  m_highlightCurrentPage = -1;  // trang chua ket qua dang chon
     int  m_highlightCurrentIdx  = -1;  // chi so trong list cua trang do
 
-    QHash<int, std::shared_ptr<VectorLayer>> m_vecLayers;
-    QSet<int>                                m_vecBuilding;
-    void ensureVectorLayers();
-    bool vectorWillRender(int pg) const;
+QHash<int, std::shared_ptr<VectorLayer>> m_vecLayers;
+     // Lop bu foreign annot theo trang (C1): moi lop la mot ANH LON, chi giu quanh
+     // trang chinh (evict trong ensureVectorLayers, cung cho voi m_vecLayers).
+     QHash<int, std::shared_ptr<ForeignAnnotLayer>> m_fgnLayers;
+     // Evict lop bu ngoai ban kinh kKeepRadius quanh trang chinh (loi goi chung tu
+     // setForeignAnnotLayer va ensureVectorLayers).
+     void evictForeignLayers();
+     QSet<int>                                m_vecBuilding;
+     QThreadPool                              m_vecPool;
+     QHash<int, qint64>                       m_vecBuildStart;
+     QSet<int>                                m_rasterOnlyPages;   // trang chi ve bang raster (spec cont2)
+     QSet<int>                                m_thumbRequested;    // trang da yeu cau thumbnail (BAC 2)
+     void ensureVectorLayers();
+     bool vectorWillRender(int pg) const;
+     // rasterOnly co duoc ap cho trang nay khong? Trang nang (>= nguong) KHONG bi cam
+     // lop vector: raster 2,54 trieu path khong bao gio ve xong, phai dung lop vector
+     // tu cache de hien trang (owner chot 2026-08-30).
+     // 🔴 2026-09-01: trang co chu thich ma overlay KHONG ve (Note, Text, comment ngoai) thi
+    // KHONG duoc ve bang nen vector — nen vector khong chua annotation. Tu quyet tai cho,
+    // khong phu thuoc MainWindow co goi setVectorAnnotSafe dung luc hay khong.
+    bool trangCanRaster(int pg) const;
+    bool rasterOnlyApplies(int pg) const;
+     static bool contRasterOnlyEnv();   // TORREADER_CONT_RASTER=1 -> Continuous raster thuan
 
-    VectorGpuRenderer m_vgr;
+VectorGpuRenderer m_vgr;
     bool m_vgrInit = false;
 
+// Khoa cache .torvec, MainWindow day sang (ContinuousView khong tu biet duong dan goc).
+     QString m_vecKeyPath;
+     quint64 m_vecKeyHash = 0;
+     // Doc so huu key hien tai. Doi doc thi key cu PHAI bo — khong duoc dung cache
+     // cua file A cho trang cua file B (bao mat noi dung).
+     PdfDocument* m_vecKeyDoc = nullptr;
+     // Moi duong vao Continuous deu phai co key hop le. setDocument tu dan xuat key
+     // tu doc khi MainWindow quen day (duong doi tab) hoac day hash=0 (initWatcher
+     // chua tinh xong) — day la nguyen nhan [torvec] SKIP reason=nokey.
+     void updateVecCacheKeyFromDoc(PdfDocument* doc);
 };

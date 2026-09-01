@@ -1,6 +1,7 @@
 #include "PdfDocument.h"
 #include "OcrTextLayer.h"
 #include "PageCache.h"
+#include "PdfiumLock.h"
 #include <QMutex>
 #include <QDebug>
 #include <fpdf_text.h>
@@ -17,6 +18,11 @@
 // Serializes FPDF_LoadCustomDocument / FPDF_LoadDocument / FPDF_CloseDocument
 // (PDFium document-level operations have internal global state).
 QMutex s_pdfiumMutex;
+QAtomicInteger<int> g_pdfiumDocOpen{0},  g_pdfiumDocClose{0};
+QAtomicInteger<int> g_pdfiumPoolOpen{0}, g_pdfiumPoolClose{0};
+QAtomicInteger<int> g_pdfiumPageOpen{0}, g_pdfiumPageClose{0};
+QAtomicInteger<qint64> g_gpuTexBytes{0};
+QAtomicInteger<int>    g_gpuTexAlive{0};
 
 // PDFium requires one-time library init. Guard with static + mutex.
 static QMutex s_initMutex;
@@ -63,8 +69,10 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
     std::wstring wpath = filePath.toStdWString();
     // FILE_SHARE_WRITE is required so AnnotationManager can open the same file
     // for writing (FPDF_SaveAsCopy) while this read-only mmap is still active.
+    // FILE_SHARE_DELETE only unlocks rename/move in Explorer; delete is still
+    // blocked while the file stays memory-mapped.
     m_fileHandle = CreateFileW(wpath.c_str(), GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (m_fileHandle != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER sz{};
@@ -78,9 +86,9 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
                 if (m_mapView) {
                     m_fileSize = sz.QuadPart;
                     {
-                        QMutexLocker lock(&s_pdfiumMutex);
+                        BoundedPdfiumLock lock(__FILE__, __LINE__);
                         m_doc = FPDF_LoadMemDocument(m_mapView, static_cast<int>(sz.QuadPart),
-                                                     pwd.isEmpty() ? nullptr : pwd.constData());
+                                                     pwd.isEmpty() ? nullptr : pwd.constData()); g_pdfiumDocOpen.fetchAndAddOrdered(1);
                         if (m_doc) {
                             m_pageCount = FPDF_GetPageCount(m_doc);
                             m_pageSizes.resize(m_pageCount);
@@ -121,9 +129,9 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
             if (m_mapView != MAP_FAILED) {
                 m_fileSize = static_cast<unsigned long>(st.st_size);
                 {
-                    QMutexLocker lock(&s_pdfiumMutex);
+                    BoundedPdfiumLock lock(__FILE__, __LINE__);
                     m_doc = FPDF_LoadMemDocument(m_mapView, static_cast<int>(st.st_size),
-                                                 pwd.isEmpty() ? nullptr : pwd.constData());
+                                                 pwd.isEmpty() ? nullptr : pwd.constData()); g_pdfiumDocOpen.fetchAndAddOrdered(1);
                     if (m_doc) {
                         m_pageCount = FPDF_GetPageCount(m_doc);
                         m_pageSizes.resize(m_pageCount);
@@ -154,9 +162,9 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
     // Fallback: FPDF_LoadDocument (loads entire file into PDFium heap)
     QByteArray pathUtf8 = filePath.toUtf8();
     {
-        QMutexLocker lock(&s_pdfiumMutex);
+        BoundedPdfiumLock lock(__FILE__, __LINE__);
         m_doc = FPDF_LoadDocument(pathUtf8.constData(),
-                                   pwd.isEmpty() ? nullptr : pwd.constData());
+                                   pwd.isEmpty() ? nullptr : pwd.constData()); g_pdfiumDocOpen.fetchAndAddOrdered(1);
         if (m_doc) {
             m_pageCount = FPDF_GetPageCount(m_doc);
             m_pageSizes.resize(m_pageCount);
@@ -176,13 +184,15 @@ bool PdfDocument::open(const QString& filePath, const QString& password) {
 
 // ── close ─────────────────────────────────────────────────────────────────────
 void PdfDocument::close() {
-    QMutexLocker lock(&s_pdfiumMutex);
+    // 🔴 VIỆC 1 (SPEC_SMOOTH_123 31/08): close PHAI xong (FPDF_CloseDocument) nhung
+    // GUI khong duoc chan vo han — dung bounded lock: tryLock(0) + retry ngan.
+    BoundedPdfiumLock lock(__FILE__, __LINE__);
     if (m_doc) {
         OcrTextLayer::forgetDocument(m_doc);
         // 🔴 PageCache giu FPDF_PAGE cua doc — phai xoa TRUOC FPDF_CloseDocument
         //    neu khong con tro chet (SPEC_PAGECACHE_CORE muc 2).
         PageCache::forgetDocument(m_doc);
-        FPDF_CloseDocument(m_doc);
+        FPDF_CloseDocument(m_doc); g_pdfiumDocClose.fetchAndAddOrdered(1);
         m_doc = nullptr;
         m_filePath.clear();
         m_pageCount = 0;

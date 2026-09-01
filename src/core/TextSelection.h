@@ -7,6 +7,7 @@
 #include <QHash>
 #include <fpdfview.h>
 #include <fpdf_text.h>
+#include "PageCache.h"
 
 // Chon chu theo CHI SO KY TU (kieu Adobe) — boc FPDFText_*, khong dinh giao dien.
 // Moi loi goi PDFium deu gio QMutexLocker lock(&s_pdfiumMutex).
@@ -21,12 +22,15 @@ namespace TextSelection {
 
 // Thong tin TEXT page cua mot trang. FPDF_PAGE + FPDF_TEXTPAGE la MUON TU
 // PageCache (chu so huu duy nhat, SPEC_PAGECACHE_CORE) — ben goi KHONG Close.
+// `borrow` (RAII) tu dong goi PageCache::release khi PageInfo het scope — moi duong
+// thoat deu tra borrow (SPEC_PERF_HEAVYPAGE R1).
 struct PageInfo {
     FPDF_PAGE     page = nullptr;
     FPDF_TEXTPAGE tp   = nullptr;
     int           rot  = 0;      // FPDFPage_GetRotation & 3
     QPointF       box;           // CropBox (left, bottom)
     QSizeF        disp;          // kich thuoc hien thi (da ap /Rotate)
+    PageCache::PageBorrow borrow; // cap doi acquire()/release() tu dong
 };
 
 // Nap trang + text page (neu can) tu PageCache. GOI TU LUONG NEN / duong bam
