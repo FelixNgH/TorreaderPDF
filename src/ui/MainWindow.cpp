@@ -922,6 +922,7 @@ const int page = (m_fastMode && m_continuousView)
         refreshAnnotVisuals(t, page);
     });
 
+#ifndef TORREADER_STORE_BUILD
     // ── Gate: update check (fires once after window is shown) ─────────────────
     m_updateChecker = new UpdateChecker(this);
     connect(m_updateChecker, &UpdateChecker::updateAvailable,
@@ -944,6 +945,10 @@ const int page = (m_fastMode && m_continuousView)
         qDebug().noquote() << "[gate] up to date — no dialog";
     });
     QTimer::singleShot(0, this, [this]() { m_updateChecker->checkForUpdates(); });
+#else
+    m_updateChecker = nullptr;
+    qDebug().noquote() << "[gate] store build — update check disabled";
+#endif
 
     // Settle timer: defers full-quality render until 400ms after last page change.
     // During fast scrolling, no renders start — avoids mutex contention.

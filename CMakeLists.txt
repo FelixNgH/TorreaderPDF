@@ -23,6 +23,7 @@ endif()
 
 # ── AI-only build mode: skip PDF/OpenSSL/QPDF dependencies ─────────────────
 option(TORREADER_NO_PDFIUM "Skip PDFium + PDF dependencies (AI-only build)" OFF)
+option(TORREADER_STORE_BUILD "Build for Microsoft Store (no self-update prompt)" OFF)
 
 # ── OpenSSL (vcpkg) — PdfSigner verify + sign (CMS/PKCS12) ───────────────────
 if(NOT TORREADER_NO_PDFIUM)
@@ -272,6 +273,10 @@ target_compile_definitions(TorReader PRIVATE
     $<$<BOOL:${FELIXPDF_ENABLE_OCR}>:FELIXPDF_ENABLE_OCR>
     $<$<BOOL:${TORREADER_NO_PDFIUM}>:TORREADER_NO_PDFIUM>
 )
+
+if(TORREADER_STORE_BUILD)
+    target_compile_definitions(TorReader PRIVATE TORREADER_STORE_BUILD)
+endif()
 
 target_include_directories(TorReader PRIVATE
     src
