@@ -66,7 +66,7 @@ cp "$DEB" "$OUT/pool/main/t/torreader/$DEB_NAME"
 mkdir -p "$OUT/dists/stable/main/binary-amd64"
 
 cd "$OUT"
-dpkg-scanpackages --arch amd64 pool/ > "dists/stable/main/binary-amd64/Packages"
+dpkg-scanpackages -m --arch amd64 pool/ > "dists/stable/main/binary-amd64/Packages"
 gzip -kf "dists/stable/main/binary-amd64/Packages"
 
 cd "$OUT/dists/stable"
