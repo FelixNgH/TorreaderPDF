@@ -40,6 +40,18 @@ backed by a memory + disk cache, and off-screen pages are evicted so RAM stays f
 
 Full notes: [`RELEASE_NOTES_2.4.md`](RELEASE_NOTES_2.4.md)
 
+**Point releases since 2.4**
+
+- **2.4.2** — the Text tool now writes a real FreeText annotation, so text you add is a proper PDF
+  comment that Acrobat and other PDF software can read and edit. Vietnamese types correctly into
+  annotations with any input method, text wraps to its box, and the box resizes by dragging a
+  corner. Fixes striped text over vector pages and a crash when closing a tab.
+  ([`RELEASE_NOTES_2.4.2.md`](RELEASE_NOTES_2.4.2.md))
+- **2.4.1** — markups appear the instant you draw them instead of re-rendering the page, and stay
+  visible through zoom and in continuous mode. Comments written in other PDF software keep their
+  own font and background. Heavy CAD drawings reopen in a fraction of a second.
+  ([`RELEASE_NOTES_2.4.1.md`](RELEASE_NOTES_2.4.1.md))
+
 <details>
 <summary>More screenshots (viewer, dark mode, markup, search, OCR, merge)</summary>
 <br>
@@ -56,11 +68,11 @@ Full notes: [`RELEASE_NOTES_2.4.md`](RELEASE_NOTES_2.4.md)
 
 | Platform | Install |
 |----------|---------|
-| **Windows** (x64) | [`TorReaderPDF-2.4.1-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
+| **Windows** (x64) | [`TorReaderPDF-2.4.2-win64.zip`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — unzip & run `TorReader.exe` |
 | **Ubuntu / Debian** (APT) | `sudo mkdir -p /etc/apt/keyrings`<br>`sudo curl -fsSL https://torreader.cloud/apt/torreader-archive-keyring.gpg -o /etc/apt/keyrings/torreader.gpg`<br>`echo "deb [signed-by=/etc/apt/keyrings/torreader.gpg] https://torreader.cloud/apt stable main" \| sudo tee /etc/apt/sources.list.d/torreader.list`<br>`sudo apt update && sudo apt install torreader` |
-| **Ubuntu / Debian** (.deb) | `sudo apt install ./torreader_2.4.1_amd64.deb` |
+| **Ubuntu / Debian** (.deb) | `sudo apt install ./torreader_2.4.2_amd64.deb` |
 | **Arch Linux** | `yay -S torreader-bin` *(pending publication on AUR)* |
-| **Any distro** (AppImage) | [`TorReaderPDF-2.4.1-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (glibc 2.35+, requires system OpenGL) |
+| **Any distro** (AppImage) | [`TorReaderPDF-2.4.2-x86_64.AppImage`](https://github.com/FelixNgH/TorreaderPDF/releases/latest) — `chmod +x` & run (glibc 2.35+, requires system OpenGL) |
 
 Ships a freedesktop `.desktop` file and AppStream metadata, so it appears in your application
 menu and in "Open with" for PDFs.
@@ -71,7 +83,7 @@ menu and in "Open with" for PDFs.
 > project's name and description reused to push generic `Application-x.y.zip` archives on
 > third-party sites. Two checks settle it: the link must be on `github.com/FelixNgH/...` or
 > `torreader.cloud`, and the file name carries the product name and version
-> (`TorReaderPDF-2.4.1-win64.zip`), never a bare `setup.exe`.
+> (`TorReaderPDF-2.4.2-win64.zip`), never a bare `setup.exe`.
 > Found a copy elsewhere? [Open an issue](https://github.com/FelixNgH/TorreaderPDF/issues).
 
 ## Features
