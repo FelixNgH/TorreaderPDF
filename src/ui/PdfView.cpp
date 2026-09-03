@@ -151,7 +151,9 @@ void PdfView::paintEvent(QPaintEvent*) {
     p.fillRect(rect(), bg);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
-    if (m_pixmap.isNull() && !m_loading) {
+    // W2 (01/09): man hinh chao chi phu thuoc hasDocument() — xem PdfGpuView.
+    // GIU !m_loading: dang tai trang dau thi nen bao "Loading...", khong phai chao.
+    if (!hasDocument() && !m_loading) {
         p.setPen(QColor(200, 200, 200));
         QFont f = p.font(); f.setPointSize(13); p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter,

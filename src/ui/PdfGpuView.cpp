@@ -143,6 +143,7 @@ PdfGpuView::~PdfGpuView() {
         if (m_fillVboDepth) { glDeleteBuffers(1, &m_fillVboDepth); m_fillVboDepth = 0; }
         if (m_fillVboClip) { glDeleteBuffers(1, &m_fillVboClip); m_fillVboClip = 0; }
         if (glx && m_tileVao) { glx->glDeleteVertexArrays(1, &m_tileVao); m_tileVao = 0; }
+        delete m_ssFbo; m_ssFbo = nullptr; m_ssFboSize = QSize();
         for (GLuint t : m_tileTexText) if (t) glDeleteTextures(1, &t);
         for (GLuint t : m_tileTexImg) if (t) glDeleteTextures(1, &t);
         m_tileTexText.clear();
@@ -497,7 +498,16 @@ void PdfGpuView::paintGL() {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
-    if (!m_hasImage && !m_loading && !pureVector) {
+    // W2 (01/09): man hinh CHAO chi duoc hoi "co tai lieu mo khong" (hasDocument),
+    // khong duoc hoi "co anh raster khong" (m_hasImage). Trang quai ve bang lop
+    // vector ma raster bi choi (heavycap) tung bi phu chu "Open a PDF" len ban ve.
+    // Da mo tai lieu ma chua co gi de ve => nen trong (loading thi da co nhanh duoi).
+    if (!hasDocument()) {
+        // W3 (01/09): xoa nen bang Source truoc khi ve chu — QOpenGLWidget khong
+        // tu xoa lop QPainter giua cac khung hinh, chu cu chong thanh nho kep (§2.4).
+        p.setCompositionMode(QPainter::CompositionMode_Source);
+        p.fillRect(rect(), deskBgColor());
+        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
         p.setPen(QColor(200, 200, 200));
         QFont f = p.font(); f.setPointSize(13); p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter,
@@ -857,6 +867,10 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
     }
     m_pageIndex  = pageIndex;
     m_pageSizePt = pageSizePt;
+    // LÁT B 09/02: doi trang => giai lai lop vector tu KHO CHUNG theo trang moi. Continuous
+    // co the da nap san trang nay (cache .torvec) => Single ve duoc ngay, khong phai cho
+    // MainWindow goi lai. paintGL tu doi chieu m_vecUploadedPage voi pageIndex nen an toan.
+    m_vecLayer = m_vecSrc ? m_vecSrc->value(m_pageIndex) : nullptr;
     m_loading    = false;
     m_hasImage   = !pageImage.isNull();
     m_placeholder = {};  // clear placeholder now that we have the real image
@@ -874,7 +888,7 @@ void PdfGpuView::setPage(int pageIndex, const QImage& pageImage, QSizeF pageSize
     }
     if (newPage) {
         m_panOffset = {};
-        m_annotVisuals.clear();
+        // LÁT A 09/02: khong xoa visuals — kho theo tài liệu, doi trang la doc key khac.
         m_hasSel = false;
         // Vung chon chu theo chi so ky tu: bo khi doi trang (khong emit — co
         // the dang o che do lien tuc, trang nay an).
@@ -983,6 +997,8 @@ void PdfGpuView::setPendingPage(int pageIndex, QSizeF pageSizePt) {
              << "size=" << pageSizePt << "pageChanged=" << pageChanged;
     m_pageIndex  = pageIndex;
     m_pageSizePt = pageSizePt;
+    // LÁT B 09/02: giai lop vector tu kho chung theo trang vua chuyen toi (xem setPage).
+    m_vecLayer = m_vecSrc ? m_vecSrc->value(m_pageIndex) : nullptr;
     if (pageChanged) {
         m_panOffset  = {};
         m_highlights.clear();
@@ -993,7 +1009,7 @@ void PdfGpuView::setPendingPage(int pageIndex, QSizeF pageSizePt) {
         m_selAnchorChar = m_selFocusChar = -1;
         m_selRects.clear();
         m_selDragging = false;
-        m_annotVisuals.clear();
+        // LÁT A 09/02: khong xoa visuals — kho theo tài liệu (xem ghi chu o setPage).
         m_tiles.clear();
         m_tilePage = -1;
         m_tileScale = 0.0;
@@ -1430,13 +1446,14 @@ void PdfGpuView::clearHighlights() {
 
 
 
-void PdfGpuView::setAnnotVisuals(const QList<AnnotVisual>& visuals) {
-    m_annotVisuals = visuals;
+void PdfGpuView::setAnnotVisuals(const QList<AnnotVisual>&) {
+    // LÁT A 09/02: visuals da nam trong kho duy nhat DocTab::visualsCache — day chi la
+    // lenh ve lai. Khong con ban chép rieng trong view.
     update();
 }
 
 void PdfGpuView::clearAnnotVisuals() {
-    m_annotVisuals.clear();
+    // LÁT A 09/02: khong con gi de ma xoa — chi ve lai (view loc theo paintByOverlay).
     update();
 }
 
@@ -1943,12 +1960,16 @@ bool PdfGpuView::tryActivateLink(QMouseEvent* e) {
 
 // ── Vector overlay ──────────────────────────────────────────────────────────
 
-void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> layer) {
+void PdfGpuView::setVectorLayer(std::shared_ptr<VectorLayer> /*layer*/) {
+    // LÁT B 09/02: nguon duy nhat la kho lop vector theo tai lieu (DocTab::vecLayers).
+    // Tham so `layer` bi BO (giu nguyen chu ky de khoi sua moi cho goi); m_vecLayer luon
+    // duoc giai theo trang dang hien cua view => Single thay dung thu ma Continuous da
+    // nap, khong con "hai kho lech nhau" nua.
+    m_vecLayer = m_vecSrc ? m_vecSrc->value(m_pageIndex) : nullptr;
     qDebug().noquote() << "[vector] setVectorLayer page=" << m_pageIndex
-                       << "ready=" << (layer && layer->isReady());
-    m_vecLayer = layer;
+                       << "ready=" << (m_vecLayer && m_vecLayer->isReady());
     m_vecUploadedPage = -1;
-    if (!layer && m_vecVao) {
+    if (!m_vecLayer && m_vecVao) {
         makeCurrent();
         QOpenGLContext* cur = QOpenGLContext::currentContext();
         QOpenGLExtraFunctions* glx = cur ? cur->extraFunctions() : nullptr;
@@ -2020,12 +2041,24 @@ void PdfGpuView::setVectorAnnotSafe(int page, bool safe) {
     update();
 }
 
+// W1 (01/09): "Co tai lieu dang mo" — tra loi tu CON TRO TAI LIEU, khong phai anh.
+// Moi PdfGpuView cua tab tai lieu duoc MainWindow setLinksDocument() luc tao,
+// va bi delete truoc khi doc bi huy ⇒ con tro song suot vong doi view.
+bool PdfGpuView::hasDocument() const {
+    return m_linksDoc && m_linksDoc->isOpen();
+}
+
 bool PdfGpuView::shouldUseVectorOverlay() const {
     const double onScreenW = m_pageSizePt.width() * m_zoom;
+    // CUNG MOT LUAT voi ContinuousView::rasterOnlyApplies: nen vector duoc dung khi
+    // overlay ve duoc het markup (m_vecAnnotSafe) HOAC lop comment da san sang cho trang
+    // nay (no ve chu thich de len nen vector). Chua san sang => tam raster, ve lai khi xong.
+    const bool commentReady = m_fgnLayer && m_fgnLayer->isReady()
+        && m_fgnLayer->pageIndex() == m_pageIndex && !m_fgnLayer->image().isNull();
     bool result = m_vecLayer && m_vecLayer->isReady()
         && m_vecLayer->isComplete()
         && m_vecLayer->pageIndex() == m_pageIndex
-        && m_vecAnnotSafe.value(m_pageIndex, true);   // xem setVectorAnnotSafe: chu thich ngoai
+        && (m_vecAnnotSafe.value(m_pageIndex, true) || commentReady);   // xem setVectorAnnotSafe
     if (result != m_vecLastOverlayState) {
         m_vecLastOverlayState = result;
         qDebug().noquote() << "[vector] overlay" << (result ? "ON" : "OFF")
@@ -2099,7 +2132,93 @@ QImage PdfGpuView::renderVectorThumbnail(double scale) {
 }
 
 void PdfGpuView::drawVectorOverlay() {
-    drawVectorContent(width(), height(), m_zoom, pageOrigin(), devicePixelRatioF());
+    // 🔴 02/09 — GOC "Single mat 66% net manh": Continuous ve trang do bang RASTER PDFium
+    //    (render 4960px roi ha xuong ~957px ⇒ net 0,1px giu duoc coverage that), con Single
+    //    ve lop vector 1:1 ⇒ shader ep moi net <1px thanh 1px dac, pixel lang gieng trang
+    //    hon. Cung geometry (165.792 segs ca hai duong), cung shader, cung covFloor 0.85.
+    //    Fix: cho lop vector sieu lay mau dung nhu cach raster lam — ve vao FBO lon hon kSS
+    //    lan roi blit LINEAR xuong. renderVectorThumbnail (2073) da dung kieu nay tu 19/08.
+    //    TORREADER_VEC_SS=1 = ve 1:1 nhu cu. Tu ha ss khi FBO vuong qua 20 Mpx.
+    static const int kEnvSS = qEnvironmentVariableIntValue("TORREADER_VEC_SS");
+    constexpr qint64 kMaxPx = 20000000;
+    const double pw = m_pageSizePt.width()  * m_zoom;
+    const double ph = m_pageSizePt.height() * m_zoom;
+    const qreal  dpr = devicePixelRatioF();
+    int ss = kEnvSS > 0 ? kEnvSS : 3;
+    QSize fboSz;
+    while (ss > 1) {
+        const QSize c(int(std::ceil(pw * dpr * ss)), int(std::ceil(ph * dpr * ss)));
+        if (c.width() > 0 && c.height() > 0 && qint64(c.width()) * c.height() <= kMaxPx) { fboSz = c; break; }
+        --ss;
+    }
+    if (ss < 2 || fboSz.isEmpty() || !m_tileProg || !m_tileVao || !context()) {
+        drawVectorContent(width(), height(), m_zoom, pageOrigin(), dpr);
+        return;
+    }
+
+    GLint prevVp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, prevVp);
+    if (!m_ssFbo || m_ssFboSize != fboSz) {
+        delete m_ssFbo;
+        QOpenGLFramebufferObjectFormat fmt;
+        fmt.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
+        m_ssFbo = new QOpenGLFramebufferObject(fboSz, fmt);
+        m_ssFboSize = fboSz;
+    }
+    if (!m_ssFbo->isValid()) {
+        drawVectorContent(width(), height(), m_zoom, pageOrigin(), dpr);
+        return;
+    }
+
+    m_ssFbo->bind();
+    glViewport(0, 0, fboSz.width(), fboSz.height());
+    glClearColor(1.f, 1.f, 1.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // dprIn = PIXEL THUC / don vi viewport = fboSz/ (fboSz/dpr) = dpr (KHONG phai dpr*ss).
+    drawVectorContent(int(std::round(double(fboSz.width())  / dpr)),
+                      int(std::round(double(fboSz.height()) / dpr)),
+                      m_zoom * ss, QPointF(0.0, 0.0), dpr);
+    m_ssFbo->release();
+    glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+
+    const QPointF orig = pageOrigin();
+    GLboolean blendWasOn = glIsEnabled(GL_BLEND);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_DEPTH_TEST);
+    m_tileProg->bind();
+    QMatrix4x4 m;
+    m.ortho(0.f, float(width()), float(height()), 0.f, -1.f, 1.f);
+    glUniformMatrix4fv(m_tileMvpLoc, 1, GL_FALSE, m.constData());
+    for (int i = 0; i < 64; ++i)
+        m_tileProg->setUniformValue(QString("uClips[%1]").arg(i).toUtf8().constData(),
+                                    QVector4D(0.f, 0.f, 0.f, 0.f));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_ssFbo->texture());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glUniform1i(m_tileTexLoc, 0);
+    glUniform1i(m_tileIsAlphaLoc, 0);
+    glUniform4f(m_tileColorLoc, 1.f, 1.f, 1.f, 1.f);
+    // Chieu cao AM: hang duoi cung cua FBO la DAY trang, tile shader lay vUV.y = aCorner.y
+    // tinh tu canh tren cua uRect → khong bi luoc nguoc anh.
+    glUniform4f(m_tileRectLoc, float(orig.x()), float(orig.y() + ph), float(pw), float(-ph));
+    glUniform1f(m_tileDepthLoc, 0.f);
+    glUniform1f(m_tileProg->uniformLocation("uClipIdx"), 0.f);
+    QOpenGLContext* cur = QOpenGLContext::currentContext();
+    QOpenGLExtraFunctions* glx = cur ? cur->extraFunctions() : nullptr;
+    if (glx) {
+        glx->glBindVertexArray(m_tileVao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glx->glBindVertexArray(0);
+        for (int _i = 0; _i < 8; ++_i) glDisableVertexAttribArray(_i);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    m_tileProg->release();
+    if (!blendWasOn) glDisable(GL_BLEND);
 }
 
 void PdfGpuView::drawVectorContent(int vpW, int vpH, double zoom, QPointF orig, qreal dprIn) {
@@ -2444,6 +2563,20 @@ void PdfGpuView::drawVectorContent(int vpW, int vpH, double zoom, QPointF orig, 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
+    // 🔴🔴 0903 — GOC "chu bi soc cheo tren trang nen VECTOR" (owner bao 03/09).
+    // Khoi don cu tra VAO/attrib/buffer/texture/program NHUNG BO SOT cac CO TRANG THAI.
+    // Nguy nhat la GL_DEPTH_TEST: QPainter mo lai ve chu bang cac o texture (dem glyph);
+    // neu depth test con bat, manh chu bi SO DO SAU voi hinh hoc cua lop vector va bi
+    // LOAI BO theo dung hinh dang net ve ben duoi => chu thung thanh soc cheo, con chu
+    // nam cho trong thi ve dac. Do duoc: cung chuoi do tren trang nen RASTER ve SACH.
+    // Hinh khoi (line/rect) khong lo vi chung la hinh hoc don gian, khong dung texture.
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);   // mac dinh Qt (mau nhan san alpha)
 }
 
 // ── paintGL sub-helpers (extracted from paintGL) ───────────────────────────
@@ -2455,7 +2588,7 @@ void PdfGpuView::drawPageBase(bool pureVector) {
         m_textureDirty  = false;
     }
 
-    QColor bg = m_darkMode ? QColor(30, 30, 30) : QColor(80, 80, 80);
+    QColor bg = deskBgColor();
     glClearColor((float)bg.redF(), (float)bg.greenF(), (float)bg.blueF(), 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -2532,24 +2665,28 @@ void PdfGpuView::drawForeignAnnotLayers(QPainter& p, const QPointF& orig, double
 }
 
 void PdfGpuView::drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVector) {
+    // LÁT A 09/02: doc thang kho duy nhat cua tai lieu theo trang hien tai — khong copy,
+    // khong con ban chép rieng trong view.
+    static const QList<AnnotVisual> kEmptyVisuals;
+    const QList<AnnotVisual>* vp = nullptr;
+    if (m_visualsSrc) {
+        auto it = m_visualsSrc->constFind(m_pageIndex);
+        if (it != m_visualsSrc->constEnd()) vp = &it.value();
+    }
+    const QList<AnnotVisual>& visuals = vp ? *vp : kEmptyVisuals;
     {
         static int _lastLogPage = -1, _lastLogSize = -1;
-        bool anyMatch = false;
-        for (const auto& av : m_annotVisuals)
-            if (av.page == m_pageIndex) { anyMatch = true; break; }
-        if (!anyMatch && (_lastLogPage != m_pageIndex || _lastLogSize != m_annotVisuals.size())) {
+        if (visuals.isEmpty() && (_lastLogPage != m_pageIndex || _lastLogSize != visuals.size())) {
             _lastLogPage = m_pageIndex;
-            _lastLogSize = m_annotVisuals.size();
-            qDebug().noquote() << "[annot] overlay skipped — visualsPage="
-                << (m_annotVisuals.isEmpty() ? -1 : m_annotVisuals.first().page)
-                << "viewPage=" << m_pageIndex << "n=" << m_annotVisuals.size();
+            _lastLogSize = visuals.size();
+            qDebug().noquote() << "[annot] overlay skipped — viewPage=" << m_pageIndex << "n=0";
         }
     }
     p.save();
     p.setRenderHint(QPainter::Antialiasing, true);
     int cntVis = 0, cntSticky = 0, cntDrawn = 0;
 
-    for (const AnnotVisual& av : m_annotVisuals) {
+    for (const AnnotVisual& av : visuals) {
         if (av.page != m_pageIndex) continue;
         ++cntVis;
         if (av.subtype == FPDF_ANNOT_TEXT) ++cntSticky;
@@ -2612,12 +2749,20 @@ void PdfGpuView::drawMarkupOverlay(QPainter& p, const QPointF& orig, bool pureVe
                 break;
             }
             case FPDF_ANNOT_FREETEXT: {
-                double fs = qMax(6.0, av.fontSize * m_zoom);
-                QFont ft = p.font();
-                ft.setPointSizeF(fs);
-                p.setFont(ft);
-                p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
-                p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
+                // 3 lớp NỀN→VIỀN→CHỮ. CHU ve qua drawFreeTextOverlay CHUNG voi
+                // ContinuousView — cung pixelSize=fontSize*zoom, cung le, cung
+                // wrap, khong bao gio cat cuth. Lech la chu nhay khi doi che do.
+                p.save();
+                if (av.hasFill && av.fill.isValid() && av.fill.alpha() > 0)
+                    p.fillRect(dRect, av.fill);
+                if (av.border > 0.0f) {
+                    p.setPen(QPen(av.stroke.isValid() ? av.stroke : QColor(Qt::black),
+                                  qMax(1.0, av.border * m_zoom)));
+                    p.setBrush(Qt::NoBrush);
+                    p.drawRect(dRect);
+                }
+                p.restore();
+                drawFreeTextOverlay(p, dRect, av.text, av.fontSize, m_zoom, av.stroke);
                 break;
             }
             case FPDF_ANNOT_STAMP: {

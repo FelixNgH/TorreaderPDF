@@ -20,18 +20,35 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QUuid>
+#include <QRawFont>
+#include <QPainter>
+#include <QFontDatabase>
+// 🔴 0902: QPainter/QFontDatabase keo windows.h vao => macro min/max cua Windows
+// nuot std::min/std::max ben duoi (error C2589 'illegal token on right side of ::').
+// Go macro ngay sau include — KHONG XOA.
+#ifdef _WIN32
+#  undef min
+#  undef max
+#endif
 
-// ── PDF escape helper (shared by both AP generators) ───────────────────────
-static QByteArray pdfEscape(const QString& text) {
-    QByteArray out;
-    for (const QChar& ch : text) {
-        if (ch == '\\') out.append("\\\\");
-        else if (ch == '(') out.append("\\(");
-        else if (ch == ')') out.append("\\)");
-        else if (ch.unicode() < 32 || ch.unicode() > 126) out.append('?');
-        else out.append(ch.toLatin1());
+// Unicode -> ma glyph Identity-H (4 hex hoa/glyph) bang QRawFont doc dung tep TTF
+// ma unicodeFont() nap — chi so glyph khớp với phông nhúng trong PDF.
+// Tra ve rong khi khong map duoc (rong/toan 0) — caller KHONG duoc ghi bừa.
+static QString glyphHexIdentityH(const QByteArray& ttfData, const QString& text) {
+    if (text.isEmpty()) return QString();
+    QRawFont rf(ttfData, 16.0);
+    if (!rf.isValid()) return QString();
+    const QList<quint32> gids = rf.glyphIndexesForString(text);
+    if (gids.isEmpty()) return QString();
+    QString hex;
+    bool any = false;
+    for (quint32 g : gids) {
+        if (g > 0xFFFF) g = 0;
+        if (g) any = true;
+        hex += QString("%1").arg(g, 4, 16, QChar('0')).toUpper();
     }
-    return out;
+    if (!any) return QString();
+    return hex;
 }
 
 extern QMutex s_pdfiumMutex;
@@ -224,6 +241,115 @@ static bool parseDA(const QString& da, QColor& outColor, float& outSize) {
     return gotSize || gotColor;
 }
 
+// ── FreeText: font + o + ve dung CHUNG cho hai view ─────────────────────────
+QFont trDejaVuFontAtPixelSize(double px) {
+    static QString family;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        int id = QFontDatabase::addApplicationFont(":/fonts/DejaVuSans.ttf");
+        if (id >= 0) {
+            QStringList fams = QFontDatabase::applicationFontFamilies(id);
+            if (!fams.isEmpty()) family = fams.first();
+        }
+    }
+    QFont f(family.isEmpty() ? QStringLiteral("DejaVu Sans") : family);
+    // 0903: setPixelSize lam TRON ve so nguyen — o co nho sai lech dang ke.
+    // QFont ho tro co le: dung setPixelSize cho tri lon, con lai de painter lo.
+    f.setPixelSize(qMax(1, qRound(px)));
+    f.setHintingPreference(QFont::PreferNoHinting);  // khong ep net vao luoi pixel
+    return f;
+}
+
+// Nong o hien thi (Y-down, pt) cho DU CHO chu o fontSizePt: chieu ngang theo
+// advance THAT (QFontMetricsF, cung font voi /AP), chieu cao theo so dong wrap
+// trong chieu ngang do — khong dung he so co dinh (length*5.5, h=18) nua.
+QRectF trFreeTextFitRect(const QRectF& dispRect, const QString& text, float fontSizePt) {
+    if (text.isEmpty() || fontSizePt <= 0.0f) return dispRect;
+    const double pad = 2.0;                       // le pt moi ben (khop pad overlay)
+    QFont f = trDejaVuFontAtPixelSize(fontSizePt); // zoom=1 => 1pt=1px
+    QFontMetricsF fm(f);
+    double adv = fm.horizontalAdvance(text);
+    double w = qMax(dispRect.width(),  adv + 2.0 * pad);
+    double h = qMax(dispRect.height(), fm.boundingRect(QRectF(0, 0, w, 1e6),
+                        Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, text).height()
+                        + 2.0 * pad);
+    return QRectF(dispRect.topLeft(), QSizeF(w, h));
+}
+
+// Ve chu FreeText trong dRect (px). KHUNG quyet cho xuong dong (Qt::TextWordWrap
+// bo theo chieu ngang inner). CO CHU LUON = fontSizePt*zoom — KHONG bao gio tu
+// thu nho. Noi dung cao hon khung => ve TRAN xuong duoi (view khong setClipRect)
+// de user thay con chu va tu keo khung cao them. pixelSize giong ghost preview.
+void drawFreeTextOverlay(QPainter& p, const QRectF& dRect, const QString& text,
+                         float fontSizePt, double zoom, const QColor& penColor) {
+    if (text.isEmpty()) return;
+    const double pad = qMax(1.0, 2.0 * zoom);
+    const QRectF inner = dRect.adjusted(pad, pad, -pad, -pad);
+    const double availW = inner.width();
+    if (availW < 1.0) return;
+
+    const int flags = Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap;
+    const double ps = qMax(1.0, static_cast<double>(fontSizePt) * zoom);
+    QFont f = trDejaVuFontAtPixelSize(ps);
+    QFontMetricsF fm(f);
+    // Chieu cao anh = max(chieu cao khung, chieu cao chu tu nhien tai availW) =>
+    // chu tran khung van hien. Tran 50k px de tranh phat anh khong lo tu text ben.
+    const double textH = fm.boundingRect(QRectF(0, 0, availW, 1e6), flags, text).height();
+    const double imgH = (std::min)(qMax(inner.height(), textH), 50000.0);
+    {   // 0903 CHAN DOAN — in ra dung thu ham nay dang dung
+        static QString _last;
+        const QString cur = QString("fam=%1 ps=%2 zoom=%3 rect=%4x%5 txt=%6")
+            .arg(f.family()).arg(ps,0,'f',1).arg(zoom,0,'f',3)
+            .arg(dRect.width(),0,'f',1).arg(dRect.height(),0,'f',1).arg(text.left(20));
+        if (cur != _last) { _last = cur; qDebug().noquote() << "[fttext]" << cur; }
+    }
+    // 🔴 0903 textimg: KHONG BAO GIO p.drawText len painter cua view nua. Atlas
+    // glyph GL bi lop vector GL tao/xoa texture cap lai ID => chu < ~64px mau
+    // tu ban ve (soc cheo net CAD). Ve chu len QImage (rasterizer CPU, khong
+    // dung atlas) roi dan anh = quad texture thuong (giong Stamp — da chung minh
+    // chay dung). Hai view cung goi ham nay => ket qua giong het.
+    const QColor col = penColor.isValid() ? penColor : QColor(Qt::black);
+    const double dpr = p.device() ? p.device()->devicePixelRatioF() : 1.0;
+    // Khoa cache: text + ps + mau + BE RONG khung (availW — quyet cach wrap) +
+    // chieu cao anh (imgH) + dpr. Doi be rong khung => doi wrap => doi khoa =>
+    // dung anh moi. Tran 64, LRU. Chi GUI thread (paintEvent 2 view) => khong mutex.
+    const QString key = text + QChar(1) + QString::number(ps, 'g', 17) + QChar(1)
+                      + QString::number(static_cast<quint64>(col.rgba()), 16) + QChar(1)
+                      + QString::number(availW, 'g', 17) + QChar(1)
+                      + QString::number(imgH, 'g', 17) + QChar(1)
+                      + QString::number(dpr, 'g', 17);
+    static QHash<QString, QImage> s_textCache;
+    static QStringList s_textLru;
+    if (!s_textCache.contains(key)) {
+        const int w = qMax(1, static_cast<int>(std::ceil(availW * dpr)));
+        const int h = qMax(1, static_cast<int>(std::ceil(imgH * dpr)));
+        QImage img(w, h, QImage::Format_ARGB32_Premultiplied);
+        img.fill(Qt::transparent);
+        img.setDevicePixelRatio(dpr);   // painter tren anh tu quy chieu px logic
+        {
+            QPainter ip(&img);
+            // Gir nguyen khu rang cưa + font + wrap nhu phien ban drawText cu.
+            ip.setRenderHint(QPainter::Antialiasing, true);
+            ip.setRenderHint(QPainter::TextAntialiasing, true);
+            ip.setFont(f);
+            ip.setPen(col);
+            ip.drawText(QRectF(0.0, 0.0, availW, imgH), flags, text);
+        }
+        s_textCache.insert(key, img);
+        s_textLru.append(key);
+        while (s_textLru.size() > 64) s_textCache.remove(s_textLru.takeFirst());
+    } else {
+        s_textLru.removeAll(key);
+        s_textLru.append(key);
+    }
+    p.save();
+    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    // setDevicePixelRatio tren anh => drawImage dan dung kich thuoc px logic.
+    p.drawImage(inner.topLeft(), s_textCache.value(key));
+    p.restore();
+}
+
 // ── AnnotationManager ─────────────────────────────────────────────────────────
 
 AnnotationManager::AnnotationManager(QObject* parent) : QObject(parent) {
@@ -312,6 +438,41 @@ void AnnotationManager::releaseSharedPage() {
 
 void AnnotationManager::releaseSharedPage_locked() {
     if (m_doc) PageCache::forgetDocument(m_doc);
+}
+
+// ── LÁT C 0902: delta cho duong CẬP NHẬT CÓ CHỌN LỌC ─────────────────────────
+// Xem ly do + hop dong idempotent o AnnotationManager.h (struct VisualDelta).
+
+void AnnotationManager::recordCreatedVisual_locked(FPDF_PAGE page, int pageIndex) {
+    const int n = FPDFPage_GetAnnotCount(page);
+    if (n <= 0) return;
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, n - 1);   // annot VUA TAO nam cuoi
+    if (!a) return;
+    AnnotVisual av;
+    const bool ok = buildVisual(page, a, pageIndex, av);
+    FPDFPage_CloseAnnot(a);
+    if (!ok || av.uid.isEmpty()) return;   // khong dinh vi duoc bang uid → mac duong nap lai
+    QMutexLocker dl(&m_deltaMutex);
+    m_visualDeltas[pageIndex].append({av, false});
+}
+
+QString AnnotationManager::annotUid_locked(FPDF_PAGE page, int index) {
+    FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, index);
+    if (!a) return {};
+    const QString uid = readAnnotString(a, "TRUID");
+    FPDFPage_CloseAnnot(a);
+    return uid;
+}
+
+void AnnotationManager::recordVisualDelta(int page, const AnnotVisual& av) {
+    if (av.uid.isEmpty()) return;
+    QMutexLocker dl(&m_deltaMutex);
+    m_visualDeltas[page].append({av, false});
+}
+
+QList<VisualDelta> AnnotationManager::visualDeltas(int page) const {
+    QMutexLocker dl(&m_deltaMutex);
+    return m_visualDeltas.value(page);
 }
 
 void AnnotationManager::flushGenerate_locked(int pageIndex) {
@@ -604,22 +765,30 @@ bool AnnotationManager::buildVisual(FPDF_PAGE page, FPDF_ANNOTATION annot, int p
         if (out.image.isNull()) return false;
     }
 
-    // 🔴🔴 2026-09-01, sua LAI: CA FreeText LAN Note deu de PDFium ve.
-    // Truoc do tôi cho overlay ve huy hieu "N" cho Note vi tuong PDFium khong ve icon.
-    // SAI: PDFium CO ve (icon vang, dung /AP). Hau qua: huy hieu CAM cua ta de len icon vang
-    // that ⇒ owner thay "mau cam, be net, zoom vao nhay nhay ra icon vang dung".
-    // ⭐ Single KHONG he co `case FPDF_ANNOT_TEXT` — no khong tu ve gi ca, va no dep nhat.
-    //   ⇒ Da co ban dung thi dung di lam ban gan dung. Ly do that khien Note "khong hien" la
-    //     anh trang khong duoc ve lai sau khi tao — da sua rieng o pageContentChanged.
-    if (sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_TEXT)
+    // 🔴 2026-09-02 (FTREAL): FreeText CUA TA khong con co HIDDEN → la annot THAT,
+    // overlay ve (paintByOverlay=true), nen raster an no qua OwnAnnotHideGuard.
+    // FreeText NGOAI (khong TRUID) gi NGUYEN han vi cu: nen raster/lop bu lo.
+    // FreeText CO TRUID + co co HIDDEN = tep CU (vat the TRNote trong noi dung
+    // trang da ve no o nen) → phai giu paintByOverlay=false, neu khong VE TRUNG.
+    // Note (FPDF_ANNOT_TEXT) khong dong trong luot nay.
+    if (sub == FPDF_ANNOT_TEXT)
         out.paintByOverlay = false;
+    else if (sub == FPDF_ANNOT_FREETEXT)
+        out.paintByOverlay = FPDFAnnot_HasKey(annot, "TRUID") != 0 &&
+                             !(FPDFAnnot_GetFlags(annot) & FPDF_ANNOT_FLAG_HIDDEN);
 
     // AutoCAD sinh /Square annot VO HINH (SHX text): /Border=[0,0,0], khong /C,
     // /IC, /AP. Theo chuan khong duoc ve gi len trang (Adobe cung khong ve).
     // Bo qua overlay de khoi bi QPen ep thanh vien 1px do. Phai du CA BON dieu,
     // thieu mot lai co the giau nham annot that. Annot tu app luon co /C (duoc
     // FPDFAnnot_SetColor khi tao) nen khong bao gio dinh luat nay.
-    if (!out.hasAP && !out.hasColor && !out.hasFill && out.border == 0.0f)
+    // 🔴 0902: chot nay viet cho annot /Square VO HINH cua AutoCAD, nhung no ap cho
+    // MOI subtype — ke ca FreeText. FreeText CO CHU la CO NOI DUNG NHIN THAY DUOC,
+    // khong can /C, /IC hay vien. Ap chot nay cho no = tat overlay => chu bien mat.
+    // Do duoc 02/09: FreeText moi (chua co /AP vi SetAP that bai, /Border [0,0,0])
+    // dinh du CA BON dieu kien => paintByOverlay bi tat => khong ai ve chu.
+    if (!out.hasAP && !out.hasColor && !out.hasFill && out.border == 0.0f
+        && !(sub == FPDF_ANNOT_FREETEXT && !out.text.isEmpty()))
         out.paintByOverlay = false;
 
     return true;
@@ -659,13 +828,11 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
         int sub = FPDFAnnot_GetSubtype(annot);
         // TAP drawable duoc dinh nghia O MOT CHO duy nhat: isOverlayDrawnAnnot()
         // (OwnAnnotHideGuard.h) — KHONG dinh nghia lai o day (SPEC_OVERLAY_LAYER 31/08).
-        // FreeText/Text bi LOAI khoi tap drawable: buildVisual() dat paintByOverlay=false
-        // cho dung 2 loai nay (dong ~419) => overlay THUC SU khong ve chung. De chung
-        // trong tap drawable lam trang toan FreeText van bi danh overlayCapable=1 =>
-        // canFastPath giu lop vector (khong chua annot) => markup tàng hình
-        // (hoi quy dot 19/08, do 2026-08-30: 37 FreeText deu /AP, drawn=4).
-        // ⚠️ Neu sau nay overlay ve duoc FreeText/Text, phai sua CA HAI cho:
-        //    isOverlayDrawnAnnot() VA `paintByOverlay` trong buildVisual() (dong ~419).
+        // 🔴 2026-09-02 (FTREAL): FreeText CUA TA (TRUID, khong HIDDEN) DA THUOC TAP
+        // drawable — buildVisual() cho paintByOverlay=true. Tep CU (FreeText HIDDEN +
+        // vat the TRNote) van ngoai tap, nen khong bi an o nen cung khong bi overlay ve.
+        // ⚠️ Neu sau nay doi tap nay, phai sua CA HAI cho: isOverlayDrawnAnnot() VA
+        //    `paintByOverlay` trong buildVisual().
         //
         // 🔴 capable co nghia: "overlay ve duoc MỌI markup CỦA TA (co TRUID) tren trang".
         //    Annot NGOAI (KHONG TRUID) KHONG duoc hạ capable — no nam trong anh nen, ve
@@ -711,6 +878,11 @@ QList<AnnotVisual> AnnotationManager::loadPageVisuals(int page, bool* outOverlay
         *hasForeign = (foreignCount > 0);
     }
 
+    // 🔴 LÁT C 0902: anh cat nay DA bao tram moi thay doi ghi truoc luc no lay khoa
+    // (ca hai deu nam trong s_pdfiumMutex) → delta cu khong con nghia, don bo.
+    // Moi thay doi SAU nay se vao hang delta khi luong tao/xoa lay duoc khoa.
+    { QMutexLocker dl(&m_deltaMutex); m_visualDeltas.remove(page); }
+
     lock.unlock();
 
     qint64 ms = _perf.elapsed();
@@ -741,7 +913,7 @@ bool AnnotationManager::createPopupNote(int pageIndex, QPointF pointDisp,
         qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
         // Trang da bi sua: bo entry cu (cac he khac khong dung handle cu) roi nap lai cho am.
         PageCache::bumpAnnotGeneration(m_doc, pageIndex);
-        
+        recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902: delta, µs trong khoa DA giu
     }
     lock.unlock();
     if (ok) {
@@ -779,7 +951,7 @@ bool AnnotationManager::createInlineNote(int pageIndex, QRectF rectPdf,
     int finalAnnotCount = FPDFPage_GetAnnotCount(page);
     if (ok) {
         PageCache::bumpAnnotGeneration(m_doc, pageIndex);
-        
+        recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902
     }
     lock.unlock();
     if (ok) {
@@ -862,6 +1034,7 @@ bool AnnotationManager::rebuildTextNote(int pageIndex, int index, QColor newColo
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
     PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+    recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902: uid giu nguyen → thay trong cache
 
     lock.unlock();
     bumpPageRevision(pageIndex);
@@ -1059,6 +1232,7 @@ QString AnnotationManager::insertStampImage(int pageIndex, const QImage& image,
     m_lastCreatedSnapshot = snapshotAnnot_locked(page, pageIndex, m_lastCreatedIndex);
 
     PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+    recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902: Stamp co anh trong visual → overlay ve ngay
 
     lock.unlock();
     bumpPageRevision(pageIndex);
@@ -1212,6 +1386,7 @@ bool AnnotationManager::retextNote(int pageIndex, int index, const QString& newT
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     invalidateNoteObjCache_locked(pageIndex);
     PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+    recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902: uid giu nguyen → thay trong cache
 
     lock.unlock();
     bumpPageRevision(pageIndex);
@@ -1226,8 +1401,16 @@ bool AnnotationManager::removeAnnot(int pageIndex, int index) {
     FPDF_PAGE page = PageCache::acquire(m_doc, pageIndex);
     if (!page) return false;
     PageCache::PageBorrow _b(m_doc, pageIndex);   // R1: cap doi acquire()
+    // LÁT C 0902: doc uid TRUOC khi xoá (xoá xong la het doc duoc). Annot NGOAI
+    // (khong TRUID) khong co delta → rev lech → MainWindow nap lai ca trang nhu cu.
+    const QString uidBefore = annotUid_locked(page, index);
     bool needsGen = false;
     bool ok = removeAnnot_locked(page, index, &needsGen);
+    if (ok && !uidBefore.isEmpty()) {
+        AnnotVisual av; av.uid = uidBefore;
+        QMutexLocker dl(&m_deltaMutex);
+        m_visualDeltas[pageIndex].append({av, true});
+    }
     if (ok && needsGen) {
         setOwnNoteObjectsActive(page, true);
         QElapsedTimer _gt; _gt.start();
@@ -1398,7 +1581,7 @@ bool AnnotationManager::addSnapshot(int pageIndex, const AnnotSnapshot& s) {
     bool ok = (annot != nullptr);
     if (ok) {
         PageCache::bumpAnnotGeneration(m_doc, pageIndex);
-        
+        recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902: undo/redo hien lai ngay
     }
     if (ok) bumpPageRevision(pageIndex);
     return ok;
@@ -1682,6 +1865,7 @@ bool AnnotationManager::createSignatureDraft(int pageIndex, QRectF rectPt, const
     FPDFPage_GenerateContent(page);
     qDebug().noquote() << "[perf] genContent page=" << pageIndex << "ms=" << _gt.elapsed();
     PageCache::bumpAnnotGeneration(m_doc, pageIndex);
+    recordCreatedVisual_locked(page, pageIndex);   // LÁT C 0902
 
     lock.unlock();
 
@@ -1876,6 +2060,12 @@ bool AnnotationManager::createInlineNote_locked(FPDF_PAGE page, int pageIndex, Q
     const QString text = textIn.normalized(QString::NormalizationForm_C);
     if (!m_doc) return false;
 
+    // 🔴 FT-SIZE 0902: o PHAI DU CHU. Nong theo advance/chieu cao THAT cua chu o
+    // fontSize (QFontMetricsF, cung font voi /AP va overlay) — thay cho chieu cao
+    // co dinh 18pt cua goi. Day la goc cua "chu bi cat cuth": o 18pt khong chua
+    // du chu 24pt => overlay clip chi con man net.
+    rectPdf = trFreeTextFitRect(rectPdf, text, fontSize);
+
     double pageH = FPDF_GetPageHeight(page);
     double pageW = FPDF_GetPageWidth(page);
     int rot = FPDFPage_GetRotation(page);
@@ -1897,139 +2087,111 @@ bool AnnotationManager::createInlineNote_locked(FPDF_PAGE page, int pageIndex, Q
     qDebug() << "[inote] rectU x[" << xu_min << "," << xu_max << "] y[" << yu_min << "," << yu_max << "] w=" << w << "h=" << h;
 
     FPDF_FONT font = unicodeFont();
-    if (!font) font = FPDFText_LoadStandardFont(m_doc, "Helvetica");
     qDebug() << "[inote] font loaded=" << (font != nullptr);
     unsigned int noteId = m_nextNoteId++;
 
+    // ── FreeText THAT (2026-09-02): khong con chen vat the TRNote, khong con co
+    // HIDDEN. Annot tu ve qua /AP (PDFium) — giong Line/Rect/Circle/Ink/Stamp.
+    // ── Moc neo dang ky phông: PDFium chi dua phông vao /Resources/Font cua TRANG
+    // khi GenerateContent thay page object dung den no. Mot text object chua duy
+    // nui dau cach, KHONG gan mark TRNote, o goc (0,0) → khong ve ra pixel thay
+    // duoc, nhung dang ky du /FXF1 (ten PDFium dat cho phông doc-level nay) vao
+    // tai nguyen trang — noi /AP ke thua (da chung minh: AP khong can /Resources
+    // rieng). Khong co moc neo → /FXF1 trong /AP tro vao khong khi.
     if (font) {
-        FPDF_PAGEOBJECT to = FPDFPageObj_CreateTextObj(m_doc, font, fontSize);
-        qDebug() << "[inote] textObj created=" << (to != nullptr);
-        if (to) {
-            FPDFText_SetText(to, reinterpret_cast<FPDF_WIDESTRING>(text.utf16()));
-            double a, b, c, d;
-            float tx, ty;
-            switch (rot) {
-                case 1:
-                    a = 0.0; b = 1.0; c = -1.0; d = 0.0;
-                    tx = xu_min + fontSize + 2.0f; ty = yu_min + 4.0f;
-                    break;
-                case 2:
-                    a = -1.0; b = 0.0; c = 0.0; d = -1.0;
-                    tx = xu_max - 4.0f; ty = yu_max - 2.0f;
-                    break;
-                case 3:
-                    a = 0.0; b = -1.0; c = 1.0; d = 0.0;
-                    tx = xu_max - fontSize - 2.0f; ty = yu_max - 4.0f;
-                    break;
-                default:
-                    a = 1.0; b = 0.0; c = 0.0; d = 1.0;
-                    tx = xu_min + 4.0f; ty = yu_min + 2.0f;
-                    break;
-            }
-            FPDFPageObj_Transform(to, a, b, c, d,
-                                  static_cast<double>(tx),
-                                  static_cast<double>(ty));
-            qDebug() << "[inote] transform a=" << a << "b=" << b << "c=" << c << "d=" << d << "tx=" << tx << "ty=" << ty;
-            unsigned int tr = textColor.red();
-            unsigned int tg = textColor.green();
-            unsigned int tb = textColor.blue();
-            FPDFPageObj_SetFillColor(to, tr, tg, tb, 255);
-            FPDF_PAGEOBJECTMARK mk = FPDFPageObj_AddMark(to, "TRNote");
-            if (mk)
-                FPDFPageObjMark_SetIntParam(m_doc, to, mk, "id", static_cast<int>(noteId));
-            FPDFPage_InsertObject(page, to);
-            qDebug() << "[inote] text page object inserted";
-        }
-
-        if (withBackground) {
-            FPDF_PAGEOBJECT bg = FPDFPageObj_CreateNewRect(xu_min, yu_min, w, h);
-            if (bg) {
-                FPDFPageObj_SetFillColor(bg, 255, 255, 150, 200);
-                FPDF_PAGEOBJECTMARK bgMk = FPDFPageObj_AddMark(bg, "TRNote");
-                if (bgMk)
-                    FPDFPageObjMark_SetIntParam(m_doc, bg, bgMk, "id", static_cast<int>(noteId));
-                FPDFPage_InsertObject(page, bg);
-            }
+        FPDF_PAGEOBJECT anchor = FPDFPageObj_CreateTextObj(m_doc, font, fontSize);
+        if (anchor) {
+            static const FPDF_WCHAR s_space[2] = { ' ', 0 };
+            FPDFText_SetText(anchor, const_cast<FPDF_WCHAR*>(s_space));
+            FPDFPageObj_Transform(anchor, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+            FPDFPage_InsertObject(page, anchor);
         }
     }
 
-    {
-        FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT);
-        if (!annot) { m_lastError = "Cannot create annotation"; return false; }
+    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT);
+    if (!annot) { m_lastError = "Cannot create annotation"; return false; }
 
-        FS_RECTF rect{ xu_min, yu_min, xu_max, yu_max };
-        FPDFAnnot_SetRect(annot, &rect);
-        qDebug() << "[inote] annot created rect=" << rect.left << rect.bottom << rect.right << rect.top;
+    FS_RECTF rect{ xu_min, yu_min, xu_max, yu_max };
+    FPDFAnnot_SetRect(annot, &rect);
+    qDebug() << "[inote] real FreeText rect=" << rect.left << rect.bottom << rect.right << rect.top;
 
-        QString daQ = QString("/Helv %1 Tf %2 %3 %4 rg")
-            .arg(fontSize, 0, 'f', 1)
-            .arg(textColor.redF(),   0, 'f', 3)
-            .arg(textColor.greenF(), 0, 'f', 3)
-            .arg(textColor.blueF(),  0, 'f', 3);
-        FPDFAnnot_SetStringValue(annot, "DA",
-            reinterpret_cast<FPDF_WIDESTRING>(daQ.utf16()));
-        FPDFAnnot_SetStringValue(annot, "Contents",
-            reinterpret_cast<FPDF_WIDESTRING>(text.utf16()));
-        if (!author.isEmpty())
-            FPDFAnnot_SetStringValue(annot, "T",
-                reinterpret_cast<FPDF_WIDESTRING>(author.utf16()));
-        if (withBackground)
-            FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 255, 255, 150, 200);
-        else
-            FPDFAnnot_SetBorder(annot, 0.0f, 0.0f, 0.0f);
+    QString daQ = QString("/Helv %1 Tf %2 %3 %4 rg")
+        .arg(fontSize, 0, 'f', 1)
+        .arg(textColor.redF(),   0, 'f', 3)
+        .arg(textColor.greenF(), 0, 'f', 3)
+        .arg(textColor.blueF(),  0, 'f', 3);
+    FPDFAnnot_SetStringValue(annot, "DA",
+        reinterpret_cast<FPDF_WIDESTRING>(daQ.utf16()));
+    FPDFAnnot_SetStringValue(annot, "Contents",
+        reinterpret_cast<FPDF_WIDESTRING>(text.utf16()));
+    if (!author.isEmpty())
+        FPDFAnnot_SetStringValue(annot, "T",
+            reinterpret_cast<FPDF_WIDESTRING>(author.utf16()));
+    if (withBackground)
+        FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, 255, 255, 150, 200);
+    else
+        FPDFAnnot_SetBorder(annot, 0.0f, 0.0f, 0.0f);
 
-        QString trid = QString::number(noteId);
-        FPDFAnnot_SetStringValue(annot, "TRID",
-            reinterpret_cast<FPDF_WIDESTRING>(trid.utf16()));
-        m_lastCreatedUid = generateUid();
-        FPDFAnnot_SetStringValue(annot, "TRUID",
-            reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
+    QString trid = QString::number(noteId);
+    FPDFAnnot_SetStringValue(annot, "TRID",
+        reinterpret_cast<FPDF_WIDESTRING>(trid.utf16()));
+    m_lastCreatedUid = generateUid();
+    FPDFAnnot_SetStringValue(annot, "TRUID",
+        reinterpret_cast<FPDF_WIDESTRING>(m_lastCreatedUid.utf16()));
 
-        FPDFAnnot_SetFlags(annot, FPDFAnnot_GetFlags(annot) | FPDF_ANNOT_FLAG_HIDDEN);
-        FPDFPage_CloseAnnot(annot);
-
-        int nAnnots = FPDFPage_GetAnnotCount(page);
-        if (nAnnots > 0) {
-            FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(page, nAnnots - 1);
-            if (a2) {
-                float usable_w = w, usable_h = h;
-                if (rot == 1 || rot == 3) { usable_w = h; usable_h = w; }
-                float fs = fontSize;
-                float textEst = text.length() * fs * 0.6f;
-                if (textEst > usable_w - 8.0f) {
-                    int textLen = text.length() < 1 ? 1 : static_cast<int>(text.length());
-                    fs = (usable_w - 8.0f) / (textLen * 0.6f);
-                    if (fs < 6.0f) fs = 6.0f;
-                }
-                QByteArray ap;
-                ap.append("q\n");
-                if (rot == 1)
-                    ap.append(QString("0 -1 1 0 0 %1 cm\n").arg(h, 0, 'f', 2).toUtf8());
-                else if (rot == 2)
-                    ap.append(QString("-1 0 0 -1 %1 %2 cm\n").arg(w, 0, 'f', 2).arg(h, 0, 'f', 2).toUtf8());
-                else if (rot == 3)
-                    ap.append(QString("0 1 -1 0 %1 0 cm\n").arg(w, 0, 'f', 2).toUtf8());
-                ap.append("BT\n");
-                ap.append("/Helv " + QByteArray::number(fs, 'f', 1) + " Tf\n");
-                ap.append(QByteArray::number(textColor.redF(), 'f', 3) + " ");
-                ap.append(QByteArray::number(textColor.greenF(), 'f', 3) + " ");
-                ap.append(QByteArray::number(textColor.blueF(), 'f', 3) + " rg\n");
-                ap.append(QByteArray::number(4.0f, 'f', 1) + " ");
-                ap.append(QByteArray::number(fs + 2.0f, 'f', 1) + " Td\n");
-                ap.append("(" + pdfEscape(text) + ") Tj\n");
-                ap.append("ET\n");
-                ap.append("Q");
-
-                QString apStr = QString::fromUtf8(ap);
-                qDebug() << "[inote] apContent=" << ap.left(300);
-                bool setOk = FPDFAnnot_SetAP(a2, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
-                    reinterpret_cast<FPDF_WIDESTRING>(apStr.utf16()));
-                unsigned long apLenAfter = FPDFAnnot_GetAP(a2, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr, 0);
-                qDebug() << "[inote] SetAP returned=" << (setOk ? "true" : "false") << "apLenAfter=" << apLenAfter;
-                FPDFPage_CloseAnnot(a2);
-            }
-        }
+    // ── /AP tu viet, phong /FXF1 Identity-H (tieng Việt chuan, da chung minh) ──
+    float usable_w = w, usable_h = h;
+    if (rot == 1 || rot == 3) { usable_w = h; usable_h = w; }
+    // 🔴 FT-SIZE 0902: do bang advance THAT (cung font voi o va overlay), khong
+    // dung uoc so length*0.6 nua. Uoc so ay LUON lon hon advance that (~0.55) nen
+    // no thu fs xuong 8.8 trong khi /DA ghi 24 => MOI DANG MAU THUAN. O da duoc
+    // nong vua chu nen day khong con trigger; /DA == /AP == fontSize.
+    float fs = fontSize;
+    const QFont apFont = trDejaVuFontAtPixelSize(fontSize);
+    const float realAdv = static_cast<float>(QFontMetricsF(apFont).horizontalAdvance(text));
+    if (realAdv > usable_w - 8.0f) {
+        fs = fontSize * (usable_w - 8.0f) / (realAdv > 0.0f ? realAdv : 1.0f);
+        if (fs < 6.0f) fs = 6.0f;
     }
+    const QString hex = glyphHexIdentityH(m_unicodeFontData, text);
+    if (hex.isEmpty() && !text.isEmpty())
+        qWarning() << "[inote] GLYPH MAP FAILED — /AP khong co chu (Contents van du):" << text;
+
+    QByteArray ap;
+    ap.append("q\n");
+    if (rot == 1)
+        ap.append(QString("0 -1 1 0 0 %1 cm\n").arg(h, 0, 'f', 2).toUtf8());
+    else if (rot == 2)
+        ap.append(QString("-1 0 0 -1 %1 %2 cm\n").arg(w, 0, 'f', 2).arg(h, 0, 'f', 2).toUtf8());
+    else if (rot == 3)
+        ap.append(QString("0 1 -1 0 %1 0 cm\n").arg(w, 0, 'f', 2).toUtf8());
+    if (withBackground) {
+        ap.append("1 1 0.588 rg\n");
+        ap.append(QString("0 0 %1 %2 re f\n").arg(w, 0, 'f', 2).arg(h, 0, 'f', 2).toUtf8());
+    }
+    ap.append("Q\n");
+    ap.append(QString("q %1 %2 %3 RG 1 w 0.5 0.5 %4 %5 re S Q\n")
+              .arg(textColor.redF(),   0, 'f', 3)
+              .arg(textColor.greenF(), 0, 'f', 3)
+              .arg(textColor.blueF(),  0, 'f', 3)
+              .arg((double)w - 1.0, 0, 'f', 2)
+              .arg((double)h - 1.0, 0, 'f', 2).toUtf8());
+    if (!hex.isEmpty()) {
+        ap.append(QString("BT /FXF1 %1 Tf %2 %3 %4 rg 4 %5 Td <%6> Tj ET\n")
+                  .arg(fs, 0, 'f', 1)
+                  .arg(textColor.redF(),   0, 'f', 3)
+                  .arg(textColor.greenF(), 0, 'f', 3)
+                  .arg(textColor.blueF(),  0, 'f', 3)
+                  .arg(fs + 2.0, 0, 'f', 1)
+                  .arg(hex).toUtf8());
+    }
+    qDebug() << "[inote] apContent=" << ap.left(300);
+    QString apStr = QString::fromUtf8(ap);
+    bool setOk = FPDFAnnot_SetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+        reinterpret_cast<FPDF_WIDESTRING>(apStr.utf16()));
+    unsigned long apLenAfter = FPDFAnnot_GetAP(annot, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr, 0);
+    qDebug() << "[inote] SetAP returned=" << (setOk ? "true" : "false") << "apLenAfter=" << apLenAfter;
+    FPDFPage_CloseAnnot(annot);
 
     if (outInfo) {
         outInfo->pageIndex = pageIndex;

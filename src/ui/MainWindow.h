@@ -90,7 +90,12 @@ struct DocTab {
     // mo/mo lai, toi 4 cho build dung lai (KHONG bam lai file lon tren luong giao dien).
     QString  pdfPath;             // file dang duoc render cho lop vector
     uint64_t pdfHash = 0;         // hash cua pdfPath (da tinh san o luc mo)
-    std::shared_ptr<VectorLayer> vecLayer;  // GPU vector overlay for heavy pages
+    // LÁT B 09/02: KHO LỚP VECTOR DUY NHẤT theo tài liệu (khuôn Lát A). Trước đây
+    // DocTab::vecLayer (một trang) + ContinuousView::m_vecLayers (ba trang) là HAI bản
+    // chép lệch nhau -> trang quái vật Continuous nạp được cache nhưng Single thấy NULL.
+    // Nay MỘT kho hash, cả hai view đọc qua con trỏ; eviction của Continuous đánh thẳng
+    // vào đây. Key = pageIndex, value = layer trang đó (null = chưa có).
+    QHash<int, std::shared_ptr<VectorLayer>> vecLayers;  // GPU vector overlay, theo trang
     std::shared_ptr<ForeignAnnotLayer> fgnLayer;   // lop annot phan mem khac cho trang vector thuan
     QSet<int> fgnBuilding;                          // trang dang dung, tranh dung chong
     // Trang da HOAN lop bu 1 lan vi chua co noi dung de ve (chot C3 2026-08-30).
@@ -114,6 +119,40 @@ struct DocTab {
     // Lop vector dung tu page object, khong chua annotation, nen nhung trang nay BAT BUOC
     // phai lay raster (co FPDF_ANNOT) lam nen, neu khong markup se VO HINH.
     QSet<int> forceRasterPages;
+    // ── LÁT C 09/02: tach so phien "nen vector" khoi "lop bu toan trang" ─────────
+    // Trang NANG (objCount > tran 400000) truoc day bi forceRasterPage vat bo nen
+    // vector chi vi khong dung duoc lop bu toan trang (87,8 giay/trang, giu khoa
+    // 14s+). Tran do VAN CHAN lop bu; nen vector giu lai, chu thich do PDFium ve
+    // theo VUNG NHIN: o VUONG TUNG annot, clip dung o (cong thuc --annotroi-bench,
+    // do 18,6 ms/o tren trang 2,54M object), gao nen trang, chong trong suot len
+    // nen vector. KHONG dung buildRegion (render ca vung nhin: CAD chen duc day,
+    // do 4s+7s giu khoa) va KHONG BAO GIO goi ForeignAnnotLayer::build.
+    // SU KIEN 0902 (thay polling 1s gay vang app tren may owner): chi dung khi
+    // su kien goi updateHeavyRegion — UpdateRequest (pan/repaint), zoomChanged,
+    // doi trang, invalidateAnnotPage.
+    QSet<int> heavyRegionPages;
+    std::shared_ptr<QAtomicInt> heavyRegionCancel;  // don tap van region khi dong tai lieu
+    bool heavyRegionBuilding = false;
+    QFuture<bool> heavyRegionFuture;
+    int   heavyRegionPage  = -1;    // trang cua anh region da dung gan nhat
+    double heavyRegionScale = 0.0;  // zoom luc dung
+    QRect  heavyRegionPx;           // vung da dung (px cua trang tai heavyRegionScale)
+    // LAT G 09/02 — handle RIENG cho renderAnnotRegion: NAP MOT LAN roi DUNG LAI.
+    // LAT E tuong FPDF_LoadPage o day "RE" — SAI: do tren trang 2,54M object no ton
+    // 2,0-2,1 giay MOI LAN goi. Handle rieng van CAN (chong crash 0x80000003 —
+    // render dong bo de len handle PageCache dang tam dung), nhung phai giu lai
+    // trong DocTab chu khong nap/dong theo nhip dong ho.
+    // Quy tac so huu: chi TAC VU build (luong nen) doc/ghi handle khi no dang chay
+    // (heavyRegionBuilding); main thread chi cham vao handle khi KHONG co tac vu nao
+    // (!building) hoac SAU waitForFinished (cancelForeignAnnotTasks / watcher).
+    FPDF_PAGE heavyPrivPage  = nullptr;   // handle rieng cho heavyPrivIndex
+    int       heavyPrivIndex = -1;        // trang cua handle dang mo
+    bool      heavyPrivStale = false;     // noi dung doi khi dang render -> tac vu nap lai
+    // LAT G 0902 — "danh dien vung nhin": su kien goi ham nay co the dens lien tuc
+    // (moi lan repaint); chi dung lai khi vung nhin THAT SU doi.
+    int    heavySeenPage = -1;
+    double heavySeenZoom = 0.0;
+    QRect  heavySeenVis;
     QList<MarkupUndoEntry> undoStack;
     QList<MarkupUndoEntry> redoStack;
     QSet<int> ocrBusyPages;   // trang dang chay OCR o luong nen (tranh chay chong)
@@ -407,6 +446,11 @@ QAction*   m_viewQualityAct = nullptr;
     void showAnnotOverlayImmediate(DocTab* tab, int pageIdx);
     void scheduleReRender(DocTab* tab, int pageIdx);
     void refreshAnnotVisuals(DocTab* t, int page);
+    // 🔴 LÁT C 0902: CẬP NHẬT CÓ CHỌN LỌC — trộn hàng chờ delta của AnnotationManager
+    // vào visualsCache (KHÔNG lấy s_pdfiumMutex, KHÔNG xếp hàng sau bộ dựng trang).
+    // true = cache da duoc tron (danh sach moi nam trong *out); false = khong co
+    // delta/bo dem → duong nap lai ca trang nhu cu.
+    bool mergeAnnotVisuals(DocTab* t, int page, QList<AnnotVisual>* out);
     // Áp kết quả visuals vào renderer + view (cả 2 view). Dùng chung cho đường
     // CACHE HIT (sync) và đường RESCAN (async, áp lại trên UI thread).
     void vaVungChuThich(DocTab* t, int page, const QList<AnnotVisual>& visuals);
@@ -415,8 +459,9 @@ QAction*   m_viewQualityAct = nullptr;
                            bool overlayCapable, bool hasForeign);
     bool canFastPath(DocTab* t, int page) const;
     bool baseIsVector(DocTab* t, int page) const;
-    // Nen lop vector of the view ACTUALLY drawing: Single = t->vecLayer, Continuous =
-    // ContinuousView::m_vecLayers. Root of "Comment mat" (30-08) if missing.
+    // Nen lop vector cua view dang ve. LÁT B 09/02: Single va Continuous CUNG DOC mot
+    // kho DocTab::vecLayers, nen "nen vector" chi con mot nghiã — khong con "cua view
+    // nao". Root cua "Comment mat" (30-08) neu thieu chot nay.
     bool pageBaseIsVector(DocTab* t, int page) const;
     // Trang co markup khong overlay duoc (canFastPath false) thi phai ve bang raster:
     // lop vector lam nen se chan raster (drop reason=vectorReady) va markup VO HINH.
@@ -440,9 +485,18 @@ QAction*   m_viewQualityAct = nullptr;
 
     const QList<AnnotInfo>& annotsForPage(DocTab* t, int page, bool* outOk = nullptr);
     void invalidateAnnotPage(DocTab* t, int page);
+    // LÁT C 09/02: ve chu thich theo VUNG NHIN cho trang nang nen vector (region,
+    // ~20ms) thay lop bu toan trang. Goi theo SU KIEN: DeferredUpdate (pan),
+    // zoomChanged, doi trang, invalidateAnnotPage. Tu guard — goi vo hai khi trang
+    // khong heavy / khong phai tab hien hanh / vung nhin khong doi.
+    void updateHeavyRegion(DocTab* t);
+    void closeHeavyPriv(DocTab* t);   // LAT G: dong handle rieng (goi khi KHONG co tac vu dang chay)
     void buildVectorLayer(DocTab* t, int pageIndex, bool force = false);
     void ensureForeignAnnotLayer(DocTab* t, int pageIndex);
     void cancelForeignAnnotTasks(DocTab* t);  // cancel+wait cac tac vu lop bu truoc khi dong doc
+    // 0903: dung bo dung thumbnail cua tab + CHO worker thoat han TRUOC khi doc bi
+    // dong/giai phong hoac UI cham PDFium. Goi o MOI duong giai phong tai lieu.
+    void stopThumbPool(DocTab* t);
     // annotsForPage returns a reference into the cache — DO NOT retain it
     // across any call that may invalidate the cache (invalidateAnnotPage,
     // removeAnnot, refreshAnnotVisuals, refreshCommentsForPage, etc.).

@@ -46,6 +46,9 @@ public:
     ViewMode viewMode()    const { return m_viewMode; }
     // True once a page image has been received (used to choose setPage vs updatePageImage).
     bool     hasImage()    const { return !m_pixmap.isNull() && !m_loading; }
+    // W1 (01/09): "co tai lieu dang mo" — hoi trang thai tai lieu (da duoc nap
+    // trang nao chua), KHONG hoi "co anh raster trong tay luc nay" nhu m_pixmap.
+    bool     hasDocument() const { return !m_pageSizePt.isEmpty() || !m_pixmap.isNull(); }
 
     QPointF widgetToPdf(const QPointF& wp) const;
     QPointF pdfToWidget(const QPointF& pp) const;

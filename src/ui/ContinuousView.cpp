@@ -115,11 +115,11 @@ ContinuousView::ContinuousView(QWidget* parent)
             qDebug() << "[perf] cont settle SKIP reason=noPrimaryPage";
             return;
         }
-        // Skip re-render if we already have a full-quality (kFullRenderMaxPx) image.
+        // Skip re-render if we already have a full-quality image (tran = fullQCapPx).
         auto zit = m_pageImageZoom.constFind(m_primaryPage);
         if (zit != m_pageImageZoom.constEnd()) {
             double maxDim = qMax(m_pageSizePt[m_primaryPage].width(), m_pageSizePt[m_primaryPage].height());
-            double maxResZoom = PdfRenderer::kFullRenderMaxPx / qMax(maxDim, 1.0);
+            double maxResZoom = m_renderer->fullQCapPx(m_primaryPage, maxDim) / qMax(maxDim, 1.0);
             if (maxDim > 0 && qAbs(zit.value() - maxResZoom) < 1e-9) {
                 qDebug() << "[perf] cont settle SKIP reason=alreadyFullQuality page=" << m_primaryPage;
                 requestNeighborPages();
@@ -216,6 +216,11 @@ ContinuousView::ContinuousView(QWidget* parent)
      });
 
      // Retry timer for primary page when rendering is skipped due to maxConcurrent limit.
+     // 🔴 V2 2026-09-01 (HEAVYCAP): truoc day 300ms VO HAN — log chu san pham 0901 do ra
+     // 779 lan "RETRY primary" cung mot trang 2,54 trieu object: moi dat lai lenh render
+     // lai tang the he giet luot render dang chay => vong lap trang tron + app do.
+     // Nay: dem theo trang, gui 300*2^n (tran 4s), dung han sau 8 lan. State nam trong
+     // property cua timer (khong phai them thanh vien header). Doi trang / da co anh => reset.
      m_retryTimer = new QTimer(this);
      m_retryTimer->setInterval(300);
      connect(m_retryTimer, &QTimer::timeout, this, [this] {
@@ -223,9 +228,25 @@ ContinuousView::ContinuousView(QWidget* parent)
          // Da co anh hoac da co lop vector => khong can thu lai nua.
          if (m_pageImages.contains(m_primaryPage) || vectorWillRender(m_primaryPage)) {
              m_retryTimer->stop();
+             m_retryTimer->setProperty("tries", 0);
              return;
          }
-         qDebug().noquote() << "[cont] RETRY primary page=" << m_primaryPage << " zoom=" << m_zoom;
+         int tries = m_retryTimer->property("tries").toInt();
+         if (m_retryTimer->property("page").toInt() != m_primaryPage) {
+             tries = 0;
+             m_retryTimer->setProperty("page", m_primaryPage);
+         }
+         if (tries >= 8) {   // ~25s gui lenh cho MOT luot xem trang — du cho luot ve 150 DPI ~2s
+             m_retryTimer->stop();
+             qDebug().noquote() << "[cont] RETRY DUNG page=" << m_primaryPage
+                                << "— that bai lien tiep" << tries << "lan, dung lai khi doi trang";
+             return;
+         }
+         ++tries;
+         m_retryTimer->setProperty("tries", tries);
+         m_retryTimer->setInterval(qMin(300 * (1 << tries), 4000));   // lui dan 0.6/1.2/2.4/4/4...s
+         qDebug().noquote() << "[cont] RETRY primary page=" << m_primaryPage << " zoom=" << m_zoom
+                            << "lan=" << tries;
          m_continuousRequested.remove(m_primaryPage);
          requestContinuousRender(m_primaryPage, m_zoom);
      });
@@ -285,7 +306,9 @@ if (m_vgrInit) {
 
  // ── Public API ────────────────────────────────────────────────────────────────
 
-void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
+void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer,
+                                 const QHash<int, QList<AnnotVisual>>* visualsSrc,
+                                 QHash<int, std::shared_ptr<VectorLayer>>* vecStore)
 {
     // Clear any text selection when document changes
     m_selecting = false;
@@ -294,6 +317,10 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
     stopAutoScroll();
     clearTextSelectionInternal();
 
+    // LÁT B 09/02: repoint kho lop vector ve tab dang gan. KHONG clear() — do la du lieu
+    // cua tai lieu (DocTab::vecLayers), xoá qua con trỏ nay la xoá mat cua tab khac.
+    m_vecStore = vecStore ? vecStore : &m_vecStoreEmpty;
+
     // Việc B: moi duong vao Continuous deu phai co khoa .torvec hop le. MainWindow
     // bo sot cho goi setVectorCacheKey o duong doi tab (onTabChanged) va tinh hash
     // bat dong bo (initWatcher) — nen setDocument tu bao dam key theo doc dang gan.
@@ -301,7 +328,7 @@ void ContinuousView::setDocument(PdfDocument* doc, PdfRenderer* renderer)
 
     ++m_vecGen;
     m_vecPool.clear();
-    m_vecLayers.clear();
+    // LÁT B 09/02: bo `m_vecStore->clear()` — day la du lieu cua tab, khong phai cua view.
     m_fgnLayers.clear();
     m_vecBuilding.clear();
     m_vecBuildStart.clear();
@@ -438,14 +465,18 @@ if (m_vgrInit) {
      }
     m_doc      = doc;
     m_renderer = renderer;
+    // LÁT A 09/02: view đọc kho duy nhất của tài liệu đang gắn — không giữ bản chép,
+    // không clear (clear sẽ xoá dữ liệu của cả view Single dùng chung kho).
+    m_visualsSrc = visualsSrc;
     // GOC1: tell renderer to use zoom-based scale in fast mode
     if (m_renderer) m_renderer->setContinuousUseZoomScale(m_fastMode);
     m_pageImages.clear();
     m_pageImageZoom.clear();
-    m_pageAnnotVisuals.clear();
     m_continuousRequested.clear();
     m_pendingRenderScale.clear();
-    m_vecLayers.clear();
+    // LÁT B 09/02: bo `m_vecStore->clear()` — do la kho cua tai lieu (DocTab), khong phai
+    // cua view. View dung chung giua cac tab; clear o day tung xoá mat lop vector cua tab
+    // khac (chính là bẫy Lát A gap phải). Repoint o dau ham nay la du.
     m_fgnLayers.clear();
     m_vecBuilding.clear();
     m_rasterOnlyPages.clear();
@@ -647,7 +678,7 @@ void ContinuousView::setZoom(double scale)
     // "Continuous bi mat Markup khi zoom":
     // (1) `m_vecBuildArmed` CHI duoc bat boi m_contSettleTimer, ma setZoom lai STOP chinh
     //     bo hen gio do (dong ngay tren) ⇒ sau mot lan zoom, duong vector bi khoa VINH VIEN.
-    // (2) Markup ve bang overlay lay tu `m_pageAnnotVisuals`, ma visuals chi duoc xin lai khi
+    // (2) Markup ve bang overlay lay tu `kho visuals duy nhat cua tai lieu`, ma visuals chi duoc xin lai khi
     //     raster/vector toi. Zoom huy het viec dang bay ⇒ khong con su kien nao xin lai visuals.
     // ⇒ Hen gio lai sau khi zoom: 400 ms sau se vua mo cong dung vector, vua DOI LAI visuals
     //   cho moi trang dang nhin thay.
@@ -932,8 +963,9 @@ if (primaryChanged) {
                       qDebug() << "[perf] cont primary=" << primary << "zoom=" << m_zoom;
                       m_primaryPage = primary;
                      m_lastRequestZoom = m_zoom;
-                     m_primaryRequested = false;
-                     m_retryTimer->start();
+                      m_primaryRequested = false;
+                      m_retryTimer->setProperty("tries", 0);   // V2: luot xem trang moi = ngan sach thu lai moi
+                      m_retryTimer->start();
                      m_contSettleTimer->stop();
                      m_cacheProbed.clear();
             
@@ -949,7 +981,8 @@ if (primaryChanged) {
                         if (zit != m_pageImageZoom.constEnd()) {
                             double storedZoom = zit.value();
                             double maxDim = qMax(m_pageSizePt[primary].width(), m_pageSizePt[primary].height());
-                            double maxResZoom = PdfRenderer::kFullRenderMaxPx / qMax(maxDim, 1.0);
+                            double maxResZoom = (m_renderer ? m_renderer->fullQCapPx(primary, maxDim)
+                                                             : PdfRenderer::kFullRenderMaxPx) / qMax(maxDim, 1.0);
                             if (qAbs(storedZoom - m_zoom) < 1e-9
                                 || (maxDim > 0 && qAbs(storedZoom - maxResZoom) < 1e-9)) {
                                 // Already have a good-enough pixmap: exact zoom match or
@@ -1026,10 +1059,10 @@ if (primaryChanged) {
                 for (int i = first; i <= last && i >= 0; ++i) {
                     if (i < 0 || i >= m_pageCount) continue;
                     const bool hasImg = m_pageImages.contains(i);
-                    const bool hasVector = (m_vecLayers.constFind(i) != m_vecLayers.constEnd()
-                                            && *m_vecLayers.constFind(i)
-                                            && (*m_vecLayers.constFind(i))->isReady()
-                                            && (*m_vecLayers.constFind(i))->isComplete()
+                    const bool hasVector = (m_vecStore->constFind(i) != m_vecStore->constEnd()
+                                            && *m_vecStore->constFind(i)
+                                            && (*m_vecStore->constFind(i))->isReady()
+                                            && (*m_vecStore->constFind(i))->isComplete()
                                             && !rasterOnlyApplies(i));
                     const bool hasLow = m_pageLowRes.contains(i);
                     if (!hasImg && !hasVector && !hasLow)
@@ -1107,8 +1140,8 @@ bool ContinuousView::vectorWillRender(int pg) const
     if (!rasterOnlyApplies(pg))
         return false;
     // Lop DA san sang → chac chan ve bang vector.
-    auto it = m_vecLayers.constFind(pg);
-    if (it != m_vecLayers.constEnd() && *it && (*it)->isReady() && (*it)->isComplete())
+    auto it = m_vecStore->constFind(pg);
+    if (it != m_vecStore->constEnd() && *it && (*it)->isReady() && (*it)->isComplete())
         return true;
     // Dang dung → chi duoc bo raster trong mot HAN NGAN. Qua han thi PHAI cho raster
     // chay, khong duoc cho vo han (day chinh la loi lam Continuous trang tron).
@@ -1123,7 +1156,8 @@ bool ContinuousView::vectorWillRender(int pg) const
 // TORREADER_CONT_RASTER=1 -> Continuous ve HOAN TOAN bang raster, bo han nhanh vector.
 // Y tuong cua owner 31/08: Single da co san 3 lop (thumbnail / raster / vector GPU); raster
 // von rat muot va nhanh, chi kem net o zoom 400-500%. Continuous chi can raster + xep N trang.
-// Bo nhanh vector cung xoa luon kho vector RIENG cua Continuous (m_vecLayers) — chinh la thu
+// Bo nhanh vector cung chan duong dung lop vector trong KHO CHUNG (m_vecStore ->
+// DocTab::vecLayers) — chinh la thu
 // da gay "hai kho vector" va markup mat trong Continuous.
 bool ContinuousView::contRasterOnlyEnv()
 {
@@ -1133,8 +1167,9 @@ bool ContinuousView::contRasterOnlyEnv()
 
 bool ContinuousView::trangCanRaster(int pg) const
 {
-    auto it = m_pageAnnotVisuals.constFind(pg);
-    if (it == m_pageAnnotVisuals.constEnd()) return false;
+    if (!m_visualsSrc) return false;
+    auto it = m_visualsSrc->constFind(pg);
+    if (it == m_visualsSrc->constEnd()) return false;
     bool coThuOverlayKhongVe = false;
     for (const AnnotVisual& av : it.value())
         if (!av.paintByOverlay) { coThuOverlayKhongVe = true; break; }
@@ -1148,26 +1183,29 @@ bool ContinuousView::trangCanRaster(int pg) const
     return true;
 }
 
-bool ContinuousView::rasterOnlyApplies(int pg) const
+bool ContinuousView::vectorBuildBlocked(int pg) const
 {
-    // 🔴🔴 CONG 2026-09-01 — "NEN VECTOR KHONG CHUA ANNOTATION".
-    // Do that tren file co comment cua phan mem khac (owner: "260917 3Fl th checked"):
-    //   markupCuaTa=0 · hasForeign=true · visuals=1 · overlay seVe=0
-    //   [fgnlayer] DEFER - chua biet so object   ← lop bu KHONG BAO GIO dung duoc
-    // ⇒ Chu thich ngoai CHI ton tai trong anh raster. Single dang ve nen raster nen thay;
-    //   Continuous da chuyen sang nen vector nen mat sach. Dung nhu owner quan sat.
-    // ⇒ Trang co chu thich NGOAI phai O LAI raster. Luat nay KHONG ap cho markup CUA TA —
-    //   markup cua ta la lop rieng, overlay ve, khong quan tam nen la gi (owner chot).
-    if (!m_vecAnnotSafe.value(pg, true)) return true;
-    // Chot tu quyet: co Note/Text/chu thich ngoai tren trang => phai ve bang raster,
-    // vi chi PDFium ve dung chung va nen vector khong chua annotation nao.
-    if (trangCanRaster(pg)) return true;
-    if (contRasterOnlyEnv()) return true;      // cong tac: raster cho MOI trang
+    // CAU TRUC thuan: chan dung/xdp lop vector CHỈ vi env raster hoac trang nang bi ep
+    // raster. KHONG nhuc den chu thich — nen vector phai dung duoc cho ca trang co comment
+    // (comment do lop comment ve de len). Day la thu giup trang comment thoat ket raster.
+    if (contRasterOnlyEnv()) return true;
     if (!m_rasterOnlyPages.contains(pg)) return false;
-    // Trang nang (>= nguong): bo qua rasterOnly, cho phep dung lop vector de hien trang.
     if (m_renderer && m_renderer->pageObjectCount(pg) > kHeavyObjectThreshold)
         return false;
     return true;
+}
+
+bool ContinuousView::rasterOnlyApplies(int pg) const
+{
+    // ── LUAT VAY (owner chot 02/09, "mot nguon nhieu lop") — AP DUNG GIONG HET PdfGpuView.
+    // Nen vector duoc dung khi: (a) co nen vector (khong bi chan cau truc) VA (b) hoac
+    // overlay ve duoc het chu thich, hoac lop comment da san sang ve chu thich de len.
+    // Trang co comment ma lop comment CHUA xong => tam ve raster (trangCanRaster true);
+    // khi lop comment xong, setForeignAnnotLayer() bao ve lai => chuyen sang vector.
+    // (Da go bo cay "cong" m_vecAnnotSafe cu: no ep trang co comment o lai raster VINH VIEN
+    //  ma khong biet lop comment da san sang — chinh la nguyen nhan vectorPages=0.)
+    if (vectorBuildBlocked(pg)) return true;
+    return trangCanRaster(pg);
 }
 
 void ContinuousView::ensureVectorLayers()
@@ -1189,12 +1227,12 @@ int center = pageAtCenter();
      int lo = qMax(0, center - kKeepRadius);
      int hi = qMin(m_pageCount - 1, center + kKeepRadius);
     qDebug().noquote() << QString("[contvec] ENTER center=%1 lo=%2 hi=%3 layers=%4 building=%5 poolActive=%6 poolMax=%7")
-                          .arg(center).arg(lo).arg(hi).arg(m_vecLayers.size())
+                          .arg(center).arg(lo).arg(hi).arg(m_vecStore->size())
                           .arg(m_vecBuilding.size())
                           .arg(QThreadPool::globalInstance()->activeThreadCount())
                           .arg(QThreadPool::globalInstance()->maxThreadCount());
 for (int pg = lo; pg <= hi; ++pg) {
-        if (rasterOnlyApplies(pg)) {
+        if (vectorBuildBlocked(pg)) {
             qDebug() << "[contvec] rasterOnly pg=" << pg;
             continue;
         }
@@ -1202,9 +1240,9 @@ for (int pg = lo; pg <= hi; ++pg) {
             qDebug().noquote() << "[contvec] rasterOnly BO QUA - trang nang objects="
                                << (m_renderer ? m_renderer->pageObjectCount(pg) : 0)
                                << "pg=" << pg << "(uu tien hien trang)";
-        if (m_vecLayers.contains(pg) || m_vecBuilding.contains(pg)) {
+        if (m_vecStore->contains(pg) || m_vecBuilding.contains(pg)) {
             qDebug().noquote() << QString("[contvec] skip pg=%1 hasLayer=%2 isBuilding=%3")
-                                  .arg(pg).arg(m_vecLayers.contains(pg)).arg(m_vecBuilding.contains(pg));
+                                  .arg(pg).arg(m_vecStore->contains(pg)).arg(m_vecBuilding.contains(pg));
             continue;
         }
         m_vecBuilding.insert(pg);
@@ -1224,9 +1262,9 @@ for (int pg = lo; pg <= hi; ++pg) {
             w->deleteLater();
             m_vecBuilding.remove(pg);
             m_vecBuildStart.remove(pg);
-            if (w->result()) m_vecLayers.insert(pg, layer);
+            if (w->result()) m_vecStore->insert(pg, layer);
             qDebug().noquote() << "[cont] vecLayer" << (w->result() ? "READY" : "SKIP")
-                               << "page=" << pg << "cached=" << m_vecLayers.size();
+                               << "page=" << pg << "cached=" << m_vecStore->size();
             // Noi dung trang da san — bao MainWindow truoc (de push visuals + lay lop bu).
             if (w->result()) needAnnotVisuals(pg);
             viewport()->update();
@@ -1283,7 +1321,7 @@ for (int pg = lo; pg <= hi; ++pg) {
         const qint64 _m=_e.elapsed(); if(_m>20) qDebug().noquote()<<"[scrollms] needAnnotVisuals ms="<<_m;
         }}));
     }
-for (auto it = m_vecLayers.begin(); it != m_vecLayers.end(); ) {
+for (auto it = m_vecStore->begin(); it != m_vecStore->end(); ) {
             const int dist = qAbs(it.key() - center);
             // Viec C: trang nang phai DUNG MOI vai giay moi hien lai — noi long ban
             // kinh giu lop (dist > 3). Trang thong thuong van giu dist > 1 nhu cu.
@@ -1293,9 +1331,9 @@ for (auto it = m_vecLayers.begin(); it != m_vecLayers.end(); ) {
             if (dist > keep) {
                 qDebug().noquote() << "[cont] vecLayer EVICT page=" << it.key()
                                    << "dist=" << dist << ">" << keep
-                                   << "remaining=" << m_vecLayers.size() - 1;
+                                   << "remaining=" << m_vecStore->size() - 1;
                 qDebug().noquote() << "[contvec] EVICT pg=" << it.key();
-                it = m_vecLayers.erase(it);
+                it = m_vecStore->erase(it);
             } else {
                 if (keep > kKeepRadius)
                     qDebug().noquote() << "[cont] vecLayer GIU trang nang pg=" << it.key()
@@ -1322,7 +1360,7 @@ void ContinuousView::buildPrimaryVectorLayer()
     if (!m_doc || m_pageCount == 0) return;
     const int pg = m_primaryPage;
     if (pg < 0 || pg >= m_pageCount) return;
-    if (m_vecLayers.contains(pg) || m_vecBuilding.contains(pg)) return;
+    if (m_vecStore->contains(pg) || m_vecBuilding.contains(pg)) return;
     if (m_vecKeyPath.isEmpty()) return;
 
     const int objs = m_renderer ? m_renderer->pageObjectCount(pg) : 0;
@@ -1340,7 +1378,7 @@ void ContinuousView::buildPrimaryVectorLayer()
         m_vecBuilding.remove(pg);
         m_vecBuildStart.remove(pg);
         if (w->result() && pg == m_primaryPage) {
-            m_vecLayers.insert(pg, layer);
+            m_vecStore->insert(pg, layer);
             qDebug().noquote() << "[contvec] BUILD-PRIMARY READY pg=" << pg;
             needAnnotVisuals(pg);
             viewport()->update();
@@ -1424,8 +1462,10 @@ void ContinuousView::setVectorAnnotSafe(int page, bool safe) {
     viewport()->update();
 }
 
-void ContinuousView::setAnnotVisualsForPage(int page, const QList<AnnotVisual>& visuals) {
-    m_pageAnnotVisuals[page] = visuals;
+void ContinuousView::setAnnotVisualsForPage(int page, const QList<AnnotVisual>&) {
+    // LÁT A 09/02: khong con ban chép rieng — visuals da nam trong kho duy nhat
+    // cua tai lieu (DocTab::visualsCache). Day chi la lenh ve lai.
+    Q_UNUSED(page);
     viewport()->update();
 }
 
@@ -1469,33 +1509,58 @@ void ContinuousView::setForeignAnnotLayer(int page, std::shared_ptr<ForeignAnnot
 }
 
 void ContinuousView::evictForeignLayers() {
-    // Giong m_vecLayers: gio giu lop trong ban kinh kKeepRadius quanh trang chinh
-    // (toi da 2*kKeepRadius+1 = 3 lop). Moi lop la mot ANH LON, khong giu het trang.
-    const int center = pageAtCenter();
-    for (auto it = m_fgnLayers.begin(); it != m_fgnLayers.end(); ) {
-        if (qAbs(it.key() - center) > kKeepRadius) {
-            qDebug().noquote() << "[cont] fgnLayer EVICT page=" << it.key()
-                               << "dist=" << qAbs(it.key() - center) << ">" << kKeepRadius;
-            it = m_fgnLayers.erase(it);
-        } else {
-            ++it;
-        }
+    // 🔴🔴 SUA 02/09/2026 — "chu thich tu nhien mat, lat view/doi che do thi hien lai".
+    // Luat CU: giu lop co dist-toi-pageAtCenter() ≤ kKeepRadius. Nham: "trang o tam"
+    // KHONG PHAI "trang dang xem" — o Continuous nhieu trang cung hien tren man mot luc,
+    // tam dich mot cai la lop bu cua trang DANG NHIN bi vut (log: EVICT page=2 dist=2,
+    // roi set page=2 ready=true dung lai ngay; trang 1 bi dung lai 11 lan/phiên).
+    // Luat MOI (tam nhìn that, khong khoang cach tam):
+    //   1. ⛔ Trang DANG HIEN THI tren viewport (gap ≤ 0) KHONG BAO GIO bi duoi.
+    //   2. Giu them cac lop trong vung dem 1 chieu cao viewport quanh vung nhìn
+    //      (cuon nhe khong phai dung lai).
+    //   3. Tran cung kFgnMaxLayers lop (moi lop la ANH LON ~10-45 MB): duoi theo thu
+    //      tu XA VUNG NHIN NHAT truoc, bat ke ly do 2 — khong giu vo han (RAM 6,2 GB).
+    const int vpTop = verticalScrollBar()->value();
+    const int vpBot = vpTop + viewport()->height();
+    QVector<QPair<int,int>> cand;   // (gap px, page) — cac lop CHUA hien tren man
+    for (auto it = m_fgnLayers.constBegin(); it != m_fgnLayers.constEnd(); ++it) {
+        const int top = pageTopY(it.key());
+        const int gap = qMax(vpTop - (top + pageH(it.key())),   // <0: trang nay phia tren
+                             top - vpBot);                      // >0: trang nay phia duoi
+        if (gap <= 0) continue;      // ⛔ dang hien thi — khong bao gio duoi
+        cand.append(qMakePair(gap, it.key()));
+    }
+    std::sort(cand.begin(), cand.end());   // gap tang dan = gan vung nhìn truoc
+    // So lop duoc giu them: trong vung dem (gap ≤ chieu cao viewport)...
+    int keep = 0;
+    while (keep < cand.size() && cand[keep].first <= vpBot - vpTop) ++keep;
+    // ...nhung tong so lop khong vuot tran kFgnMaxLayers (duoi XA VUNG NHIN NHAT truoc).
+    keep = qMin(keep, qMax(0, kFgnMaxLayers - (m_fgnLayers.size() - cand.size())));
+    for (int i = keep; i < cand.size(); ++i) {
+        m_fgnLayers.remove(cand[i].second);
+        qDebug().noquote() << "[cont] fgnLayer EVICT page=" << cand[i].second
+                           << "gapPx=" << cand[i].first << "(ngoai vung dem/vo tran)"
+                           << "remaining=" << m_fgnLayers.size();
     }
 }
 
 bool ContinuousView::pageHasContent(int page) const {
     if (page < 0 || page >= m_pageCount) return false;
-    auto vit = m_vecLayers.constFind(page);
-    if (vit != m_vecLayers.constEnd() && *vit && (*vit)->isReady()) return true;
+    auto vit = m_vecStore->constFind(page);
+    if (vit != m_vecStore->constEnd() && *vit && (*vit)->isReady()) return true;
     if (m_pageImages.contains(page)) return true;
     return false;
 }
 
 bool ContinuousView::pageHasVector(int page) const {
     if (page < 0 || page >= m_pageCount) return false;
-    auto vit = m_vecLayers.constFind(page);
-    return vit != m_vecLayers.constEnd() && *vit && (*vit)->isReady()
-        && (*vit)->isComplete() && !rasterOnlyApplies(page);
+    // CAU TRUC: co nen vector dung duoc (khong phai "dang duoc ve luc nay"). Trang comment
+    // co nen vector xong nhung van tam raster cho den khi lop comment san sang — MainWindow
+    // can tho tin nay de know duoc dung lop comment. Dung !vectorBuildBlocked, KHONG phai
+    // !rasterOnlyApplies (neu khong thi trang comment ket raster: khong nen => khong lop).
+    auto vit = m_vecStore->constFind(page);
+    return vit != m_vecStore->constEnd() && *vit && (*vit)->isReady()
+        && (*vit)->isComplete() && !vectorBuildBlocked(page);
 }
 
 void ContinuousView::datLaiLenhVeTrang(int page) {
@@ -1509,14 +1574,24 @@ void ContinuousView::invalidatePage(int pageIndex) {
     m_pageImageZoom.remove(pageIndex);
     m_continuousRequested.remove(pageIndex);
     m_pendingRenderScale.remove(pageIndex);
+    // 🔴 LÁT C 0902 — GOC cua "qua Continuous thi khong thay ca 2, giong nhu cho ay".
+    // Lop lam net (m_sharpPixmap) nam DE LEN anh nen va chi duoc cap lai khi zoom/scroll.
+    // Xoa anh nen ma giu lop phu cu ⇒ nen ve lai co chu thich den dau man hinh van
+    // lo anh chap cua luc CHUA co chu thich — va no nam vay cho toi khi ai do zoom
+    // ("chờ" chính là đây). Khac voi truong hop 01/09 (giu lop phu khi doi tab —
+    // noi dung KHONG doi): o day noi dung trang DA DOI thi lop phu ay that su CU.
+    if (m_sharpPage == pageIndex) {
+        m_sharpPage = -1;
+        m_sharpPixmap = {};
+    }
     // 🔴🔴 BO 2026-09-01 — day la GOC cua "Single co markup, Continuous khong".
     // Ham nay lam moi ANH TRANG. Markup la LOP RIENG (owner chot) nen no KHONG duoc
-    // dinh liu gi o day. Ban cu xoa luon `m_pageAnnotVisuals` ⇒ moi lan sua markup:
+    // dinh liu gi o day. Ban cu xoa luon kho visuals ⇒ moi lan sua markup:
     //   refreshAnnotVisuals (bat dong bo) chay truoc → invalidatePage XOA visuals →
     //   neu ban refresh da ve xong TU BO DEM truoc do thi khong con ai day visuals lai nua
     //   ⇒ nen da giau markup cua ta, overlay lai rong ⇒ MARKUP BIEN MAT.
     // Single khong co dong tac xoa nay nen Single van hien — dung nhu owner quan sat.
-    // m_pageAnnotVisuals.remove(pageIndex);   ← KHONG khoi phuc
+    // LÁT A 09/02: khong con kho rieng de xoa — ca hai view doc DocTab::visualsCache.
     qDebug() << "[markup] invalidatePage page=" << pageIndex << "(giu nguyen lop markup)";
 }
 
@@ -1765,8 +1840,8 @@ void ContinuousView::paintEvent(QPaintEvent* /*event*/)
 
         // Vector overlay
         bool drewVector = false;
-        auto vit = m_vecLayers.constFind(i);
-        if (vit != m_vecLayers.constEnd() && *vit && (*vit)->isReady() && (*vit)->isComplete()
+        auto vit = m_vecStore->constFind(i);
+        if (vit != m_vecStore->constEnd() && *vit && (*vit)->isReady() && (*vit)->isComplete()
             && !rasterOnlyApplies(i)) {
             const QSizeF vpSize = (*vit)->pageSizePt();
             if (vpSize.width() > 0 && vpSize.height() > 0) {
@@ -1955,8 +2030,8 @@ QElapsedTimer _dt; _dt.start();
         if (cy + ch2 <= scrollY || cy >= scrollY + vpH) continue;
         if (cx + cw2 <= scrollX || cx >= scrollX + vpW) continue;
         // Trang visible: co vector? co raster? co low-res?
-        auto vit2 = m_vecLayers.constFind(i);
-        bool hasVector = vit2 != m_vecLayers.constEnd() && *vit2 && (*vit2)->isReady() && (*vit2)->isComplete()
+        auto vit2 = m_vecStore->constFind(i);
+        bool hasVector = vit2 != m_vecStore->constEnd() && *vit2 && (*vit2)->isReady() && (*vit2)->isComplete()
                          && !rasterOnlyApplies(i);
         bool hasRaster = m_pageImages.contains(i);
         bool hasLowRes = m_pageLowRes.contains(i);
@@ -1984,8 +2059,8 @@ QElapsedTimer _dt; _dt.start();
             int cx = pageLeftX(i), cy = pageTopY(i), cw2 = pageW(i), ch2 = pageH(i);
             if (cy + ch2 <= scrollY || cy >= scrollY + vpH) continue;
             if (cx + cw2 <= scrollX || cx >= scrollX + vpW) continue;
-            auto vit2 = m_vecLayers.constFind(i);
-            if (vit2 != m_vecLayers.constEnd() && *vit2 && (*vit2)->isReady() && (*vit2)->isComplete()
+            auto vit2 = m_vecStore->constFind(i);
+            if (vit2 != m_vecStore->constEnd() && *vit2 && (*vit2)->isReady() && (*vit2)->isComplete()
                 && !rasterOnlyApplies(i))
                 ++nv;
             else if (m_pageImages.contains(i))
@@ -2003,11 +2078,12 @@ QElapsedTimer _dt; _dt.start();
     {
         static int _lastN = -1, _lastVis = -1; static double _lastZ = -1;
         int nVis = 0, nOverlay = 0;
-        for (auto it = m_pageAnnotVisuals.constBegin(); it != m_pageAnnotVisuals.constEnd(); ++it) {
+        if (m_visualsSrc)
+        for (auto it = m_visualsSrc->constBegin(); it != m_visualsSrc->constEnd(); ++it) {
             if (!pageVisible(it.key())) continue;
             const int pg = it.key();
-            auto vv = m_vecLayers.constFind(pg);
-            const bool veVec = (vv != m_vecLayers.constEnd() && *vv && (*vv)->isReady()
+            auto vv = m_vecStore->constFind(pg);
+            const bool veVec = (vv != m_vecStore->constEnd() && *vv && (*vv)->isReady()
                                 && (*vv)->isComplete() && !rasterOnlyApplies(pg));
             // Dem theo DUNG luat ma ma ve dung (xem vong ve ben duoi), khong dem theo luat cu.
             for (const AnnotVisual& av : it.value()) { ++nVis; if (av.paintByOverlay) ++nOverlay; }
@@ -2018,18 +2094,18 @@ QElapsedTimer _dt; _dt.start();
                                << "zoom=" << m_zoom;
         }
     }
-    if (!m_pageAnnotVisuals.isEmpty()) {
+    if (m_visualsSrc && !m_visualsSrc->isEmpty()) {
         p.setRenderHint(QPainter::Antialiasing, true);
         for (int i = 0; i < m_pageCount; ++i) {
-            auto vit = m_pageAnnotVisuals.constFind(i);
-            if (vit == m_pageAnnotVisuals.constEnd() || vit->isEmpty()) continue;
+            auto vit = m_visualsSrc->constFind(i);
+            if (vit == m_visualsSrc->constEnd() || vit->isEmpty()) continue;
 
             int vx = pageLeftX(i) - scrollX;
             int vy = pageTopY(i) - scrollY;
 
             // Trang nay co dang duoc ve bang LOP VECTOR khong?
-            auto vitV = m_vecLayers.constFind(i);
-            const bool veBangVector = (vitV != m_vecLayers.constEnd() && *vitV
+            auto vitV = m_vecStore->constFind(i);
+            const bool veBangVector = (vitV != m_vecStore->constEnd() && *vitV
                                        && (*vitV)->isReady() && (*vitV)->isComplete()
                                        && !rasterOnlyApplies(i));
             for (const AnnotVisual& av : *vit) {
@@ -2099,12 +2175,20 @@ QElapsedTimer _dt; _dt.start();
                         break;
                     }
                     case FPDF_ANNOT_FREETEXT: {
-                        double fs = qMax(6.0, av.fontSize * m_zoom);
-                        QFont ft = p.font();
-                        ft.setPointSizeF(fs);
-                        p.setFont(ft);
-                        p.setPen(av.stroke.isValid() ? QPen(av.stroke) : QPen(Qt::black));
-                        p.drawText(dRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, av.text);
+                        // 3 lớp NỀN→VIỀN→CHỮ. CHU ve qua drawFreeTextOverlay CHUNG
+                        // voi PdfGpuView — cung pixelSize=fontSize*zoom, cung le,
+                        // cung wrap, khong bao gio cat cuth.
+                        p.save();
+                        if (av.hasFill && av.fill.isValid() && av.fill.alpha() > 0)
+                            p.fillRect(dRect, av.fill);
+                        if (av.border > 0.0f) {
+                            p.setPen(QPen(av.stroke.isValid() ? av.stroke : QColor(Qt::black),
+                                          qMax(1.0, av.border * m_zoom)));
+                            p.setBrush(Qt::NoBrush);
+                            p.drawRect(dRect);
+                        }
+                        p.restore();
+                        drawFreeTextOverlay(p, dRect, av.text, av.fontSize, m_zoom, av.stroke);
                         break;
                     }
                     case FPDF_ANNOT_STAMP: {

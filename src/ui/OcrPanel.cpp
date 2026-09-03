@@ -21,11 +21,13 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QMutex>
+#include <QTimer>
 #include <QtConcurrent>
 #include <QPointer>
 #include <QApplication>
 #include <fpdfview.h>
 #include <fpdf_text.h>
+#include <fpdf_edit.h>   // FPDFPage_CountObjects
 
 extern QMutex s_pdfiumMutex;
 
@@ -37,6 +39,13 @@ namespace {
 // dien la du (worker paste qua queued invokeMethod), them mutex cho chac.
 static QMutex   g_hasTextMutex;
 static QHash<OcrTextCache::DocHandle, QHash<int,bool>> g_hasTextCache;
+
+// Ngưỡng "trang nang" cho phep kiem "co chu": CUNG gia tri voi chan >400000 cua
+// [fgnlayer] SKIP (MainWindow) va fullQCapPx prefetch (PdfRenderer) — cung nguon
+// FPDFPage_CountObjects. Do 02/09 tren trang 2.540.585 object: FPDF_LoadPage =
+// 1.686 ms (khong duoc lam duoi khoa), FPDFText_LoadPage tren trang DA parse van
+// = 155 ms (> 50 ms), FPDFPage_CountObjects = 0,35 ms, FPDFText_CountChars = 0 ms.
+static constexpr int kSkipTextCheckObjects = 400000;
 
 int pageHasTextCachedFlag(FPDF_DOCUMENT doc, int pageIndex) {
     QMutexLocker lock(&g_hasTextMutex);
@@ -267,12 +276,22 @@ void OcrPanel::updateStatus() {
 }
 
 // Dam bao bo dem "trang co chu" da co gia tri truoc khi statusText doc (chi doc
-// bo dem — khong parse dong bo). Parse FPDF o LUONG NEN: trang CAD nang ton 2,4
-// giay giu s_pdfiumMutex, lam tren UI la dung hinh (SPEC_PERF_HEAVYPAGE). Trang
-// phai di qua PageCache (R1), khong FPDF_LoadPage/ClosePage o day.
-// Cay an toan: worker set cache roi updateStatus() -> ensureHasTextKnown() thay
-// hasTextStatus != -1 nen return ngay — het vong lap. QPointer phong panel bi xoa
-// khi check con chay.
+// bo dem — khong parse dong bo). Va 02/09 (SPEC_PERF_HEAVYPAGE, huong (b) + chan
+// (a)): luong nen KHONG duoc GIU s_pdfiumMutex luc FPDF_LoadPage — do 19/08 thay
+// day sang luong nen van giu khoa 2.513 ms tren trang CAD 2,54 trieu object, luong
+// chinh cho 2.262 giay ([lockwait] MainWindow:1831). Chay o dau khong giai quyet
+// tranh khoa — chi KHONG NAP trang va KHONG mo text page trang nang moi het.
+// Worker chi duoc giu khoa cho: (1) FPDFText_CountChars tren text page DA ton tai
+// (0 ms), (2) FPDFPage_CountObjects O(1) (0,35 ms) de chan trang >400k object.
+// Trang chua trong PageCache hoac nang ma chua co text page → HOAN (tri hoan,
+// trang van o trang thai trung tinh "checking…"), m_hasTextRetry no 1 giay sau —
+// an ke khi bo dung hinh/OCR/search da nap trang va dung text page.
+// Cay an toan: moi worker chi post VE MOT LAN (done → setHasText; tri hoan →
+// armHasTextRetry), nen tai mot trang luong co nhat mot worker song — khong
+// tich lop QtConcurrent. Handle tu tryAcquire duoc dung TRONG luc giu
+// s_pdfiumMutex: moi duong evict/invalidate/closeEntry deu can khoa do, nen
+// handle khong the chet giua chung — khong can PageBorrow (borrow chi can khi
+// tha khoa giua chung, nhu render slice). QPointer phong panel bi xoa.
 void OcrPanel::ensureHasTextKnown() {
     if (!m_doc || !m_doc->isOpen()) return;
     const int page = m_currentPage >= 0 ? m_currentPage : 0;
@@ -287,24 +306,50 @@ void OcrPanel::ensureHasTextKnown() {
     const int pg = page;
     QPointer<OcrPanel> self(this);
     (void)QtConcurrent::run([d, pg, self]() {
-        bool has = false;
+        bool done = false, has = false;
         {
             TimedPdfiumLock lk(__FILE__, __LINE__);
-            FPDF_PAGE p = PageCache::acquire(d, pg);
-            if (p) {
-                PageCache::PageBorrow _b(d, pg);   // RAII tra muon khi het scope
-                FPDF_TEXTPAGE tp = PageCache::textPage(d, pg);
-                if (tp) has = (FPDFText_CountChars(tp) > 0);
+            FPDF_TEXTPAGE tp = PageCache::tryAcquireTextPage(d, pg);
+            if (tp) {                                   // co roi → an ke, 0 ms
+                has = (FPDFText_CountChars(tp) > 0);
+                done = true;
+            } else if (FPDF_PAGE p = PageCache::tryAcquire(d, pg)) {
+                // tryAcquire (KHONG phai acquire): HIT-only — acquire se
+                // FPDF_LoadPage duoi khoa = 1.686 ms tren trang CAD.
+                if (FPDFPage_CountObjects(p) <= kSkipTextCheckObjects) {
+                    FPDF_TEXTPAGE t = PageCache::textPage(d, pg);  // trang nhe: ms
+                    has = t && (FPDFText_CountChars(t) > 0);
+                    done = true;
+                }
+                // Trang nang + chua co text page → tri hoan, khong mo text page.
             }
+            // Trang chua trong dem → tri hoan cho bo dung hinh nap.
         }
-        // setHasText + xoa trang kiem + cap nhat UI PHAI o luong chinh.
-        QMetaObject::invokeMethod(qApp, [self, d, pg, has]() {
+        // setHasText/xoa trang kiem/cap nhat UI PHAI o luong chinh.
+        QMetaObject::invokeMethod(qApp, [self, d, pg, done, has]() {
             if (!self) return;
-            OcrTextCache::setHasText(reinterpret_cast<OcrTextCache::DocHandle>(d), pg, has);
             self->m_hasTextChecking.remove(pg);
-            self->updateStatus();
+            if (done) {
+                OcrTextCache::setHasText(reinterpret_cast<OcrTextCache::DocHandle>(d), pg, has);
+                self->updateStatus();
+            } else {
+                self->armHasTextRetry();
+            }
         }, Qt::QueuedConnection);
     });
+}
+
+// Duy nhat MOT worker tri hoan moi trang: don (single-shot) — phat → updateStatus
+// → ensureHasTextKnown lai. Gia mot lan kiem = hash lookup + CountObjects, duoi
+// 1 ms. Worker co the CHO lay khoa o luong nen — luong chinh khong bao gio cho.
+void OcrPanel::armHasTextRetry() {
+    if (!m_hasTextRetry) {
+        m_hasTextRetry = new QTimer(this);
+        m_hasTextRetry->setSingleShot(true);
+        m_hasTextRetry->setInterval(1000);
+        connect(m_hasTextRetry, &QTimer::timeout, this, &OcrPanel::updateStatus);
+    }
+    if (!m_hasTextRetry->isActive()) m_hasTextRetry->start();
 }
 
 void OcrPanel::elideStatus() {

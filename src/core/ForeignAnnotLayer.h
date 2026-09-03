@@ -6,6 +6,10 @@
 
 class ForeignAnnotLayer {
 public:
+    // LOP COMMENT (owner chot 02/09): MOT anh TRONG SUOT co trang, gom MOI chu thich ngoai
+    // cua trang, dung MOT LAN o ti le hien thi (maxPx), chay tren LUONG NEN. Sinh bang cach
+    // render clip dung o TUNG annot (do: ~20.9ms cold / <1ms warm) roi gao nen trang — KHONG
+    // con la "phep tru hai lan render ca trang" (36-41 giay) cua ban cu.
     bool build(FPDF_DOCUMENT doc, int pageIndex, int maxPx);
 
     // Huy tac vu dang chay. MainWindow goi truoc khi dong/giai phong tai lieu de
@@ -31,7 +35,11 @@ public:
     const QImage& regionImage() const { return m_regImg; }
 
 private:
-    // Tinh BBOX hop nhat cua annot ngoai (khong TRUID, khong HIDDEN, khong POPUP, co /AP).
+    // LOC y het mot annot "ngoai": bo TRUID (markup cua app), bo HIDDEN, bo POPUP, chi lay co /AP.
+    // GIA DINH dang GIU s_pdfiumMutex. Dung CHUNG cho computeForeignBbox va build() —
+    // mot nguoi cham loc duy nhat, de lop comment va bbox khong bao gio lech nhau.
+    static bool annotIsForeign(FPDF_ANNOTATION a);
+    // Tinh BBOX hop nhat cua annot ngoai (loc qua annotIsForeign).
     // GIA DINH dang GIU s_pdfiumMutex. Tra false neu khong co annot nao.
     static bool computeForeignBbox(FPDF_PAGE page, FS_RECTF& out);
     // Chuyen FS_RECTF (toa do page, goc trai-duoi) sang QRect (toa do pixel, goc trai-tren).

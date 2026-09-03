@@ -11,10 +11,13 @@ inline bool isOverlayDrawnAnnot(FPDF_ANNOTATION a) {
     if (!FPDFAnnot_HasKey(a, "TRUID")) return false;
     if (FPDFAnnot_GetFlags(a) & FPDF_ANNOT_FLAG_HIDDEN) return false;
     const int sub = FPDFAnnot_GetSubtype(a);
+    // FREETEXT (2026-09-02 FTREAL): FreeText cua ta la annot THAT (khong HIDDEN,
+    // co /AP Identity-H) → overlay ve, nen raster phai an no. FreeText CU co co
+    // HIDDEN → bi chan o dong tren, vat the TRNote cua no van o trong nen.
     return sub == FPDF_ANNOT_INK || sub == FPDF_ANNOT_SQUARE ||
            sub == FPDF_ANNOT_CIRCLE || sub == FPDF_ANNOT_HIGHLIGHT ||
            sub == FPDF_ANNOT_LINE || sub == FPDF_ANNOT_POLYGON ||
-           sub == FPDF_ANNOT_STAMP;
+           sub == FPDF_ANNOT_FREETEXT || sub == FPDF_ANNOT_STAMP;
 }
 
 class OwnAnnotHideGuard {

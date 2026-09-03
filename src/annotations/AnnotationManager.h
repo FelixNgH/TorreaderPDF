@@ -9,9 +9,24 @@
 #include <QImage>
 #include <QHash>
 #include <QSet>
+#include <QMutex>
 #include <atomic>
+#include <QFont>
 #include <fpdfview.h>
 #include <fpdf_annot.h>
+
+class QPainter;
+
+// ── FreeText: MOT cong thuc duy nhat cho ca HAI view ( PdfGpuView +
+// ContinuousView) ───────────────────────────────────────────────────────────
+// Toa do trang cua app anh xa 1 PDF pt = 1 px * zoom (pw = pagePt * zoom), nen
+// chu cung phai theo he nay: pixelSize = fontSizePt * zoom (KHONG phai
+// pointSizeF — no phong len dpi/72 lan). Vi vay hai ham nay dung chung mot font
+// DejaVu (giong /AP) va mot le/wrap — lech la chu nhay khi doi che do.
+QFont trDejaVuFontAtPixelSize(double px);
+QRectF trFreeTextFitRect(const QRectF& dispRect, const QString& text, float fontSizePt);
+void   drawFreeTextOverlay(QPainter& p, const QRectF& dRect, const QString& text,
+                           float fontSizePt, double zoom, const QColor& penColor);
 
 // Flat record for one annotation read from a PDF page.
 struct AnnotInfo {
@@ -69,6 +84,18 @@ struct AnnotVisual {
     QImage   image;
     // ponytail: FreeText/Note are drawn as page objects in renderer, not by overlay
     bool     paintByOverlay = true;
+};
+
+// 🔴 LÁT C 0902 — CẬP NHẬT CÓ CHỌN LỌC (owner: chú thích phải hiện NGAY khi vừa tạo/xoá,
+// không được xếp hàng sau bộ dựng trang). Mỗi lần tạo/xoá, AnnotationManager — vốn ĐANG
+// GIU KHOÁ + đang cầm handle annot — dựng luôn AnnotVisual của đúng chú thích đó (µs,
+// không thêm thời gian giữ khoá đáng kể) và bỏ vào hàng chờ DELTA theo trang. MainWindow
+// trộn delta vào visualsCache thay vì gọi loadPageVisuals (thứ phải chờ 1–2,4 giây sau
+// bộ dựng trang rồi tự ôm khoá thêm 2 giây để phân tích cả trang). Phát lại delta theo
+// thứ tự là idempotent (thay/xoá theo uid) ⇒ cùng một delta áp hai lần không sao.
+struct VisualDelta {
+    AnnotVisual av;        // removed=true: chi dung av.uid de dinh vi
+    bool        removed = false;
 };
 
 // Reads and creates annotations via PDFium.
@@ -173,6 +200,13 @@ public:
     quint32 pageRevision(int page) const { return m_pageRev.value(page, 0); }
     void    bumpPageRevision(int page);
 
+    // ── LÁT C 0902: hàng chờ delta cho đường CẬP NHẬT CÓ CHỌN LỌC ──────────────
+    // Peek (KHONG xoa) — delta chi bi xoá trong loadPageVisuals, luc ay anh cat
+    // da bao tram moi thay doi ghi truoc no.
+    QList<VisualDelta> visualDeltas(int page) const;
+    // Nhap delta tu ngoai vao (AnnotationLayer::annotVisualAdded noi truc tiep vao day).
+    void recordVisualDelta(int page, const AnnotVisual& av);
+
     void stopScan()  { m_stopScan.store(true); }
     void resetScan() { m_stopScan.store(false); }
     bool scanStopped() const { return m_stopScan.load(); }
@@ -224,6 +258,12 @@ private:
                                 const QString& text, const QString& author,
                                 AnnotInfo* outInfo);
 
+    // GIA DINH: ben goi DA giu s_pdfiumMutex va `page` mo — ghi delta Added cho
+    // annot VUA TAO (annot cuoi cung cua trang) bang buildVisual, µs, khong mo trang.
+    void recordCreatedVisual_locked(FPDF_PAGE page, int pageIndex);
+    // GIA DINH: ben goi DA giu s_pdfiumMutex va `page` mo — doc uid cua annot truoc
+    // khi xoá (xoá xong la khong doc duoc nua).
+    QString annotUid_locked(FPDF_PAGE page, int index);
     // GIA DINH: ben goi DA giu s_pdfiumMutex. Khong duoc tu khoa.
     void flushGenerate_locked(int pageIndex);
     // GIA DINH: ben goi DA giu s_pdfiumMutex.
@@ -241,6 +281,12 @@ private:
     // duong loadPage (chi khi outOk!=nullptr = duong GUI). >= 3 lan thi CHO THAT
     // (khoa blocking) de dut diem, khong hen lai nhap nhay mai. Reset khi lay duoc khoa.
     QHash<int,int> m_loadPageRetry;
+
+    // LÁT C 0902: delta cho duong cap nhat co chon loc. m_deltaMutex CHI bao ve
+    // m_visualDeltas — KHONG BAO GIO lay s_pdfiumMutex khi dang giu no (thuat toan
+    // kho: s_pdfiumMutex → m_deltaMutex mot chieu).
+    QHash<int, QList<VisualDelta>> m_visualDeltas;
+    mutable QMutex m_deltaMutex;
 
     FPDF_DOCUMENT m_doc     = nullptr;
     QString       m_path;

@@ -5,6 +5,7 @@
 #include <QTextEdit>
 #include <QLineEdit>
 #include <QDialogButtonBox>
+#include "KeylogProbe.h"
 
 NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent, bool singleLine)
     : QDialog(parent), m_singleLine(singleLine) {
@@ -28,6 +29,7 @@ NoteInputDialog::NoteInputDialog(const QString& initialText, QWidget* parent, bo
     if (singleLine) {
         m_lineEdit = new QLineEdit;
         m_lineEdit->setText(initialText);
+        installKeylogProbe(m_lineEdit);   // 0903: bat loi go tieng Viet (TORREADER_KEYLOG=1)
         m_lineEdit->setMinimumWidth(280);
         layout->addWidget(m_lineEdit);
         m_lineEdit->setFocus();

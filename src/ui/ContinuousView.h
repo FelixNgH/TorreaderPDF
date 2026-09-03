@@ -31,8 +31,20 @@ public:
     ~ContinuousView() override;
 
     // Attach a document + renderer. Pass nullptr to clear.
-    void setDocument(PdfDocument* doc, PdfRenderer* renderer);
+    // LÁT A 09/02: `visualsSrc` là KHO CHÚ THÍCH DUY NHẤT theo tài liệu
+    // (DocTab::visualsCache) — view ĐỌC, không sở hữu, không tự xoá.
+    // LÁT B 09/02: `vecStore` là KHO LỚP VECTOR DUY NHẤT theo tài liệu
+    // (DocTab::vecLayers) — view đọc/ghi qua con trỏ, KHÔNG sở hữu, KHÔNG tự xoá.
+    void setDocument(PdfDocument* doc, PdfRenderer* renderer,
+                     const QHash<int, QList<AnnotVisual>>* visualsSrc = nullptr,
+                     QHash<int, std::shared_ptr<VectorLayer>>* vecStore = nullptr);
     void clearDocument();
+    // LÁT B 09/02: repoint kho lớp vector (DocTab::vecLayers cua tab hien hanh). Goi moi
+    // lan doi/dong tab de con tro khong bao gio tro vao tai lieu da giai phong. Null -> ve
+    // kho trong cua rieng view (khong bao gio giu du lieu that).
+    void setVectorStore(QHash<int, std::shared_ptr<VectorLayer>>* store) {
+        m_vecStore = store ? store : &m_vecStoreEmpty;
+    }
 
     // Khoa cache .torvec, MainWindow day sang (ContinuousView khong tu biet duong dan goc).
     void setVectorCacheKey(const QString& keyPath, quint64 keyHash);
@@ -83,6 +95,9 @@ public:
     // ⇒ Dat lenh THANG cho dung trang do.
     void datLaiLenhVeTrang(int page);
     void setAnnotVisualsForPage(int page, const QList<AnnotVisual>& visuals);
+    // LÁT A 09/02: repoint kho doc duoc duy nhat (DocTab::visualsCache cua tab hien hanh).
+    // Goi moi lan doi/dong tab de con tro khong bao gio tro vao tai lieu da giai phong.
+    void setVisualsStore(const QHash<int, QList<AnnotVisual>>* src) { m_visualsSrc = src; }
     void setPageLowRes(int pageIndex, const QImage& img);
     // Bai do bo nho: dung luong 2 kho anh cua Continuous
     qint64 bytesPageImages() const {
@@ -102,13 +117,13 @@ public:
     // ── Lop bu annot phan mem khac (lam giong Single/PdfGpuView) ─────────────
     // MainWindow day lop bu da build (ForeignAnnotLayer) xuong theo tung trang.
     // ContinuousView ve lop nay DE LEN lop vector ngay sau endNativePainting.
-    // Giu TOI DA 3 trang, evict theo khoang cach toi trang chinh (giong m_vecLayers).
+    // Giu TOI DA 3 trang, evict theo khoang cach toi trang chinh (giong m_vecStore).
     // Truyen nullptr de xoa lop cua trang.
     void setForeignAnnotLayer(int page, std::shared_ptr<ForeignAnnotLayer> layer);
     // Trang da co noi dung de ve (lop vector san sang HOAC da co anh raster)?
     // C3: lop bu chi dung SAU KHI trang hien ra roi, tranh chan hien thi trang nang.
     bool pageHasContent(int page) const;
-    // Trang DANG ve bang lop vector (m_vecLayers san san + not rasterOnly)? C3 / 30-08:
+    // Trang DANG ve bang lop vector (m_vecStore san san + not rasterOnly)? C3 / 30-08:
     // lop bu chi can khi NEN la vector (lop nay khong chua annotation). Nen raster da
     // nung san annotation nen khong can lop bu.
     bool pageHasVector(int page) const;
@@ -194,9 +209,13 @@ private:
      static constexpr qint64 kVectorGraceMs = 400;
      // Radius (in pages) around center to keep vector layers/builds active.
      static constexpr int    kKeepRadius    = 1;
-     // Trang nang phai DUNG MOI vai giay moi hien lai — noi long ban kinh giu lop
-     // vector (Viec C 2026-08-30): cuon di 2-3 trang roi quay lai khong phai xay lai.
-     static constexpr int    kHeavyKeepRadius = 3;
+      // Trang nang phai DUNG MOI vai giay moi hien lai — noi long ban kinh giu lop
+      // vector (Viec C 2026-08-30): cuon di 2-3 trang roi quay lai khong phai xay lai.
+      static constexpr int    kHeavyKeepRadius = 3;
+      // 🔴 SUA 02/09/2026 — tran so lop bu foreign giu dong thoi. Moi lop la mot anh
+      // ARGB32 ca trang (long side ≤ 4000px ⇒ toi da ~45 MB/lop, thuong 10-25 MB).
+      // 6 lop ≈ toi da ~270 MB. Khong bao gio giu vo han (bai hoc RAM 6,2 GB).
+      static constexpr int    kFgnMaxLayers = 6;
      // Object-count threshold above which a page is "heavy": raster can never finish
      // (2,5 trieu path), so rasterOnly is bypassed and the vector layer stays allowed.
      static constexpr int    kHeavyObjectThreshold = 400000;
@@ -392,8 +411,10 @@ private:
     QTimer* m_vecBuildTimer = nullptr;
     void buildPrimaryVectorLayer();
 
-    // ── Annotation overlay visuals (per page) ─────────────────────────────
-    QHash<int, QList<AnnotVisual>> m_pageAnnotVisuals;
+    // ── Annotation overlay visuals (LÁT A 09/02) ──────────────────────────────
+    // Con trỏ KHÔNG SỞ HỮU tới kho duy nhất theo tài liệu (DocTab::visualsCache).
+    // Hai view (Single + Continuous) cùng đọc một kho ⇒ không còn lệch bản chép.
+    const QHash<int, QList<AnnotVisual>>* m_visualsSrc = nullptr;
 
     // Cache trang xoay (de khong phai khoa PDFium o main thread).
     QHash<int, int> m_pageRot;
@@ -403,12 +424,19 @@ private:
     int  m_highlightCurrentPage = -1;  // trang chua ket qua dang chon
     int  m_highlightCurrentIdx  = -1;  // chi so trong list cua trang do
 
-QHash<int, std::shared_ptr<VectorLayer>> m_vecLayers;
-     // Lop bu foreign annot theo trang (C1): moi lop la mot ANH LON, chi giu quanh
-     // trang chinh (evict trong ensureVectorLayers, cung cho voi m_vecLayers).
-     QHash<int, std::shared_ptr<ForeignAnnotLayer>> m_fgnLayers;
-     // Evict lop bu ngoai ban kinh kKeepRadius quanh trang chinh (loi goi chung tu
-     // setForeignAnnotLayer va ensureVectorLayers).
+     // LÁT B 09/02: CON TRỎ KHÔNG SỞ HỮU tới kho lớp vector duy nhất theo tài liệu
+     // (DocTab::vecLayers). View DÙNG CHUNG giữa các tab -> repoint khi đổi tab. Không
+     // bao giờ clear() qua con trỏ này (sẽ xoá dữ liệu của tab). m_vecStoreEmpty là kho
+     // TRONG cua riêng view, chi dung khi chua gan tab nao (khong giu du lieu that), de
+     // cac duong ve khong bao gio null-deref.
+     QHash<int, std::shared_ptr<VectorLayer>>  m_vecStoreEmpty;
+     QHash<int, std::shared_ptr<VectorLayer>>* m_vecStore = &m_vecStoreEmpty;
+      // Lop bu foreign annot theo trang (C1): moi lop la mot ANH LON, co tran cung
+      // kFgnMaxLayers va vung dem quanh tam nhin that (khong dung ban kinh tam).
+      QHash<int, std::shared_ptr<ForeignAnnotLayer>> m_fgnLayers;
+      // Evict theo tam nhin that (02/09/2026): khong duoi trang dang hien thi, giu
+      // vung dem 1 viewport, duoi xa-nhat-truoc den khi ≤ tran. (Loi goi chung tu
+      // setForeignAnnotLayer va ensureVectorLayers).
      void evictForeignLayers();
      QSet<int>                                m_vecBuilding;
      QThreadPool                              m_vecPool;
@@ -425,6 +453,11 @@ QHash<int, std::shared_ptr<VectorLayer>> m_vecLayers;
     // khong phu thuoc MainWindow co goi setVectorAnnotSafe dung luc hay khong.
     bool trangCanRaster(int pg) const;
     bool rasterOnlyApplies(int pg) const;
+    // CAU TRUC — co nen dung/xdp lop vector cho trang nay khong? CHI chan khi env raster
+    // thuan hoac trang nang bi ep raster. KHONG nhuc den chu thich: lop vector la NEN,
+    // phai dung duoc cho ca trang co comment (comment do lop khac ve de len). Dung cho
+    // ensureVectorLayers (1220) va pageHasVector (1521) — de trang comment khong ket raster.
+    bool vectorBuildBlocked(int pg) const;
      static bool contRasterOnlyEnv();   // TORREADER_CONT_RASTER=1 -> Continuous raster thuan
 
 VectorGpuRenderer m_vgr;

@@ -59,6 +59,9 @@ extern QMutex s_pdfiumMutex;
 #ifdef _WIN32
 #include <psapi.h>
 #endif
+#ifdef Q_OS_WIN
+#include "core/VkPacketInputFilter.h"
+#endif
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QDir>
@@ -175,6 +178,12 @@ int main(int argc, char* argv[]) {
     app.setApplicationVersion(FELIXPDF_VERSION);
     app.setOrganizationName("Loc Nguyen Huy");
     app.setOrganizationDomain("torreader.cloud");
+
+#ifdef Q_OS_WIN
+    // 0903: Go tieng Viet UniKey (VK_PACKET) mat ky tu >255 — xem core/VkPacketInputFilter.h
+    static VkPacketInputFilter g_vkPacketFilter;
+    app.installNativeEventFilter(&g_vkPacketFilter);
+#endif
 
     // Do-luong: bat cac lan luong chinh bi chan > nguong. Chi bat khi co bien moi truong.
     if (!qEnvironmentVariableIsEmpty("TORREADER_STALL_WATCH")) {
@@ -3173,6 +3182,138 @@ int main(int argc, char* argv[]) {
             // Handle muon tu PageCache — KHONG FPDF_ClosePage (PdfDocument::close se
             // goi PageCache::forgetDocument khi doc ra khoi pham vi).
         }
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // ── Annot-ROI render bench (do chi phí render RIENG o tung chu thich) ──────
+    // usage: TorReader.exe --annotroi-bench <pdf_path> <page_0based>
+    // Cauthoi song con: tren trang nang, render mot o nho (clip dung ROI) co RE
+    // hon render ca trang khong, hay PDFium van duyet toan bo object nen van dat?
+    // Day la bai do DOC LAP — khong dung bat ky duong ve nao cua app.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotroi-bench")) {
+        const QString pdfPath = QString::fromLocal8Bit(argv[2]);
+        const int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        const double scale = 2.0;   // px/pt — ti le CHUNG cho ca ROI va ca trang
+        const int margin = 4;       // px le quanh o chu thich
+        QTextStream out(stdout);
+
+        PdfDocument::libAddRef();
+        FPDF_DOCUMENT doc = nullptr;
+        { QMutexLocker lock(&s_pdfiumMutex);
+          doc = FPDF_LoadDocument(pdfPath.toUtf8().constData(), nullptr); }
+        if (!doc) {
+            out << "[roibench] FAIL cannot open " << pdfPath << "\n"; out.flush();
+            PdfDocument::libRelease(); return 1;
+        }
+        FPDF_PAGE page = nullptr;
+        double pageW = 0, pageH = 0;
+        int nAnnot = 0;
+        { QMutexLocker lock(&s_pdfiumMutex);
+          if (pageIndex < 0 || pageIndex >= FPDF_GetPageCount(doc)) {
+              out << "[roibench] FAIL page " << pageIndex << " out of range\n"; out.flush();
+              FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+          }
+          page = FPDF_LoadPage(doc, pageIndex);
+          if (page) {
+              pageW = FPDF_GetPageWidth(page);
+              pageH = FPDF_GetPageHeight(page);
+              nAnnot = FPDFPage_GetAnnotCount(page);
+          }
+        }
+        if (!page) {
+            out << "[roibench] FAIL cannot load page " << pageIndex << "\n"; out.flush();
+            FPDF_CloseDocument(doc); PdfDocument::libRelease(); return 1;
+        }
+        out << "[roibench] file=" << pdfPath << " page=" << pageIndex
+            << " size=" << QString::number(pageW, 'f', 1) << "x" << QString::number(pageH, 'f', 1)
+            << "pt scale=" << QString::number(scale, 'f', 1) << "px/pt annots=" << nAnnot << "\n";
+        out.flush();
+
+        auto subtypeName = [](int t) -> QString {
+            switch (t) {
+            case FPDF_ANNOT_FREETEXT: return "FreeText";
+            case FPDF_ANNOT_SQUARE: return "Square";
+            case FPDF_ANNOT_CIRCLE: return "Circle";
+            case FPDF_ANNOT_LINE: return "Line";
+            case FPDF_ANNOT_INK: return "Ink";
+            case FPDF_ANNOT_STAMP: return "Stamp";
+            case FPDF_ANNOT_HIGHLIGHT: return "Highlight";
+            case FPDF_ANNOT_UNDERLINE: return "Underline";
+            case FPDF_ANNOT_STRIKEOUT: return "StrikeOut";
+            case FPDF_ANNOT_SQUIGGLY: return "Squiggly";
+            case FPDF_ANNOT_TEXT: return "Text";
+            case FPDF_ANNOT_LINK: return "Link";
+            case FPDF_ANNOT_POLYGON: return "Polygon";
+            case FPDF_ANNOT_POLYLINE: return "PolyLine";
+            case FPDF_ANNOT_CARET: return "Caret";
+            default: return "(" + QString::number(t) + ")";
+            }
+        };
+
+        qint64 totalMs = 0, slowestMs = 0; int measured = 0;
+        for (int i = 0; i < nAnnot; ++i) {
+            FS_RECTF r{0, 0, 0, 0};
+            int sub = FPDF_ANNOT_UNKNOWN;
+            bool ok = false;
+            { QMutexLocker lock(&s_pdfiumMutex);
+              FPDF_ANNOTATION a = FPDFPage_GetAnnot(page, i);
+              if (a) {
+                  sub = FPDFAnnot_GetSubtype(a);
+                  ok = (FPDFAnnot_GetRect(a, &r) != 0);
+                  FPDFPage_CloseAnnot(a);
+              } }
+            const double rw = r.right - r.left, rh = r.top - r.bottom;
+            if (!ok || rw <= 0 || rh <= 0) {
+                out << "[roibench] annot i=" << i << " subtype=" << subtypeName(sub)
+                    << " rect=INVALID px=0x0 ms=0\n"; out.flush();
+                continue;
+            }
+            const int bw = qMax(1, (int)(rw * scale)) + 2 * margin;
+            const int bh = qMax(1, (int)(rh * scale)) + 2 * margin;
+            // PDF user space (y-up) -> device (y-down): a=s, d=-s,
+            // e=margin - s*left, f=margin + s*top => goc (left,top) roi vao (margin,margin).
+            FS_MATRIX m{ (float)scale, 0.f, 0.f, (float)-scale,
+                         (float)(margin - scale * r.left), (float)(margin + scale * r.top) };
+            FS_RECTF clip{ 0.f, 0.f, (float)bw, (float)bh };
+            qint64 ms = 0;
+            { QMutexLocker lock(&s_pdfiumMutex);
+              QImage img(bw, bh, QImage::Format_ARGB32); img.fill(Qt::white);
+              FPDF_BITMAP bmp = FPDFBitmap_CreateEx(bw, bh, FPDFBitmap_BGRA,
+                                                    img.bits(), img.bytesPerLine());
+              QElapsedTimer t; t.start();
+              if (bmp) FPDF_RenderPageBitmapWithMatrix(bmp, page, &m, &clip, FPDF_ANNOT);
+              ms = t.elapsed();
+              if (bmp) FPDFBitmap_Destroy(bmp); }
+            out << "[roibench] annot i=" << i << " subtype=" << subtypeName(sub)
+                << " rect=" << (int)rw << "x" << (int)rh
+                << " px=" << bw << "x" << bh << " ms=" << ms << "\n"; out.flush();
+            totalMs += ms; ++measured; if (ms > slowestMs) slowestMs = ms;
+        }
+        const double avgMs = measured ? (double)totalMs / measured : 0.0;
+        out << "[roibench] TONG " << nAnnot << " annot: tong ms=" << totalMs
+            << "  trung binh=" << QString::number(avgMs, 'f', 1)
+            << "  lau nhat=" << slowestMs << "\n"; out.flush();
+
+        // MOC: render CA TRANG cung ti le (cung flags) de so sanh.
+        {
+            const int fw = qMax(1, (int)(pageW * scale)), fh = qMax(1, (int)(pageH * scale));
+            FS_MATRIX fm{ (float)scale, 0.f, 0.f, (float)-scale, 0.f, (float)(scale * pageH) };
+            FS_RECTF fc{ 0.f, 0.f, (float)fw, (float)fh };
+            qint64 ms = 0;
+            { QMutexLocker lock(&s_pdfiumMutex);
+              QImage img(fw, fh, QImage::Format_ARGB32); img.fill(Qt::white);
+              FPDF_BITMAP bmp = FPDFBitmap_CreateEx(fw, fh, FPDFBitmap_BGRA,
+                                                    img.bits(), img.bytesPerLine());
+              QElapsedTimer t; t.start();
+              if (bmp) FPDF_RenderPageBitmapWithMatrix(bmp, page, &fm, &fc, FPDF_ANNOT);
+              ms = t.elapsed();
+              if (bmp) FPDFBitmap_Destroy(bmp); }
+            out << "[roibench] MOC: render CA TRANG cung ti le: ms=" << ms
+                << " (" << fw << "x" << fh << "px)\n"; out.flush();
+        }
+
+        { QMutexLocker lock(&s_pdfiumMutex); FPDF_ClosePage(page); FPDF_CloseDocument(doc); }
         PdfDocument::libRelease();
         return 0;
     }

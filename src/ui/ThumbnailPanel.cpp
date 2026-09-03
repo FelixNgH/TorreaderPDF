@@ -319,7 +319,14 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         // Select tren toolbar (id 10) — KHONG dua id 10 vao luoi nay nua.
         const ToolDef tools[] = {
             {"Pick", 0}, {"Line", 2}, {"Arrow", 3}, {"Rect", 4},
-            {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7}, {"Note", 1},
+            // 🔴 0903 owner chot: BO nut "Note" (id 1) khoi bang cong cu.
+            // Ly do: Note cua app KHONG phai annotation that — no chen VAT THE vao
+            // noi dung trang (`TRNote`) roi dat annot thanh HIDDEN, nen dinh chat vao
+            // bo dung trang va la goc cua loat loi 02-03/09. Text da duoc viet lai
+            // thanh FreeText THAT nen thay duoc vai tro ghi chu.
+            // ⚠️ CHI bo NUT TAO. Duong DOC/HIEN Note cu trong file khach GIU NGUYEN —
+            //    khong duoc lam hong tai lieu da luu.
+            {"Ellipse", 5}, {"Cloud", 6}, {"Text", 7},
             {"Freehand", 8}, {"Highlight", 9}
         };
         int r = 0, c = 0;
@@ -341,7 +348,7 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         cpLay->addWidget(toolWrap);
         // Insert Image (SPEC_INSERT_IMAGE_2026-08-30): mot nut Insert kich hoat
         // hộp chon anh (PNG trong suot duoc uu tien). Khong phai ViewTool.
-        auto* insertBtn = new QPushButton(QStringLiteral("📷 Insert Image"));
+        auto* insertBtn = new QPushButton(QStringLiteral("📷 Image"));   // 0903: vao luoi, nhan ngan cho vua nua o
         insertBtn->setObjectName(QStringLiteral("insertImageTool"));
         insertBtn->setFixedHeight(24);
         QString insertTip;
@@ -352,7 +359,9 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
                 .arg(m_dark ? darkHC().bgAlt : lightHC().bgAlt)
                 .arg(m_dark ? darkHC().border : lightHC().border));
         connect(insertBtn, &QPushButton::clicked, this, [this]{ emit insertImageRequested(); });
-        cpLay->addWidget(insertBtn);
+        // 🔴 0903 owner chot: dua Insert Image VAO LUOI lam o thu 10, dap cho
+        // trong cua Note vua bo => 9 + 1 = 10 nut = dung 5 hang x 2 cot, het o le.
+        tgl->addWidget(insertBtn, r, c);
         auto* propWrap = new QWidget;
         auto* pgl = new QGridLayout(propWrap);
         pgl->setContentsMargins(0, 2, 0, 2);
@@ -373,6 +382,12 @@ ThumbnailPanel::ThumbnailPanel(QWidget* parent) : QWidget(parent) {
         pgl->addWidget(fillOpacityCombo, 0, 3);
         cpLay->addWidget(propWrap);
         auto emitStyle = [this]{ emit annotStyleChanged(m_annColor, m_annWidth, m_annFill, m_annFillOpacity, m_annFontSize); };
+        // 🔴 0903: HAI NGUON CHAN LY cho co chu. ThumbnailPanel::m_annFontSize mac dinh 24
+        // (dung o combo owner nhin thay), con AnnotStyle::fontSize ben MainWindow mac dinh 11.
+        // annotStyleChanged CHI phat khi owner DOI combo — khong doi thi MainWindow giu 11
+        // => thanh cong cu ghi 24 ma chu thich tao ra dung 11 (o zoom 53% = 5,8 px, nhoe thanh vet).
+        // Phat MOT LAN ngay sau khi dung xong widget de hai ben khop tu dau.
+        QMetaObject::invokeMethod(this, emitStyle, Qt::QueuedConnection);
         connect(m_sizeCombo, &QComboBox::currentIndexChanged, this, [this, emitStyle](int i){
             if (i < 0) return;
             if (m_sizeIsFont) {

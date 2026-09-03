@@ -9,6 +9,7 @@ class QPushButton;
 class QComboBox;
 class QProgressBar;
 class QResizeEvent;
+class QTimer;
 class PdfDocument;
 
 // Bo nho dem "trang co chu hay khong" theo (doc, pageIndex). SPEC_PERF_DESK_ABOUT:
@@ -68,6 +69,9 @@ private:
     // Dam bao bo dem "trang co chu" da co gia tri cho trang hien tai (kiem o
     // LUONG NEN qua QtConcurrent — SPEC_PERF_HEAVYPAGE, xem OcrPanel.cpp).
     void ensureHasTextKnown();
+    // Worker tri hoan (trang chua trong PageCache / nang chua co text page) →
+    // bo mot lan single-shot 1 giay sau kiem lai, an ke khi cho khac da nap.
+    void armHasTextRetry();
 
 protected:
     void resizeEvent(QResizeEvent* e) override;
@@ -83,6 +87,7 @@ private:
     bool         m_dark        = false;
     QHash<int,int> m_wordsByPage;         // page -> so tu OCR
     QSet<int>      m_hasTextChecking;     // trang dang kiem "co chu" o luong nen
+    QTimer*        m_hasTextRetry = nullptr;  // don retry "co chu" khi worker tri hoan
 
     QLabel*       m_status      = nullptr;
     QString       m_statusFull;           // chu day du truoc khi elide

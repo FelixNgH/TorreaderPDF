@@ -4,6 +4,7 @@
 #include <QOpenGLShaderProgram>
 #include <QOpenGLVertexArrayObject>
 #include <QOpenGLBuffer>
+#include <QOpenGLFramebufferObject>
 #include <QImage>
 #include <QPointF>
 #include <QList>
@@ -88,6 +89,9 @@ public:
     void clearHighlights();
 
     void setVectorAnnotSafe(int page, bool safe);  // xem PdfGpuView.cpp: bat bien nen-vector
+    // LÁT A 09/02: Single view ĐỌC kho chú thích duy nhất theo tài liệu
+    // (DocTab::visualsCache) — không còn giữ bản chép riêng nữa.
+    void setVisualsStore(const QHash<int, QList<AnnotVisual>>* src) { m_visualsSrc = src; }
     void setAnnotVisuals(const QList<AnnotVisual>& visuals);
     void clearAnnotVisuals();
     void addPendingMarkup(AnnotTool tool, const AnnotStyle& style, QPointF a, QPointF b, const QVector<QPointF>& freehand = {});
@@ -102,6 +106,10 @@ public:
                        float fontSizePt, const QColor& ghostColor);
     void clearDragTarget();
     void setVectorLayer(std::shared_ptr<VectorLayer> layer);
+    // LÁT B 09/02: Single view ĐỌC kho lớp vector duy nhất theo tài liệu (DocTab::vecLayers).
+    // setVectorLayer() giu nguyen chu ky nhung chi con la lenh "ve lai tu kho" — khong con
+    // nhan ban chep. View per-tab -> gan &tab->vecLayers luc tao, chet cung tab.
+    void setVectorStore(const QHash<int, std::shared_ptr<VectorLayer>>* src) { m_vecSrc = src; }
     void setForeignAnnotLayer(std::shared_ptr<ForeignAnnotLayer> layer);
     void setForeignAnnotRegion(int page, double scale, QRect regionPx, const QImage& img);
     void setDragNote(const QRectF& rPt);
@@ -127,6 +135,10 @@ public:
     ViewTool tool()        const { return m_tool; }
     ViewMode viewMode()    const { return m_viewMode; }
     bool     hasImage()    const { return m_hasImage && !m_loading; }
+    // W1 (01/09): NGUON THAT duy nhat cho "co tai lieu dang mo". KHONG hoi anh raster.
+    // Cung nguon con tro tai lieu ma ContinuousView dung (m_doc -> m_pageCount):
+    // moi tab tai lieu duoc setLinksDocument() luc tao (MainWindow.cpp:3683).
+    bool     hasDocument() const;
 
     QPointF widgetToPdf(const QPointF& wp) const;
     QPointF pdfToWidget(const QPointF& pp) const;
@@ -220,6 +232,9 @@ private:
     int     m_uBgColor    = -1;
 
     // Vector overlay GL resources
+    // LÁT B 09/02: m_vecLayer la lop CUA TRANG DANG HIEN, luon duoc giai tu kho chung
+    // m_vecSrc (= &DocTab::vecLayers, doc, khong so huu) — khong con la ban chep doc lap.
+    const QHash<int, std::shared_ptr<VectorLayer>>* m_vecSrc = nullptr;
     std::shared_ptr<VectorLayer> m_vecLayer;
     std::shared_ptr<ForeignAnnotLayer> m_fgnLayer;
     int    m_fgnRegPage  = -1;
@@ -228,6 +243,11 @@ private:
     QImage m_fgnRegImg;
     GLuint  m_vecVao = 0, m_vecVboPos = 0, m_vecVboCol = 0, m_vecVboQuad = 0, m_vecVboWidth = 0, m_vecVboDepth = 0, m_vecVboClip = 0;
     int     m_vecUploadedPage = -1;
+    // SSAA cho lop vector (xem PdfGpuView::drawVectorOverlay): FBO chua anh trang
+    // ve o kSS lan, blit LINEAR xuong man hinh de giu net mong hon 1px.
+    QOpenGLFramebufferObject* m_ssFbo = nullptr;
+    QSize m_ssFboSize;
+    int     m_ssFboLastW = -1, m_ssFboLastH = -1;   // viewport cua lan ve gan nhat
     QOpenGLShaderProgram* m_vecProg = nullptr;
     int     m_vecMvpLoc = -1;
     int     m_vecViewportLoc = -1;
@@ -244,11 +264,17 @@ private:
     quint64 m_tileTexUid = 0;   // uid cua VectorLayer da nap texture — doi lop la phai cap lai
     GLuint m_tileVao = 0;
     bool    shouldUseVectorOverlay() const;
+    // Mau nen ban cua GL clear — dung chung cho cho xoa nen truoc khi ve chu (W3).
+    QColor  deskBgColor() const { return m_darkMode ? QColor(30, 30, 30) : QColor(80, 80, 80); }
     // "Trang co noi dung de thao tac" — KHONG dong nghia voi "co anh raster".
     // Trang thuan vector (R2 + cache .torvec) co noi dung day du ma m_hasImage van false.
     // Dung cho cac CONG TUONG TAC (chuot, cong cu ve, chon chu, link).
     // KHONG dung cho cho nao thuc su doc m_lastImage / m_texture.
     bool hasPageContent() const { return m_hasImage || shouldUseVectorOverlay(); }
+    // W1 (01/09): "CO THU DE VE" = raster HOAC lop vector HOAC anh net (sharp region).
+    // La dich den cho cac dieu kien hien thi dang hoi thang m_hasImage (xem
+    // REPORT_WELCOME_0901.md muc 4 — danh sach 17 cho chuyen dan, KHONG doi loat).
+    bool hasVisibleContent() const { return hasPageContent() || !m_sharpImage.isNull(); }
     // R3: ve lop vector hien tai ra anh co thumbnail bang GPU (KHONG dung PDFium).
     // Tra QImage rong neu chua co lop vector day du cho trang hien tai.
     // 🔴 PHAI goi tren LUONG GIAO DIEN — can GL context cua widget.
@@ -377,7 +403,8 @@ private:
     int     m_pendingPartPage  = -1;
 
     // Overlays (drawn via QPainter on top of GL)
-    QList<AnnotVisual>      m_annotVisuals;
+    // LÁT A 09/02: con trỏ KHÔNG SỞ HỮU — kho duy nhất DocTab::visualsCache (per page).
+    const QHash<int, QList<AnnotVisual>>* m_visualsSrc = nullptr;
     QHash<int, bool>        m_vecAnnotSafe;   // trang -> nen vector co nuot markup khong
     QList<QRectF>           m_highlights;
     int                     m_currentHighlightIdx = -1;

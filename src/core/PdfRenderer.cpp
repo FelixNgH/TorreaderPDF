@@ -149,8 +149,17 @@ void PageRenderTask::run() {
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_req.pageIndex, w, h);
         if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_req.pageIndex, pdfBoxOrigin(page));
 
+        // V1b 0901: biet so object TRUOC khi chon tran. Lenh emit pageObjectCount o cuoi
+        // chi chay SAU khi ve xong => trang ve 4000px khong bao gio xong => tran mai la 4000
+        // => long khoa chan-ga-quay. Do ngay luc vua co page (chi doc danh sach object, re).
+        { QElapsedTimer ct; ct.start();
+          const int nObj = FPDFPage_CountObjects(page);
+          m_renderer->setPageObjectCount(m_req.pageIndex, nObj);
+          qDebug() << "[heavycap] pre-count page=" << m_req.pageIndex << "objects=" << nObj
+                   << "ms=" << ct.elapsed(); }
+
         double longSide = qMax(w, h);
-        double maxPx = m_req.fullQuality ? PdfRenderer::kFullRenderMaxPx
+        double maxPx = m_req.fullQuality ? m_renderer->fullQCapPx(m_req.pageIndex, longSide)
             : qMin(m_req.scaleFactor * longSide, PdfRenderer::kThumbMaxPx);
         double scale = maxPx / qMax(longSide, 1.0);
         int imgW = qMax(1, static_cast<int>(w * scale));
@@ -295,15 +304,23 @@ void ProgressiveRenderTask::run() {
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_req.pageIndex, w, h);
         if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_req.pageIndex, pdfBoxOrigin(poolPage));
 
+        // V1b 0901: do so object TRUOC khi chon tran (xem PageRenderTask::run — cùng một lỗi
+        // long-khoa: emit cuoi chi chay khi ve xong, trang 4000px khong bao gio xong).
+        { QElapsedTimer ct; ct.start();
+          const int nObj = FPDFPage_CountObjects(poolPage);
+          m_renderer->setPageObjectCount(m_req.pageIndex, nObj);
+          qDebug() << "[heavycap] pre-count page=" << m_req.pageIndex << "objects=" << nObj
+                   << "ms=" << ct.elapsed(); }
+
         double longSide = qMax(w, h);
         double maxPx;
         if (m_req.fullQuality && m_req.useZoomScale) {
-            maxPx = PdfRenderer::kFullRenderMaxPx;
+            maxPx = m_renderer->fullQCapPx(m_req.pageIndex, longSide);
             qDebug().noquote() << "[dem] page=" << m_req.pageIndex << "render DAY DU"
                                << int(maxPx) << "px (hien thi thu nho ve"
                                << PdfRenderer::contDpi() << "DPI)";
         } else if (m_req.fullQuality) {
-            maxPx = PdfRenderer::kFullRenderMaxPx;
+            maxPx = m_renderer->fullQCapPx(m_req.pageIndex, longSide);
         } else {
             maxPx = qMin(m_req.scaleFactor * longSide, PdfRenderer::kThumbMaxPx);
         }
@@ -411,33 +428,28 @@ void ProgressiveRenderTask::run() {
         return;
     }
 
-    // VIỆC B: Pool rỗi — dùng đường cũ (s_pdfiumMutex)
+    // VIỆC B: Pool rỗi — dùng đường cũ (s_pdfiumMutex), NHA KHOA giua cac lat.
     //
-    // 🔴🔴 VA CHONG SAP 2026-09-01.
-    // Duong nay NHA KHOA giua cac lat ve. Voi trang vua sua chu thich, no phai ve tu TAI LIEU
-    // CHINH (ban sao chua co chu thich) — nen trong khe ho do luong giao dien co the sua chinh
-    // tai lieu dang duoc ve dang do. Ket qua: PDFium tu bung loi (0x80000003) roi hong heap
-    // (0xc0000374) — da thay trong Event Log cua may owner.
-    // ⇒ Voi trang "ban" ma KHONG NANG: giu khoa SUOT mot luot ve, khong nha giua chung.
-    // ⚠️ Chi lam cho trang nhe. Trang quai vat ma giu khoa ca luot thi giao dien DUNG HINH —
-    //    dieu owner cam tuyet doi. Trang nang giu nguyen hanh vi cu (van co nguy co, nhung hiem
-    //    khi ai them chu thich vao trang quai vat, va dung hinh la loi nang hon).
-    const int soObj = m_renderer->pageObjectCount(m_req.pageIndex);
-    // ⚠️ soObj == 0 nghia la CHUA BIET (chua render lan nao) — ngay sau khi sua chu thich thi
-    // thuong roi vao truong hop nay. Coi "chua biet" la NHE: da do, dieu kien cu lam ban va
-    // KHONG BAO GIO kich hoat (0 lan). Chi bo qua khi BIET CHAC la trang nang.
-    const bool bietChacNang = (soObj >= 200000);
-    const bool giuKhoaSuot = m_renderer->pageAnnotDirty(m_req.pageIndex) && !bietChacNang;
-    std::unique_ptr<TimedMutexLocker> khoaSuot;
-    if (giuKhoaSuot) {
-        qDebug().noquote() << "[lock] page=" << m_req.pageIndex
-                           << "GIU KHOA suot luot ve (trang vua sua chu thich, objects=" << soObj << ")";
-        khoaSuot = std::make_unique<TimedMutexLocker>(s_pdfiumMutex, "ProgressiveRenderTask::GiuSuot");
-    }
+    // 🔴 0902 — BO GIU KHOA SUOT ("ProgressiveRenderTask::GiuSuot" 0901): no om
+    // s_pdfiumMutex 2,7-2,9 gi moi luot ve trang vua sua chu thich; luong giao dien
+    // xin khoa kieu chan o MainWindow:1835 bi chan theo thanh 7,1 gi, chu thich xep
+    // hang khong hien (log 02/09). Chot bao ve chu thich lai giết hien thi chu thich.
+    // 🔴🔴 VAN GIU YEU CAU CUA VA CHONG SAP 2026-09-01: sau khi nha khoa, luong giao
+    // dien co the sua tai lieu ngay giua hai lat ⇒ tiep tuc FPDF_RenderPage_Continue
+    // tren trang da bi sua sinh PDFium tu bung loi (0x80000003) hong heap (0xc0000374).
+    // ⇒ Tinh nhat quan gi bang THE HE ANNOT, khong bang khoa doc quyen: moi luot
+    //   them/xoa/sua chu thich tang PageCache::annotGeneration DUNG TRONG LUC no giu
+    //   s_pdfiumMutex (bumpAnnotGeneration — xem AnnotationManager.cpp). Kiem tra the
+    //   he DUOI KHOA truoc moi lat nen KHONG CON KHE HO: hoac ta thay bump truoc khi
+    //   Continue (=> huy luot ve), hoac luot sua phai cho ta xong lat roi moi lay
+    //   duoc khoa. Huy luot ve an toan vi cung luot sua da invalidatePage + dat luot
+    //   ve moi (annotationAdded/pageContentChanged) — chu thich KHONG mat, chi hien
+    //   o luot sau. Duong pool handle (phia tren) doc tai lieu rieng nen khong lien quan.
+    FPDF_DOCUMENT annotDoc = m_pdfDoc ? m_pdfDoc->raw() : nullptr;
+    quint64 annotGen0 = 0;
+    bool annotStale = false;
     {
-        std::unique_ptr<TimedMutexLocker> lockStart;
-        if (!giuKhoaSuot)
-            lockStart = std::make_unique<TimedMutexLocker>(s_pdfiumMutex, "ProgressiveRenderTask::Start");
+        TimedMutexLocker lockStart(s_pdfiumMutex, "ProgressiveRenderTask::Start");
         if (m_genRef->loadRelaxed() != m_req.generation) {
             qDebug() << "[perf] drop page=" << m_req.pageIndex << "reason=genMismatchPreStart";
             emit finished(m_req.pageIndex, QImage()); return;
@@ -445,6 +457,7 @@ void ProgressiveRenderTask::run() {
 
         m_fpdfPage = m_renderer->acquirePage(m_req.pageIndex);
         if (!m_fpdfPage) { emit finished(m_req.pageIndex, QImage()); return; }
+        annotGen0 = PageCache::annotGeneration(annotDoc, m_req.pageIndex);  // moc the he DUOI KHOA
 
         if (m_req.hideOwnAnnots)
             _ahGuard = std::make_unique<OwnAnnotHideGuard>(m_fpdfPage, true, true);
@@ -453,6 +466,14 @@ void ProgressiveRenderTask::run() {
         double h = FPDF_GetPageHeight(m_fpdfPage);
         if (m_pdfDoc) m_pdfDoc->updatePageSize(m_req.pageIndex, w, h);
         if (m_pdfDoc) m_pdfDoc->updatePageBoxOrigin(m_req.pageIndex, pdfBoxOrigin(m_fpdfPage));
+
+        // V1b 0901: do so object TRUOC khi chon tran (xem PageRenderTask::run — cùng một lỗi
+        // long-khoa: emit cuoi chi chay khi ve xong, trang 4000px khong bao gio xong).
+        { QElapsedTimer ct; ct.start();
+          const int nObj = FPDFPage_CountObjects(m_fpdfPage);
+          m_renderer->setPageObjectCount(m_req.pageIndex, nObj);
+          qDebug() << "[heavycap] pre-count page=" << m_req.pageIndex << "objects=" << nObj
+                   << "ms=" << ct.elapsed(); }
 
         double longSide = qMax(w, h);
         double maxPx;
@@ -479,12 +500,12 @@ void ProgressiveRenderTask::run() {
             // tang chua toi gap doi (khau to pixel chi ~10-20% chi phi; 80% la PDFium doc noi dung).
             // Nen render day du MOT LAN roi thu nho de hien la re hon render lai moi muc zoom.
             // Hien thi: ContinuousView tu `scaledToWidth(needW*1.15)` ve dung DPI dang xem.
-            maxPx = PdfRenderer::kFullRenderMaxPx;
+            maxPx = m_renderer->fullQCapPx(m_req.pageIndex, longSide);
             qDebug().noquote() << "[dem] page=" << m_req.pageIndex << "render DAY DU"
                                << int(maxPx) << "px (hien thi thu nho ve"
                                << PdfRenderer::contDpi() << "DPI)";
         } else if (m_req.fullQuality) {
-            maxPx = PdfRenderer::kFullRenderMaxPx;
+            maxPx = m_renderer->fullQCapPx(m_req.pageIndex, longSide);
         } else {
             maxPx = qMin(m_req.scaleFactor * longSide, PdfRenderer::kThumbMaxPx);
         }
@@ -531,9 +552,16 @@ void ProgressiveRenderTask::run() {
         }
 
         {
-            std::unique_ptr<TimedMutexLocker> lockCont;
-            if (!giuKhoaSuot)
-                lockCont = std::make_unique<TimedMutexLocker>(s_pdfiumMutex, "ProgressiveRenderTask::Continue");
+            TimedMutexLocker lockCont(s_pdfiumMutex, "ProgressiveRenderTask::Continue");
+            // Kiem the he DUOI KHOA, TRUOC khi tiep tuc lat ve: co luot sua chu thich
+            // xen giua hai lat => KHONG Continue tren trang da bi sua (nguon crash
+            // 0x80000003 ngay 01/09) — huy luot ve, luot moi da duoc ben sua dat.
+            if (PageCache::annotGeneration(annotDoc, m_req.pageIndex) != annotGen0) {
+                annotStale = true;
+                qDebug().noquote() << "[perf] drop page=" << m_req.pageIndex
+                                   << "reason=annotGenMid — huy luot ve, khong ve tiep tren trang da sua";
+                break;
+            }
             ProgressivePauseCtx pctx;
             pctx.timer.start();
             IFSDK_PAUSE pause;
@@ -563,7 +591,7 @@ void ProgressiveRenderTask::run() {
     //   tao khong bao gio hien). Neu lam lai: phai ve form SAU khi FPDF_RenderPage_Close va
     //   PHAI nam trong TimedMutexLocker, hoac ve o mot luot rieng.
     // ── Step 3: Close / finalise ──────────────────────────────────────────────
-    bool cancelled = (m_genRef->loadRelaxed() != m_req.generation);
+    bool cancelled = (m_genRef->loadRelaxed() != m_req.generation) || annotStale;
 
     // Emit one final partial if Done
     if (m_renderStatus == FPDF_RENDER_DONE && !cancelled) {
@@ -572,9 +600,7 @@ void ProgressiveRenderTask::run() {
     }
 
     {
-        std::unique_ptr<TimedMutexLocker> lockClose;
-        if (!giuKhoaSuot)
-            lockClose = std::make_unique<TimedMutexLocker>(s_pdfiumMutex, "ProgressiveRenderTask::Close");
+        TimedMutexLocker lockClose(s_pdfiumMutex, "ProgressiveRenderTask::Close");
         if (m_renderStatus == FPDF_RENDER_TOBECONTINUED || m_renderStatus == FPDF_RENDER_DONE)
             FPDF_RenderPage_Close(m_fpdfPage);
         if (m_bmp) { FPDFBitmap_Destroy(m_bmp); m_bmp = nullptr; }
@@ -1467,7 +1493,7 @@ bool PdfRenderer::requestFromCacheOnlyForContinuous(int pageIndex, double /*scal
     // the requested scale. This ensures cache hits regardless of visual zoom.
     QSizeF pgSz = m_doc->pageSize(pageIndex);
     double longSide = qMax(pgSz.width(), pgSz.height());
-    double renderedScale = kFullRenderMaxPx / qMax(longSide, 1.0);
+    double renderedScale = fullQCapPx(pageIndex, longSide) / qMax(longSide, 1.0);
 
     // Memory cache — accept any full-quality image (zoom-independent)
     if (m_cache.contains(pageIndex)) {
@@ -1489,7 +1515,7 @@ bool PdfRenderer::requestFromCacheOnlyForContinuous(int pageIndex, double /*scal
         // => TRANG TRANG/DEN. O CacheZoom::Full phai chua anh canh dai ~kFullRenderMaxPx;
         // khong dat thi coi nhu MISS va VUT entry hong di, de render lai cho dung.
         const int cachedLong = cached.isNull() ? 0 : qMax(cached.width(), cached.height());
-        const int expectLong2 = int(kFullRenderMaxPx);   // o Full = luon day du
+        const int expectLong2 = int(fullQCapPx(pageIndex, longSide));   // o Full = day DU theo tran cua trang nay
         if (!cached.isNull() && cachedLong < int(expectLong2 * 0.9)) {
             qWarning() << "[cache] VUT entry hong page=" << pageIndex
                        << "canhDai=" << cachedLong << "can>=" << int(expectLong2 * 0.9);
@@ -1517,6 +1543,12 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double scale, int prio
         return;
     }
 
+    // 0902: `scale` day = zoom * devicePixelRatio = kich thuoc hien thi THAT cua khung nhin
+    // (chinh la so `canCo` in ra o "cont sharp request"). Bom vao renderer de fullQCapPx
+    // cat tran trang nang theo PIXEL MAN HINH, khong theo DPI co dinh nua. Moi duong goi
+    // (primary/neighbor/dequeue/retry) deu qua day => luon dung gia tri hien hanh.
+    setContinuousDisplayScale(scale);
+
     // GOC1: when m_continuousUseZoomScale is set (fast mode), render at the
     // requested zoom resolution instead of always kFullRenderMaxPx.  This
     // avoids rendering 4000px when the screen only needs ~1300px at Fit zoom.
@@ -1530,9 +1562,9 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double scale, int prio
         // "cont render start renderScale= 4.82982e-05"). Phep chia /longSide chi thuoc ve
         // CAI TRAN (doi kFullRenderMaxPx tu pixel sang he so), KHONG thuoc ve zoom.
         renderedScale = qMin(scale * 1.15,
-                             PdfRenderer::kFullRenderMaxPx / qMax(longSide, 1.0));
+                             fullQCapPx(pageIndex, longSide) / qMax(longSide, 1.0));
     } else {
-        renderedScale = kFullRenderMaxPx / qMax(longSide, 1.0);
+        renderedScale = fullQCapPx(pageIndex, longSide) / qMax(longSide, 1.0);
     }
 
     // Accept any full-quality cached image (all at kFullRenderMaxPx resolution)
@@ -1679,8 +1711,9 @@ void PdfRenderer::requestPageForContinuous(int pageIndex, double scale, int prio
         // chuyen sang siet theo DPI thi o 75 DPI trang A0 chi 2480px => chot NAY CHAN SACH
         // viec ghi dem, moi lan mo lai phai render lai tu dau. Phai so voi KY VONG theo DPI.
         const int outLong = qMax(img.width(), img.height());
-        // O Full chi nhan anh DAY DU — day la giao uoc chung voi Single.
-        const bool fullQualityImg = outLong >= int(PdfRenderer::kFullRenderMaxPx * 0.9);
+        const QSizeF fullSz = m_doc ? m_doc->pageSize(pageIndex) : QSizeF();
+        // O Full chi nhan anh DAY DU theo tran cua chinh trang nay (fullQCapPx).
+        const bool fullQualityImg = outLong >= int(fullQCapPx(pageIndex, qMax(fullSz.width(), fullSz.height())) * 0.9);
         if (!fullQualityImg)
             qDebug() << "[cache] KHONG ghi dia page=" << pageIndex
                      << "canhDai=" << outLong << "(chua du chat luong day du)";

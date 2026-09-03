@@ -21,6 +21,7 @@
 #include "core/TextSearch.h"
 #include "core/VectorLayer.h"
 #include "core/ForeignAnnotLayer.h"
+#include "core/OwnAnnotHideGuard.h"
 #include "core/PdfCoords.h"
 #include "core/PdfLinks.h"
 #include "core/PageCache.h"
@@ -1073,6 +1074,7 @@ MainWindow::~MainWindow() {
     for (auto* t : m_openDocs) {
         disconnect(t->pageReadyConn);
         disconnect(t->scrollConn);
+        stopThumbPool(t);          // 0903: dung worker thumbnail truoc khi UI cham PDFium
         cancelForeignAnnotTasks(t);   // huy lop bu dang build truoc khi doc bi huy
         if (t->doc) TextSelection::closeDocument(t->doc->raw());
         delete t;
@@ -1208,7 +1210,7 @@ void MainWindow::setupActionBar() {
 // View mode actions
      QActionGroup* viewModeGroup = new QActionGroup(this);
      viewModeGroup->setExclusive(true);
-     m_viewQualityAct = viewModeGroup->addAction("View Quality && Edit");
+     m_viewQualityAct = viewModeGroup->addAction("View Quality && Edit Comments");   // 0903 owner: ro nghia hon
      m_viewQualityAct->setCheckable(true);
      m_viewQualityAct->setToolTip("High Quality Single Page and Editable");
      m_viewFastAct = viewModeGroup->addAction("View Fast");
@@ -1511,7 +1513,7 @@ void MainWindow::setViewMode(bool fastMode) {
             // render resolution — no longer hardcodes kFullRenderMaxPx.
             qDebug() << "[perf] cont enter fast mode zoom=" << t->zoom;
             { QElapsedTimer _e; _e.start(); m_continuousView->setZoom(t->zoom); const qint64 _m=_e.elapsed(); if(_m>30) qDebug().noquote()<<"[conttoggle] setZoom ms="<<_m; }
-            { QElapsedTimer _e; _e.start(); m_continuousView->setDocument(t->doc.get(), t->renderer.get()); const qint64 _m=_e.elapsed(); if(_m>30) qDebug().noquote()<<"[conttoggle] setDocument ms="<<_m; }
+            { QElapsedTimer _e; _e.start(); m_continuousView->setDocument(t->doc.get(), t->renderer.get(), &t->visualsCache, &t->vecLayers); const qint64 _m=_e.elapsed(); if(_m>30) qDebug().noquote()<<"[conttoggle] setDocument ms="<<_m; }
             // Enter continuous mode: clear any raster suppression commands set when in single mode,
             // because ContinuousView draws using its own separate vector layer.
             if (t->renderer) t->renderer->setSuppressFullQuality(t->currentPage, false);
@@ -1532,6 +1534,7 @@ void MainWindow::setViewMode(bool fastMode) {
         if (t && t->doc->isOpen()) {
             t->view->setZoom(t->zoom);
             t->renderer->cancelPending();
+            t->renderer->setSuppressFullQuality(t->currentPage, false);
             t->renderer->requestPage(t->currentPage, t->zoom);
         }
     }
@@ -1596,9 +1599,10 @@ void MainWindow::onSaveFile() {
     PdfLinks::clearCache();
     // 🔴 Huy + cho xong tac vu lop bu truoc khi dong doc de ghi de file (crash 30/08).
     cancelForeignAnnotTasks(t);
+    // R1/0903: thumbPool workers dung CHUNG doc — phai stop + CHO thoat HAN truoc khi
+    // UI cham PDFium (closeDocument, doc->close) de ghi de file.
+    stopThumbPool(t);
     TextSelection::closeDocument(t->doc->raw());
-    // R1: thumbPool workers dung CHUNG doc — phai stop TRUOC khi dong doc (swap thu tu).
-    if (t->thumbPool) t->thumbPool->close();
     t->doc->close();
     if (t->renderer) t->renderer->setTileCache(nullptr);
 
@@ -1736,9 +1740,31 @@ const QList<AnnotInfo>& MainWindow::annotsForPage(DocTab* t, int page, bool* out
 
 void MainWindow::invalidateAnnotPage(DocTab* t, int page) {
     t->annotPageCache.remove(page);
-    t->visualsCache.remove(page);
-    t->visualsRev.remove(page);
-    t->visualsHasForeign.remove(page);
+    // 🔴 LÁT C 0902: visualsCache GIU LAI — no la nen de duong CẬP NHẬT CÓ CHỌN LỌC
+    // (mergeAnnotVisuals) tron delta vao, thay vi pha no di de roi nap lai ca trang
+    // phai xep hang 1–2,4 giay sau bo dung trang. An toan: moi lan su dung van kiem
+    // `visualsRev == pageRevision` (moi mutation deu bump revision), va moi thay doi
+    // KHONG co delta (vd annot ngoai bi xoa) se truh thanh cache-miss → nap lai.
+    if (t->heavyRegionPage == page)
+        t->heavyRegionPage = -1;   // LAT C: noi dung doi — anh region cu het han
+    // LAT G: noi dung trang doi => handle rieng (danh sach annot da cu) phai NAP LAI,
+    // va danh dien vung nhin phai reset de lan goi theo su kien dung lai BAT KE vung
+    // nhin co doi khong (neu khong, chot vung-nhin-seen chan luon viec ve chu thich moi).
+    if (t->heavyRegionPages.contains(page)) {
+        t->heavySeenPage = -1;
+        if (t->heavyPrivIndex == page) {
+            if (t->heavyRegionBuilding) t->heavyPrivStale = true;   // dang render: cho tac vu nap lai
+            else closeHeavyPriv(t);                                  // re: dong ngay
+        }
+    }
+    // LAT E 09/02 (UU TIEN 2): trang nang nen vector ve chu thich TU ANH VUNG, khong
+    // tu lop vector (lop vector KHONG chua annot). Chu thich vua tao/xoa phai duoc
+    // dung lai NGAY — goi thang updateHeavyRegion tu su kien chu thich doi (giu nguyen
+    // nhu ban tham chiếu latABCDEFG, chi bo dong ho polling 1s); no tu guard (khong
+    // phai trang hien hanh / khong heavy / dang dung thi no return), nen goi vo hai.
+    if (t->heavyRegionPages.contains(page) && t == currentTab()
+        && t->currentPage == page && t->view)
+        updateHeavyRegion(t);
     t->fgnDeferred.remove(page);   // noi dung doi — duoc hoan lai toi da 1 lan cho lan hien moi
     if (t->fgnLayer && t->fgnLayer->pageIndex() == page) {
         t->fgnLayer.reset();
@@ -1747,8 +1773,10 @@ void MainWindow::invalidateAnnotPage(DocTab* t, int page) {
 }
 
 void MainWindow::buildVectorLayer(DocTab* t, int pageIndex, bool force) {
+    // LÁT B 09/02: "da co lop cho trang nay chua" doc tu KHO CHUNG (vecLayers), khong con
+    // lop rieng mot nua. Continuous co the da nap san trang nay -> Single khoi dung lai.
     if (t->vecBuilding.contains(pageIndex)
-        || (!force && t->vecLayer && t->vecLayer->pageIndex() == pageIndex))
+        || (!force && t->vecLayers.contains(pageIndex)))
         return;
     int pg = pageIndex;
     // force = "noi dung trang DA DOI, dung lai di". Tu day tro di trang nay KHONG duoc lay
@@ -1822,14 +1850,55 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
     // giua chung. Thay bang: ep trang ve RASTER (forceRasterPage) — da co FPDF_ANNOT.
     // So object lay tu PdfRenderer::pageObjectCount (da cache, KHONG lay khoa pdfium).
     if (t->renderer) {
-        const int objCount = t->renderer->pageObjectCount(pageIndex);
+        int objCount = t->renderer->pageObjectCount(pageIndex);
+        if (objCount == 0) {
+            // SAI THU TU khoi dong (do 02/09): so object den muon 2,7 gi (heavycap pre-count)
+            // trong khi ensureForeignAnnotLayer can ngay => 2 trang hien tai bi DEFER.
+            // Phep dem FPDFPage_CountObjects chi ton 0 ms, NHUNG PageCache::acquire PHAI
+            // phan tich CA TRANG (do 2 giay tren trang 2,54 trieu object). Khoa CHAN o day
+            // da dung luong giao dien 7,1 gi (log 02/09, ke om khoa: GiuSuot 2,9 gi).
+            // LUONG GIAO DIEN khong duoc di cho khoa pdfium — TryPdfiumLock y het
+            // AnnotationManager::loadPage: lay duoc thi dem; khong lay duoc thi HOAN va
+            // de luong nen lam (luot ve nen xong phat objectCountReady -> goi lai, noi 4324).
+            TryPdfiumLock lk(__FILE__, __LINE__);
+            if (!lk.held()) {
+                // LỖI 2 0902: danh dau trang nay vao fgnDeferred (registry "da hoan, lan
+                // sau PHAI dung") de continuousPageReady ben duoi duoc no. Neu khong ghi,
+                // luot goi nay roi di va KHONG con su kien nao keo no quay lai (do: 7 DEFER,
+                // 0 dung lai).
+                t->fgnDeferred.insert(pageIndex);
+                qDebug().noquote() << "[fgnlayer] DEFER - khoa pdfium ban, cho luong nen dem object page=" << pageIndex;
+                return;
+            }
+            FPDF_PAGE pg = PageCache::acquire(t->doc->raw(), pageIndex);
+            if (!pg) {
+                // Chi hoan khi THAT SU khong muon duoc trang.
+                qDebug().noquote() << "[fgnlayer] DEFER - khong muon duoc trang page=" << pageIndex;
+                return;
+            }
+            PageCache::PageBorrow _b(t->doc->raw(), pageIndex);   // RAII — cap doi acquire
+            objCount = FPDFPage_CountObjects(pg);
+            t->renderer->setPageObjectCount(pageIndex, objCount);
+        }
         if (objCount > 400000) {
             qDebug().noquote() << "[fgnlayer] SKIP - trang nang objects=" << objCount << "page=" << pageIndex;
-            forceRasterPage(t, pageIndex);
-            return;
-        }
-        if (objCount == 0) {
-            qDebug().noquote() << "[fgnlayer] DEFER - chua biet so object page=" << pageIndex;
+            // LAT C 09/02: tran 400000 chan LOP BU TOAN TRANG (ForeignAnnotLayer::build —
+            // 87,8 giay/trang, giu khoa 14s+ khong huy duoc) — KHONG giết nen vector nua.
+            // Trang ma overlay ve duoc het chu thich (canFastPath) thi khong can gi ca.
+            // Trang can bo: chu thich ve theo VUNG NHIN bang o clip tung annot
+            // (renderAnnotRegion — 18,6 ms/o do tren chinh trang nay), nen vector van la
+            // nen. Nen vector dung duoc ⇒ du ca hai; nen vector KHONG dung duoc thi
+            // updateHeavyRegion khong cho ra dau, view tu o lai raster (raster da co
+            // FPDF_ANNOT) ⇒ thà cham con hon mat chu thich.
+            // TORREADER_NOHEAVYROI=1: ve lenh cu (vat nen vector) — dung cho A/B nghiem thu.
+            if (!canFastPath(t, pageIndex)
+                && !qEnvironmentVariableIsSet("TORREADER_NOHEAVYROI")) {
+                t->heavyRegionPages.insert(pageIndex);
+                if (t->view) t->view->setVectorAnnotSafe(pageIndex, true);
+                updateHeavyRegion(t);
+            } else {
+                forceRasterPage(t, pageIndex);
+            }
             return;
         }
     }
@@ -1845,8 +1914,8 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
     // Zoom cao sau do da co buildRegion() lo vung net. Render 4000px khi man hinh chi ve
     // ~1300px la thua >9 lan dien tich (do 30/08: 7,5 s/trang giu khoa pdfium).
     const double zoomNow = t->view ? t->view->zoom() : 1.0;
-    const QSizeF pagePt  = (t->vecLayer && t->vecLayer->pageIndex() == pageIndex)
-                             ? t->vecLayer->pageSizePt()
+    const QSizeF pagePt  = t->vecLayers.contains(pageIndex)
+                             ? t->vecLayers.value(pageIndex)->pageSizePt()
                              : ((m_fastMode && m_continuousView)
                                  ? m_continuousView->pageSizePt(pageIndex) : QSizeF());
     const double longSidePt = (std::max)(pagePt.width(), pagePt.height());
@@ -1872,6 +1941,9 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
         && (!hasLayer || needRebuild)) {
         int pgF = pageIndex;
         t->fgnBuilding.insert(pgF);
+        // LỖI 3 0902 (GIU LOP): ghi noi dung trang luc bat dau dung. pageRevision chi la
+        // QHash lookup (khong lay khoa pdfium) — lay o luong giao dien truoc khi chay nen.
+        const quint32 revAtStart = t->annotMgr ? t->annotMgr->pageRevision(pgF) : 0;
         auto fl = std::make_shared<ForeignAnnotLayer>();
         fl->setBuiltZoom(zoomNow);
         qDebug().noquote() << "[fgnlayer] maxPx=" << maxPx
@@ -1879,7 +1951,7 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
                            << " page=" << pgF
                            << " rebuild=" << needRebuild;
         auto* wf = new QFutureWatcher<bool>(this);
-        connect(wf, &QFutureWatcher<bool>::finished, this, [this, wf, t, pgF, fl]{
+        connect(wf, &QFutureWatcher<bool>::finished, this, [this, wf, t, pgF, fl, revAtStart]{
             wf->deleteLater();
             // 🔴 Guard PHIEN DAU TIEN: tab co the da dong va t da bi xoa (closeJob chay
             //    o luong nen). Chi so sanh con tro, KHONG duoc lay gi cua t khi chua soat.
@@ -1887,7 +1959,13 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
             t->fgnBuilding.remove(pgF);
             if (t->fgnFuture.isValid()) t->fgnFuture = QFuture<bool>();
             t->fgnPending.reset();
-            if (t->currentPage != pgF) return;
+            // LỖI 1 0902: `t->currentPage` la trang o TAM man hinh (pageAtCenter), KHONG
+            // phai trang vua thao tac chu thich. Continuous luu lop bu THEO TRANG
+            // (setForeignAnnotLayer(pgF,...)) va nhieu trang cung song → dung tam de
+            // quyet discard se VUT layer cua trang vua chu thich khi tam lech trang
+            // (cung ho pageAtCenter 31/08: "trang dang xem khong ai ve"). Single van
+            // discard khi doi trang (chi mot trang hien thoi).
+            if (t->currentPage != pgF && !(m_fastMode && m_continuousView)) return;
             if (t != currentTab()) return;
             if (wf->result()) {
                 t->fgnLayer = fl;
@@ -1897,10 +1975,39 @@ void MainWindow::ensureForeignAnnotLayer(DocTab* t, int pageIndex) {
                 if (m_fastMode && m_continuousView && t == currentTab())
                     m_continuousView->setForeignAnnotLayer(pgF, fl);
             } else {
-                t->fgnLayer.reset();
-                if (t->view) t->view->setForeignAnnotLayer(nullptr);
-                if (m_fastMode && m_continuousView && t == currentTab())
-                    m_continuousView->setForeignAnnotLayer(pgF, nullptr);
+                // LỖI 3 0902 (GIU LOP — owner): "KHONG tao duoc gia tri moi" ≠ "gia tri cu SAI".
+                // Luot dung that bai do tranh chap/huy (build() tra false) o day truoc day VUT
+                // luon lop dang hien thi tot va khong ai dat lenh dung lai → chu thich bien
+                // mat den khi su kien khac vo tinh kich (do: 4/23 luot bi vat, "[fgnlayer]
+                // set page= -1"). Phan biet hai ca bang pageRevision (moi mutation cua annot
+                // deu bump — AnnotationManager::bumpPageRevision):
+                //   • NOI DUNG KHONG DOI → lop cu van DUNG (cham nhat la thieu net o zoom
+                //     moi — thà cũ còn hơn mất) → GIU NGUYEN, khong cham vao view.
+                //   • NOI DUNG DA DOI giua luot dung (rev khac) → lop cu SAI → BAT BUOC vat
+                //     (rang buoc 4). invalidateAnnotPage da vat t->fgnLayer + Single view
+                //     khi no bump rev, con lop THEO TRANG cua Continuous thi no khong cham
+                //     → vat tai day, hep dung trang pgF.
+                // Ca hai ca deu danh dau fgnDeferred ( cung co che voi DEFER khoa ban o
+                // 1867) de SU KIEN KE TIEP nhet len: continuousPageReady (~4694) dut qua
+                // fgnDeferred goi lai ensureForeignAnnotLayer; Single co zoomChanged (6016)
+                // va doi trang (5858) goi truc tiep — dieu kien "!hasLayer || needRebuild"
+                // van con dung nen se dung lai. KHONG timer, KHONG polling.
+                const bool contentChanged =
+                    t->annotMgr && t->annotMgr->pageRevision(pgF) != revAtStart;
+                t->fgnDeferred.insert(pgF);
+                if (contentChanged) {
+                    if (t->fgnLayer && t->fgnLayer->pageIndex() == pgF) {
+                        t->fgnLayer.reset();
+                        if (t->view) t->view->setForeignAnnotLayer(nullptr);
+                    }
+                    if (m_fastMode && m_continuousView && t == currentTab())
+                        m_continuousView->setForeignAnnotLayer(pgF, nullptr);
+                    qDebug().noquote() << "[fgnlayer] build FAIL page=" << pgF
+                                       << "- noi dung doi → vat lop cu, DEFER dung lai";
+                } else {
+                    qDebug().noquote() << "[fgnlayer] build FAIL page=" << pgF
+                                       << "- GIU lop cu, DEFER cho su kien ke tiep dung lai";
+                }
             }
         });
         FPDF_DOCUMENT df = t->doc->raw();
@@ -1927,7 +2034,30 @@ void MainWindow::cancelForeignAnnotTasks(DocTab* t) {
     if (t->fgnLayer) t->fgnLayer->cancel();
     if (t->fgnFuture.isValid()) t->fgnFuture.waitForFinished();
     if (t->fgnRegionFuture.isValid()) t->fgnRegionFuture.waitForFinished();
+    // LAT C: tac vu buildRegion cua che do trang nang cung nam con tro FPDF_DOCUMENT —
+    // phai huy + cho xong TRUOC khi doc bi dong (ngu crash 30/08 nhu lop bu toan trang).
+    if (t->heavyRegionCancel) t->heavyRegionCancel->storeRelease(1);
+    if (t->heavyRegionFuture.isValid()) t->heavyRegionFuture.waitForFinished();
+    t->heavyRegionCancel.reset();
+    t->heavyRegionFuture = QFuture<bool>();
+    t->heavyRegionBuilding = false;  // watcher co the chua kip chay khi UI thread busy
+    t->heavyRegionPage = -1;
+    // LAT G: tac vu da xong (waitForFinished) => main thread nam handle rieng, dong an toan
+    // TRUOC khi doc bi dong/giai phong (neu khong handle tro toi doc da chet = crash/ro ri).
+    closeHeavyPriv(t);
+    t->heavySeenPage = -1; t->heavySeenZoom = 0.0; t->heavySeenVis = QRect();
     t->fgnPending.reset();
+}
+
+// 0903 — VĂNG APP KHI ĐÓNG TAB. Worker cua ThumbnailRenderPool render bang CUNG
+// FPDF_DOCUMENT voi doc va xuong PDFium tren luong rieng. Chung cua with net PDFium
+// tren UI thread (dong view, mo tab Welcome, clearCache) = STATUS_BREAKPOINT trong
+// pdfium.dll. close() = stop() + wait() → worker thoat HAN truoc khi tiep tuc don doc.
+// Chong song giua worker va cac net PDFium tren UI thread chinh la nguyen nhan crash.
+// wait() CO BUOC (~<=100ms): stop() don hang doi va run() break ngay khi m_stop,
+// khong drain pending; worker chi con xong 1 slice render (~50ms) dang chay.
+void MainWindow::stopThumbPool(DocTab* t) {
+    if (t && t->thumbPool) t->thumbPool->close();
 }
 
 bool MainWindow::canFastPath(DocTab* t, int page) const {
@@ -1938,13 +2068,16 @@ bool MainWindow::canFastPath(DocTab* t, int page) const {
 }
 
 bool MainWindow::baseIsVector(DocTab* t, int page) const {
-    return t && t->vecLayer && t->vecLayer->isReady()
-        && t->vecLayer->pageIndex() == page && t->vecLayer->isComplete();
+    // LÁT B 09/02: kho chung khoa theo trang, nen "layer->pageIndex()==page" la THUA —
+    // lay dung value(page) la ra lop cua trang do (neu co).
+    const auto L = t ? t->vecLayers.value(page) : nullptr;
+    return L && L->isReady() && L->isComplete();
 }
 
-// NEN lop vector THAT SU cua view dang ve. Single: t->vecLayer. Continuous: lop vector
-// nam trong ContinuousView (m_vecLayers) — KHONG phai t->vecLayer chi co cho Single.
-// Thieu chot nay la goc lo "Comment mat" (30/08): Continuous DEFER vo han vi
+// NEN lop vector cua trang dang xet. LÁT B 09/02: Single va Continuous CUNG doc mot kho
+// DocTab::vecLayers nen baseIsVector(da doc kho) la du; chot Continuous duoi day chi con
+// la mao hiem (doc dung cai hash ay qua con tro cua view), giu lai cho an toan.
+// Thieu chot nay tung la goc lo "Comment mat" (30/08): Continuous DEFER vo han vi
 // baseVector=false, mac du lop vector cua no da san sang de ve.
 bool MainWindow::pageBaseIsVector(DocTab* t, int page) const {
     if (baseIsVector(t, page)) return true;
@@ -1959,9 +2092,224 @@ bool MainWindow::pageBaseIsVector(DocTab* t, int page) const {
 void MainWindow::forceRasterPage(DocTab* t, int pg) {
     if (!t) return;
     if (canFastPath(t, pg)) return;   // overlay capable: lop vector van dung duoc
+    // LAT C 09/02: trang nang dang o che do "nen vector + chu thich region" (lop bu toan
+    // trang van BI CAM vi tran 400000 o ensureForeignAnnotLayer) — chu thich do duong
+    // buildRegion ve, nen KHONG duoc vat bo nen vector nua.
+    if (t->heavyRegionPages.contains(pg)) return;
     t->forceRasterPages.insert(pg);
     if (baseIsVector(t, pg))
         setTabVectorLayer(t, nullptr, pg);
+}
+
+// LÁT C 09/02 — lop chu thich TRONG SUOT cho VUNG NHIN cua trang nang nen vector.
+// O VUONG TUNG annot, clip dung o — cong thuc --annotroi-bench (do tren chinh
+// trang 2,54M object: 18,6 ms/o): clip khien PDFium chi duyet noi dung trong o
+// chu thich, khong phai toan trang. Gao nen trang (white-key nhu
+// ForeignAnnotLayer::build) va blit vao anh trong suot theo vung region.
+// OwnAnnotHideGuard(overlayOnly=true) an cac annot mà overlay tu ve ⇒ khong
+// ve trung. KHONG dung buildRegion: no render CA VUNG NHIN — trang CAD chen
+// duc net ⇒ do 4s+7s giu khoa. KHONG goi build(): lop bu toan trang van bi
+// tran 400000 cam. Khoa tha giua cac o (moi o <25ms) de UI xen vao duoc.
+static QImage renderAnnotRegion(FPDF_PAGE priv, int n, int pageIndex, double scale,
+                                const QRect& regionPx, QAtomicInt& cancel)
+{
+    QImage out(regionPx.size(), QImage::Format_ARGB32);
+    if (out.isNull()) return QImage();
+    out.fill(Qt::transparent);
+    const int margin = 4;   // px le quanh o chu thich — khop build()/--annotroi-bench
+    // LAT E 09/02 — handle RIENG, KHONG dung handle CHIA SE cua PageCache (chong crash
+    // 0x80000003: render dong bo de len handle PageCache dang tam dung giua slice).
+    // LAT G 09/02 — handle nay duoc GOI VAO DA NAP SAN va duoc DocTab GIU LAI (xem
+    // heavyPrivPage): FPDF_LoadPage tren trang 2,54M object ton 2,0-2,1 giay MOI LAN,
+    // nen nap mot lan roi dung lai. Ham nay chi ve, khong nap, khong dong handle.
+    if (!priv || n < 0) return QImage();
+    qint64 inkPx = 0;
+    int drawn = 0;
+    QElapsedTimer tAll; tAll.start();
+    bool abort = false;
+    for (int i = 0; i < n; ++i) {
+        if (cancel.loadAcquire()) { abort = true; break; }
+        QImage patch;
+        int dx = 0, dy = 0;
+        {
+            TimedPdfiumLock lk(__FILE__, __LINE__);
+            OwnAnnotHideGuard hide(priv, true, /*overlayOnly=*/true);
+            FS_RECTF r{};
+            FPDF_ANNOTATION a = FPDFPage_GetAnnot(priv, i);
+            if (!a) continue;
+            const bool keep = !(FPDFAnnot_GetFlags(a) & FPDF_ANNOT_FLAG_HIDDEN)
+                           && FPDFAnnot_GetSubtype(a) != FPDF_ANNOT_POPUP
+                           && FPDFAnnot_GetRect(a, &r);
+            FPDFPage_CloseAnnot(a);
+            if (!keep) continue;
+            const int rot   = FPDFPage_GetRotation(priv) & 3;
+            const int fullW = qMax(1, int(FPDF_GetPageWidth(priv)  * scale));
+            const int fullH = qMax(1, int(FPDF_GetPageHeight(priv) * scale));
+            int cx1, cy1, cx2, cy2;
+            FPDF_PageToDevice(priv, 0, 0, fullW, fullH, rot, r.left,  r.top,    &cx1, &cy1);
+            FPDF_PageToDevice(priv, 0, 0, fullW, fullH, rot, r.right, r.bottom, &cx2, &cy2);
+            const int ax = qMin(cx1, cx2), ay = qMin(cy1, cy2);
+            const int aw = qMax(1, qAbs(cx2 - cx1)), ah = qMax(1, qAbs(cy2 - cy1));
+            if (QRect(ax, ay, aw, ah).intersected(regionPx).isEmpty()) continue;  // ngoai vung nhin
+            patch = QImage(aw + 2 * margin, ah + 2 * margin, QImage::Format_ARGB32);
+            if (patch.isNull()) { abort = true; break; }
+            patch.fill(Qt::white);   // PDFium se ve de len nen trang + chu thich
+            FPDF_BITMAP bmp = FPDFBitmap_CreateEx(patch.width(), patch.height(), FPDFBitmap_BGRA,
+                                                  patch.bits(), patch.bytesPerLine());
+            if (!bmp) continue;
+            FPDF_RenderPageBitmap(bmp, priv, margin - ax, margin - ay,
+                                  fullW, fullH, rot, FPDF_ANNOT | FPDF_RENDER_LIMITEDIMAGECACHE);
+            FPDFBitmap_Destroy(bmp);
+            dx = ax - margin - regionPx.left();
+            dy = ay - margin - regionPx.top();
+        }
+        // Blit ngoai khoa: gao nen trang tinh, giu muc chu thich (nhu blitWhiteKey).
+        for (int y = 0; y < patch.height(); ++y) {
+            const int ty = dy + y;
+            if (ty < 0 || ty >= out.height()) continue;
+            const QRgb* rs = reinterpret_cast<const QRgb*>(patch.constScanLine(y));
+            QRgb*       dr = reinterpret_cast<QRgb*>(out.scanLine(ty));
+            for (int x = 0; x < patch.width(); ++x) {
+                const int tx = dx + x;
+                if (tx < 0 || tx >= out.width()) continue;
+                const QRgb p = rs[x];
+                if (qRed(p) >= 250 && qGreen(p) >= 250 && qBlue(p) >= 250) continue;
+                dr[tx] = qRgba(qRed(p), qGreen(p), qBlue(p), 255);
+                ++inkPx;
+            }
+        }
+        ++drawn;
+    }
+    // LAT G 09/02: KHONG dong handle o day — handle rieng do DocTab giu lai de dung
+    // lai (dong khi doi trang / dong tab / dong tai lieu / noi dung doi).
+    qDebug().noquote() << "[heavyroi] REGION page=" << pageIndex
+                       << "rect=" << regionPx << "scale=" << scale
+                       << "annots=" << n << "drawn=" << drawn << "inkPx=" << inkPx
+                       << "ms=" << tAll.elapsed();
+    if (inkPx == 0 || abort) return QImage();   // khong co gi de chong — tra rong de lan sau dung lai
+    return out;
+}
+
+// LAT G 09/02 — dong handle rieng cua heavy region. CHI goi khi KHONG co tac vu build
+// dang chay (heavyRegionBuilding == false) hoac sau waitForFinished, vi luc do main
+// thread la chu duyet duy nhat cua heavyPrivPage.
+void MainWindow::closeHeavyPriv(DocTab* t) {
+    if (!t || !t->heavyPrivPage) return;
+    TimedPdfiumLock lk(__FILE__, __LINE__);
+    FPDF_ClosePage(t->heavyPrivPage);
+    t->heavyPrivPage  = nullptr;
+    t->heavyPrivIndex = -1;
+    t->heavyPrivStale = false;
+}
+
+// LÁT C 09/02 — chu thich cho trang nang nen vector, ve theo VUNG NHIN.
+// PdfGpuView setVectorAnnotSafe(true) da bat nen vector; con chu thich do
+// setForeignAnnotRegion() chong len: anh TRONG SUOT do renderAnnotRegion() sinh
+// (pixel THAT do PDFium ve — dung phông, dung nền), khong phai QPainter phang.
+// GOI THEO SU KIEN (khong con dong ho polling 1s — no gay vang app tren may owner):
+// UpdateRequest (pan/repaint), zoomChanged, doi trang, invalidateAnnotPage.
+void MainWindow::updateHeavyRegion(DocTab* t) {
+    if (!t || !t->view || !t->doc || !t->doc->isOpen()) return;
+    if (!m_openDocs.contains(t) || t != currentTab()) return;
+    const int pg = t->currentPage;
+    if (!t->heavyRegionPages.contains(pg)) return;
+    if (t->heavyRegionBuilding) return;
+    const auto L = t->vecLayers.value(pg);
+    if (!L || !L->isReady() || !L->isComplete()) return;  // chua co nen: raster dang lo, co chu thich san
+    const double zoom = t->view->zoom();
+    const QSizeF szPt = L->pageSizePt();
+    if (zoom <= 0.01 || szPt.isEmpty()) return;
+    // Vung nhin ∩ trang quy theo px cua trang tai scale=zoom — cung thu tuc voi
+    // PdfGpuView::requestTiles (widgetToPdf = (wp - pageOrigin()) / zoom).
+    const QPointF a = t->view->widgetToPdf(QPointF(0, 0));
+    const QPointF b = t->view->widgetToPdf(QPointF(t->view->width(), t->view->height()));
+    QRectF visPt(QPointF(qMin(a.x(), b.x()), qMin(a.y(), b.y())),
+                 QPointF(qMax(a.x(), b.x()), qMax(a.y(), b.y())));
+    visPt = visPt.intersected(QRectF(QPointF(0, 0), szPt));
+    if (visPt.isEmpty()) return;
+    QRect vis(qRound(visPt.left() * zoom), qRound(visPt.top() * zoom),
+              qMax(1, qRound(visPt.width() * zoom)), qMax(1, qRound(visPt.height() * zoom)));
+    // LAT G 0902 — CHOT VUNG NHIN THAT SU: su kien (UpdateRequest/zoom) co the den
+    // lien tuc. Neu vung nhin KHONG doi va KHONG bi invalidate (invalidateAnnotPage
+    // reset heavySeenPage=-1) thi thoat NGAY — khong lay khoa, khong mo handle, khong
+    // dung region. Do: 9 lan dung region/4 phut khi khong ai dong vao. Danh dien nay
+    // moc truc tiep vung nhin hien tai.
+    if (t->heavySeenPage == pg && qAbs(t->heavySeenZoom - zoom) < 1e-9
+        && t->heavySeenVis == vis) return;
+    t->heavySeenPage = pg; t->heavySeenZoom = zoom; t->heavySeenVis = vis;
+    // Da co anh o DUNG zoom nay phu vung nhin ⇒ giu, khong dung lai.
+    if (t->heavyRegionPage == pg && qAbs(t->heavyRegionScale - zoom) < 1e-6
+        && t->heavyRegionPx.contains(vis)) return;
+    // Dung thua 1/4 moi be: pan nhe khong khoi dung lai tu dau.
+    const QRect pagePx(0, 0, int(szPt.width() * zoom), int(szPt.height() * zoom));
+    QRect build = vis.adjusted(-vis.width() / 4, -vis.height() / 4,
+                                vis.width() / 4, vis.height() / 4)
+                      .intersected(pagePx);
+    if (build.isEmpty()) build = vis;
+    t->heavyRegionBuilding = true;
+    if (!t->heavyRegionCancel) t->heavyRegionCancel = std::make_shared<QAtomicInt>(0);
+    auto cancel = t->heavyRegionCancel;
+    cancel->storeRelease(0);
+    FPDF_DOCUMENT d = t->doc->raw();
+    qDebug().noquote() << "[heavyroi] dung region page=" << pg << "scale=" << zoom
+                       << "rect=" << build;
+    auto img = std::make_shared<QImage>();
+    auto* w = new QFutureWatcher<bool>(this);
+    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, t, img, pg, zoom, build]{
+        w->deleteLater();
+        t->heavyRegionBuilding = false;
+        if (!m_openDocs.contains(t)) return;   // tab da dong
+        if (t->heavyRegionFuture.isValid()) t->heavyRegionFuture = QFuture<bool>();
+        if (t->currentPage != pg || !t->view) {
+            // LAT G: da roi trang nay trong luc dang dung — handle rieng khong con can,
+            // dong ngay (main thread, tac vu da xong => khong con tranh chap).
+            closeHeavyPriv(t);
+            return;
+        }
+        // LAT E 09/02 (UU TIEN 3): anh rong = trong vung KHONG con chu thich nao (da xoa
+        // het). Ban cu `return` o day ⇒ anh vung CU (chua chu thich da xoa) van nam trong
+        // view, nen vector van pureVector ⇒ "xoa text/Note thi anh van luu lai". Phai XOA.
+        // Van gan heavyRegionPage = pg de lan goi ke tiep dung han (khong dung lai rong);
+        // moi lan noi dung doi, invalidateAnnotPage dat no ve -1 ⇒ dung lai.
+        const bool empty = !w->result() || img->isNull();
+        t->heavyRegionPage  = pg;
+        t->heavyRegionScale = zoom;
+        t->heavyRegionPx    = build;
+        if (empty) {
+            // ponytail: PdfGpuView::clearForeignAnnotRegion (ban latABCDEFG) khong nam
+            // trong pham vi sua (chi MainWindow) — anh TRONG SUOT 1px tuong minh:
+            // setForeignAnnotRegion tu choi anh null, paint khong in hong nao.
+            QImage blank(1, 1, QImage::Format_ARGB32);
+            blank.fill(Qt::transparent);
+            t->view->setForeignAnnotRegion(pg, zoom, QRect(), blank);
+        } else {
+            t->view->setForeignAnnotRegion(pg, zoom, build, *img);
+        }
+    });
+    // LAT G 09/02 — handle rieng NAP MOT LAN, dung lai. Chi FPDF_LoadPage khi chua co
+    // handle cho dung trang nay va chua bi danh dau stale. Do: 2,0-2,1 giay LAN DAU TIEN
+    // cho trang 2,54M object; cac lan sau TAI SU DUNG => 0 lan LoadPage.
+    t->heavyRegionFuture = QtConcurrent::run([this, t, img, d, pg, zoom, build, cancel]{
+        FPDF_PAGE priv = nullptr;
+        int n = -1;
+        {
+            TimedPdfiumLock lk(__FILE__, __LINE__);
+            if (t->heavyPrivStale || t->heavyPrivIndex != pg || !t->heavyPrivPage) {
+                if (t->heavyPrivPage) { FPDF_ClosePage(t->heavyPrivPage); t->heavyPrivPage = nullptr; }
+                QElapsedTimer lt; lt.start();
+                t->heavyPrivPage = FPDF_LoadPage(d, pg);
+                t->heavyPrivIndex = pg;
+                t->heavyPrivStale = false;
+                qDebug().noquote() << "[heavyroi] NAP handle rieng page=" << pg
+                                   << "ms=" << lt.elapsed();
+            }
+            priv = t->heavyPrivPage;
+            if (priv) n = FPDFPage_GetAnnotCount(priv);
+        }
+        *img = renderAnnotRegion(priv, n, pg, zoom, build, *cancel);
+        return !img->isNull();
+    });
+    w->setFuture(t->heavyRegionFuture);
 }
 
 // R2 (SPEC_PERF_HEAVYPAGE): lop vector san sang cho trang hien tai thi raster full-quality
@@ -1974,36 +2322,46 @@ void MainWindow::setTabVectorLayer(DocTab* t, std::shared_ptr<VectorLayer> layer
     // => bo chan raster va go setSuppressFullQuality(pg, false) o duoi.
     if (t && t->forceRasterPages.contains(pg))
         layer.reset();
-    const int oldVecPage = (t->vecLayer && t->vecLayer->pageIndex() != pg)
-                             ? t->vecLayer->pageIndex() : -1;
-    t->vecLayer = std::move(layer);
-    if (t->vecLayer) {
-        qDebug().noquote() << "[vecdiag] page=" << t->vecLayer->pageIndex()
-                           << "ready=" << t->vecLayer->isReady()
-                           << "complete=" << t->vecLayer->isComplete()
-                           << "verts=" << t->vecLayer->verts().size()
-                           << "colors=" << t->vecLayer->colors().size()
-                           << "widths=" << t->vecLayer->widths().size()
-                           << "depths=" << t->vecLayer->depths().size()
-                           << "clipIdx=" << t->vecLayer->clipIdx().size()
-                           << "fillVerts=" << t->vecLayer->fillVerts().size()
-                           << "fillColors=" << t->vecLayer->fillColors().size()
-                           << "fillDepths=" << t->vecLayer->fillDepths().size()
-                           << "fillClipIdx=" << t->vecLayer->fillClipIdx().size()
-                           << "fillOpaqueFloats=" << t->vecLayer->fillOpaqueFloats()
-                           << "clips=" << t->vecLayer->clips().size()
-                           << "texts=" << t->vecLayer->textTiles().size()
-                           << "images=" << t->vecLayer->imageTiles().size()
-                           << "pageSizePt=" << t->vecLayer->pageSizePt()
-                           << "rotation=" << t->vecLayer->rotation()
-                           << "uid=" << t->vecLayer->uid();
+    // LÁT B 09/02: ghi vao KHO CHUNG theo trang — khong con mot slot bi ghi de.
+    // layer rong = XOÁ trang do khoi kho (baseIsVector pg se false).
+    if (layer) t->vecLayers.insert(pg, layer);
+    else       t->vecLayers.remove(pg);
+    if (layer) {
+        qDebug().noquote() << "[vecdiag] page=" << layer->pageIndex()
+                           << "ready=" << layer->isReady()
+                           << "complete=" << layer->isComplete()
+                           << "verts=" << layer->verts().size()
+                           << "colors=" << layer->colors().size()
+                           << "widths=" << layer->widths().size()
+                           << "depths=" << layer->depths().size()
+                           << "clipIdx=" << layer->clipIdx().size()
+                           << "fillVerts=" << layer->fillVerts().size()
+                           << "fillColors=" << layer->fillColors().size()
+                           << "fillDepths=" << layer->fillDepths().size()
+                           << "fillClipIdx=" << layer->fillClipIdx().size()
+                           << "fillOpaqueFloats=" << layer->fillOpaqueFloats()
+                           << "clips=" << layer->clips().size()
+                           << "texts=" << layer->textTiles().size()
+                           << "images=" << layer->imageTiles().size()
+                           << "pageSizePt=" << layer->pageSizePt()
+                           << "rotation=" << layer->rotation()
+                           << "uid=" << layer->uid();
     } else {
         qDebug().noquote() << "[vecdiag] page=" << pg << "layer=NULL";
     }
-    if (t->view) t->view->setVectorLayer(t->vecLayer);
+    if (t->view) t->view->setVectorLayer(layer);
     if (!t->renderer) return;
-    if (oldVecPage >= 0)
-        t->renderer->setSuppressFullQuality(oldVecPage, false);
+    // EVICT (LÁT B 09/02) — chinh sach cua ContinuousView nay danh thang vao kho chung,
+    // nen Single cung phai duoi: giu toi da 3 trang quanh trang chinh (ban kinh 1),
+    // bo trang vua gan ra ngoai le. Thieu chot nay la kho phinh RAM (mot trang ~201 MB).
+    for (auto it = t->vecLayers.begin(); it != t->vecLayers.end(); ) {
+        if (it.key() != pg && qAbs(it.key() - t->currentPage) > 1) {
+            t->renderer->setSuppressFullQuality(it.key(), false);
+            it = t->vecLayers.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (!m_fastMode && baseIsVector(t, pg)) {
         qDebug().noquote() << "[perf] drop page=" << pg << "reason=vectorReady (single)";
         t->renderer->cancelFullQuality();
@@ -2199,7 +2557,10 @@ void MainWindow::applyAnnotVisuals(DocTab* t, int page,
         //    vao dung cau hoi: "overlay co ve HET moi chu thich cua trang khong?".
         // Single mat nen vector tren trang co chu thich, nhung KHONG mo: Single co duong ve lai
         // vung dang nhin theo dung muc zoom, nen van net.
-        if (t->view) t->view->setVectorAnnotSafe(page, overlayVeHetTrang);
+        // LAT C 09/02: `|| heavyRegionPages` — trang nang den che do "nen vector + chu
+        // thich region" thi chu thich do renderAnnotRegion ve, khong phai overlay; giu nen vector.
+        // Continuous (dong duoi) KHONG doi: no chua co duong region nen van theo luat cu.
+        if (t->view) t->view->setVectorAnnotSafe(page, overlayVeHetTrang || t->heavyRegionPages.contains(page));
         if (m_continuousView && tabIsCurrent)
             m_continuousView->setVectorAnnotSafe(page, overlayVeHetTrang);
     }
@@ -2227,9 +2588,52 @@ qDebug().noquote() << "[overlay] page=" << page << "overlayCapable=" << overlayC
     }
 }
 
+// 🔴🔴 LÁT C 0902 — CẬP NHẬT CÓ CHỌN LỌC (owner: "no bi ai do chiem quyen va phai cho
+// xong moi hien"). Chu thich KHONG bao gio hong — no chi LUON THUA: loadPageVisuals
+// phai xep hang sau bo dung trang (1–2,4 giay/luot) roi TU om khoa them 2 giay nua de
+// phan tich ca trang. Nhung du lieu do DA NAM SAN trong visualsCache (lat A), va cai
+// vua tao/xoa da duoc AnnotationManager dung AnnotVisual luc DANH GIU KHOA (µs).
+// O day chi tron delta do vao nen — KHONG lay s_pdfiumMutex, KHONG xep hang.
+// Phat lai delta theo thu tu la idempotent (thay/xoa theo uid) → ap 2 lan vo hai.
+bool MainWindow::mergeAnnotVisuals(DocTab* t, int page, QList<AnnotVisual>* out) {
+    if (!t || !t->annotMgr || !t->visualsCache.contains(page)) return false;
+    const QList<VisualDelta> deltas = t->annotMgr->visualDeltas(page);
+    if (deltas.isEmpty()) return false;
+    QList<AnnotVisual> list = t->visualsCache.value(page);
+    for (const VisualDelta& d : deltas) {
+        int i = -1;
+        for (int k = 0; k < list.size(); ++k)
+            if (list[k].uid == d.av.uid) { i = k; break; }
+        if (d.removed) { if (i >= 0) list.removeAt(i); }
+        else if (i >= 0) list[i] = d.av;
+        else list.append(d.av);
+    }
+    t->visualsCache.insert(page, list);
+    t->visualsRev[page] = t->annotMgr->pageRevision(page);
+    // co veHet/overlayCapable tinh lai TREN DANH SACH (dung dinh nghia cu o 2189/2308);
+    // capable chi duoc ha xuong, khong bao gio nang len khi chua nap lai ca trang —
+    // false la duong AN TOAN (cua bu ve lo), khong lam mat chu thich.
+    bool veHet = true;
+    for (const AnnotVisual& av : list) if (!av.paintByOverlay) { veHet = false; break; }
+    const bool capable = t->overlayCapablePage.value(page, false) && veHet;
+    t->overlayVeHetPage[page] = veHet;
+    t->overlayCapablePage[page] = capable;
+    if (out) *out = list;
+    qDebug().noquote() << "[annot] visuals MERGE page=" << page << "deltas=" << deltas.size()
+                       << "n=" << list.size() << "— khong lay khoa, khong cho bo dung trang";
+    return true;
+}
+
 void MainWindow::refreshAnnotVisuals(DocTab* t, int page) {
     if (!t || !t->annotMgr || !t->doc || !t->doc->isOpen()) {
         if (t && t->view) t->view->clearAnnotVisuals();
+        return;
+    }
+    // 🔴 LÁT C 0902: co delta + co nen → tron, ap ngay, KHONG nap lai ca trang.
+    QList<AnnotVisual> merged;
+    if (mergeAnnotVisuals(t, page, &merged)) {
+        applyAnnotVisuals(t, page, merged, t->overlayCapablePage.value(page, false),
+                          t->visualsHasForeign.value(page, false));
         return;
     }
     const quint32 rev = t->annotMgr->pageRevision(page);
@@ -2286,6 +2690,12 @@ void MainWindow::refreshAnnotVisuals(DocTab* t, int page) {
             qDebug().noquote() << "[overlay] can LOP BU page=" << page
                                << "— co visual overlay khong ve (paintByOverlay=false)";
         t->visualsHasForeign[page]  = r.hasForeign;
+        // 🔴 LÁT C 0902: tao/xoá xay ra TRONG LUC scan chay (luong tao phai cho
+        // scan nhả khoa) → anh cat tren day CHUA co chu thich moi. Delta ghi sau
+        // luc loadPageVisuals don sach van con trong hang → tron de len anh cat,
+        // khong duoc de no ghi de mat chu thich vua tao.
+        QList<AnnotVisual> mergedNow;
+        const bool mergedNowOk = mergeAnnotVisuals(t, page, &mergedNow);
         // Trang da doi / tab dong → VUT, khong day vao view.
         if (t->currentPage != page) {
             qDebug().noquote() << "[overlay] page=" << page
@@ -2302,7 +2712,11 @@ void MainWindow::refreshAnnotVisuals(DocTab* t, int page) {
             }
             return;
         }
-        applyAnnotVisuals(t, page, r.visuals, r.overlayCapable, r.hasForeign);
+        if (mergedNowOk)
+            applyAnnotVisuals(t, page, mergedNow, t->overlayCapablePage.value(page, false),
+                              r.hasForeign);   // LÁT C 0902: day danh sach DA TRON delta, khong phai anh cat cu
+        else
+            applyAnnotVisuals(t, page, r.visuals, r.overlayCapable, r.hasForeign);
         // [nav] dong cua lan lat nay (rescan xong, trang van hien tai) → stale=0.
         if (m_navLogArmed && m_navDeferTab == t && m_navDeferPage == page) {
             const qint64 visualsMs = QDateTime::currentMSecsSinceEpoch() - m_navVisualsStartMs;
@@ -2587,7 +3001,7 @@ void MainWindow::applyMarkupRefresh(DocTab* t, int page, bool touchedPageObjects
             FPDF_PAGE pg = PageCache::acquire(t->doc->raw(), page);
             if (pg) {
                 PageCache::PageBorrow _b(t->doc->raw(), page);   // R1: cap doi acquire()
-                t->vecLayer->rebuildNoteTiles(t->doc->raw(), pg);
+                t->vecLayers.value(page)->rebuildNoteTiles(t->doc->raw(), pg);
             }
         }
         if (t->view) { t->view->invalidateTileTextures(); t->view->update(); }
@@ -2614,7 +3028,12 @@ void MainWindow::setMarkupSelectionViews(DocTab* t, int page, const QRectF& rect
     if (t->view) {
         t->view->setSelectedAnnot(rectPdf);
         // Insert Image: Stamp cua TorReader co 4 tay nam goc de co gian.
-        t->view->setSelectResizable(type == QLatin1String("Stamp"));
+        // 🔴 0903 owner chot: FreeText CUNG phai keo goc duoc — khung quyet dinh cho
+        // xuong dong, co chu GIU NGUYEN (owner: "nam goc khung keo, text xuong dong theo").
+        // Duong ghi la CHUNG (annotationResizeRequested -> onAnnotResize ->
+        // setAnnotRectDisplay), khong rieng cho Stamp, nen chi can mo cong nay.
+        t->view->setSelectResizable(type == QLatin1String("Stamp")
+                                 || type == QLatin1String("FreeText"));
         if (type == QLatin1String("FreeText")) {
             t->view->setDragNote(rectPdf.normalized());
         } else {
@@ -2623,7 +3042,8 @@ void MainWindow::setMarkupSelectionViews(DocTab* t, int page, const QRectF& rect
     }
     if (m_continuousView) {
         m_continuousView->setSelectedAnnot(page, rectPdf);
-        m_continuousView->setSelectResizable(type == QLatin1String("Stamp"));
+        m_continuousView->setSelectResizable(type == QLatin1String("Stamp")
+                                          || type == QLatin1String("FreeText"));
         if (type == QLatin1String("FreeText"))
             m_continuousView->setDragNote(rectPdf.normalized());
         else
@@ -2944,12 +3364,12 @@ void MainWindow::onAnnotMove(DocTab* t, int page, double dx, double dy) {
     t->annotPageCache.remove(page);
     t->visualsCache.remove(page);
     t->visualsRev.remove(page);
-    if (baseIsVector(t, page) && t->vecLayer && t->annotMgr && t->doc) {
+    if (baseIsVector(t, page) && t->vecLayers.contains(page) && t->annotMgr && t->doc) {
         TimedPdfiumLock lk(__FILE__, __LINE__);
         FPDF_PAGE pg = PageCache::acquire(t->doc->raw(), page);
         if (pg) {
             PageCache::PageBorrow _b(t->doc->raw(), page);   // R1: cap doi acquire()
-            t->vecLayer->rebuildNoteTiles(t->doc->raw(), pg);
+            t->vecLayers.value(page)->rebuildNoteTiles(t->doc->raw(), pg);
         }
     }
     if (t->view) t->view->invalidateTileTextures();
@@ -3151,6 +3571,11 @@ void MainWindow::deleteSelectedAnnot(int page, int index) {
         // Foreign — cannot undo
         if (!t->annotMgr->removeAnnot(page, realIdx)) return;
         statusBar()->showMessage("Đã xoá — thao tác này không hoàn tác được", 4000);
+        // 🔴 LÁT C 0902: annot NGOAI khong co uid → khong co delta xoa → nen cu
+        // trong cache la ma SOI. Huy nen ep nap lai ca trang cho duong nay (hiem).
+        t->visualsCache.remove(page);
+        t->visualsRev.remove(page);
+        t->visualsHasForeign.remove(page);
     }
     invalidateAnnotPage(t, page);
     t->dirty = true; updateTabDirty(t);
@@ -3478,9 +3903,10 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path, bool structureChang
     PdfLinks::clearCache();
     // 🔴 Huy + cho xong tac vu lop bu truoc khi dong doc — df cu sap chet (crash 30/08).
     cancelForeignAnnotTasks(t);
+    // R1/0903: thumbPool workers dung CHUNG FPDF_DOCUMENT voi doc — phai stop + CHO
+    // thoat HAN truoc khi UI cham PDFium (closeDocument, doc->close).
+    stopThumbPool(t);
     TextSelection::closeDocument(t->doc->raw());
-    // R1: thumbPool workers dung CHUNG FPDF_DOCUMENT voi doc — phai stop TRUOC khi dong doc.
-    if (t->thumbPool) t->thumbPool->close();
     t->doc->close();
     t->renderer->setTileCache(nullptr);
 
@@ -3492,10 +3918,16 @@ void MainWindow::loadTabFile(DocTab* t, const QString& path, bool structureChang
     t->visualsRev.clear();
     t->visualsHasForeign.clear();
     t->pagesNeedGenerate.clear();
-    t->vecLayer.reset();
+    t->vecLayers.clear();   // KHO CHUNG: moi tai lieu = kho rong
     t->vecBuilding.clear();
     t->forceRasterPages.clear();   // dieu kien "bat buoc raster" la cua tai lieu CU
     t->torvecDirty.clear();        // co "trang da sua" cung la cua tai lieu CU
+    t->heavyRegionPages.clear();   // LÁT C: che do region cung thuoc tai lieu CU
+    t->heavyRegionCancel.reset();
+    t->heavyRegionBuilding = false;
+    t->heavyRegionPage = -1;
+    t->heavyRegionScale = 0.0;
+    t->heavyRegionPx = QRect();
     // Lop bu cua tai lieu CU vo nghia voi doc moi — reset de du lieu sau khong dung nham.
     t->fgnLayer.reset();
     t->fgnBuilding.clear();
@@ -3595,8 +4027,8 @@ if (m_fastMode && m_continuousView) {
              // GOC1: use user's zoom, not kFullRenderMaxPx
              qDebug() << "[perf] cont reload fast mode zoom=" << t->zoom;
              m_continuousView->setZoom(t->zoom);
-             m_continuousView->setDocument(t->doc.get(), t->renderer.get());
-             m_continuousView->setVectorCacheKey(t->pdfPath.isEmpty() ? t->doc->filePath() : t->pdfPath, t->pdfHash);
+              m_continuousView->setDocument(t->doc.get(), t->renderer.get(), &t->visualsCache, &t->vecLayers);
+              m_continuousView->setVectorCacheKey(t->pdfPath.isEmpty() ? t->doc->filePath() : t->pdfPath, t->pdfHash);
          }
     }
 }
@@ -3667,6 +4099,11 @@ void MainWindow::openFile(const QString& path) {
     tab->renderer = std::make_unique<PdfRenderer>(this);
     tab->annotMgr = std::make_unique<AnnotationManager>(this);
     tab->view     = new PdfGpuView(m_docTabs);
+    // LÁT A 09/02: Single view đọc kho chú thích duy nhất của CHÍNH tab này.
+    tab->view->setVisualsStore(&tab->visualsCache);
+    // LÁT B 09/02: tương tự cho kho lớp vector — view per-tab, gắn &tab->vecLayers
+    // một lần lúc tạo, chết cùng tab (PdfGpuView chỉ đọc qua con trỏ này).
+    tab->view->setVectorStore(&tab->vecLayers);
     tab->view->setDarkMode(m_darkMode);
     tab->view->setViewMode(PdfGpuView::ViewMode::Single);
     tab->view->beginLoading();
@@ -3705,7 +4142,16 @@ void MainWindow::openFile(const QString& path) {
         tab->zoom = z;
         if (tab == currentTab())
             onZoomChanged(z);
+        // SU KIEN 0902 (thay dong ho polling 1s gay vang app): zoom doi → vung nhin
+        // trang nang co the vuot anh region cu. updateHeavyRegion tu guard day du.
+        updateHeavyRegion(tab);
     });
+    // SU KIEN 0902 — PAN TRONG TRANG khong phat tin hieu nao cua PdfGpuView
+    // (wheelEvent chi update(); tilesNeeded bi chan early-return khi nen vector).
+    // QEvent::Paint la han noi cua Qt: den DUNG MOT LAN moi dam repaint, SAU khi
+    // pan offset da cap nhat — bo dem "vung nhin co the doi" khong poll, khong
+    // dong ho. Gia mot so sanh danh dien vung nhin trong updateHeavyRegion.
+    tab->view->installEventFilter(this);
 
     // ── Tile wiring ───────────────────────────────────────────────────────────
     connect(tab->view, &PdfGpuView::tilesNeeded,
@@ -3755,8 +4201,13 @@ void MainWindow::openFile(const QString& path) {
             [this, tab](int page, AnnotInfo) {
         if (!m_openDocs.contains(tab)) return;
         qDebug().noquote() << "[annot] annotationAdded page=" << page << "— quet lai + ve lai";
-        refreshAnnotVisuals(tab, page);
+        refreshAnnotVisuals(tab, page);   // LÁT C 0902: duong nay gio la TRON DELTA — hien ngay, khong cho khoa
         if (m_thumbPanel && m_thumbPanel->isCommentsTabVisible()) refreshCommentsForPage(tab, page);
+        // 🔴 LÁT C 0902 — goc cua "Note thi khong hien": Note/FreeText khong do overlay
+        // ve, chung song trong ANH RASTER. Nen dang la vector thi lenh ve lai o duong
+        // duoi bi chan (drop reason=vectorReady) va chu thich VO HINH VINH VIEN.
+        // Cung cach ma applyMarkupRefresh (undo/redo) van dung — o day thieu no.
+        forceRasterPage(tab, page);
         if (tab->renderer) {
             tab->renderer->markAnnotDirty(page);
             // 🔴 GO BO 2026-09-01: da thu goi reloadHandlePool() o day de ban sao co chu thich moi.
@@ -3811,13 +4262,13 @@ void MainWindow::openFile(const QString& path) {
                 if (m_fastMode) m_continuousView->datLaiLenhVeTrang(page);
             }
         }
-        if (baseIsVector(tab, page) && tab->vecLayer && tab->annotMgr && tab->doc) {
+        if (baseIsVector(tab, page) && tab->vecLayers.contains(page) && tab->annotMgr && tab->doc) {
             {
                 TimedPdfiumLock lk(__FILE__, __LINE__);
                 FPDF_PAGE pg = PageCache::acquire(tab->doc->raw(), page);
                 if (pg) {
                     PageCache::PageBorrow _b(tab->doc->raw(), page);   // R1: cap doi acquire()
-                    tab->vecLayer->rebuildNoteTiles(tab->doc->raw(), pg);
+                    tab->vecLayers.value(page)->rebuildNoteTiles(tab->doc->raw(), pg);
                 }
             }
             if (tab->view) tab->view->invalidateTileTextures();
@@ -4015,13 +4466,14 @@ void MainWindow::openFile(const QString& path) {
         dlg.setWindowTitle("Add text");
         if (dlg.exec() != QDialog::Accepted) return;
         QString txt = dlg.text();
-        double w = qMax(24.0, static_cast<double>(txt.length()) * 5.5 + 6.0);
-        QRectF r(rectPdf.topLeft(), QSizeF(w, 18.0));
-        tab->annotMgr->createInlineNote(page, r, txt, dlg.author(), false, m_annotStyle.strokeColor, m_annotStyle.fontSize);
+        // 🔴 FT-SIZE 0902: KHONG ghep o co dinh (w=length*5.5, h=18) nua — do chinh
+        // la nguyen nhan chu 24pt bi cat cuth trong o 18pt. Giu nguyen o user keo
+        // (lam chieu toi thieu); createInlineNote tu nong theo advance/chieu cao THAT.
+        tab->annotMgr->createInlineNote(page, rectPdf, txt, dlg.author(), false, m_annotStyle.strokeColor, m_annotStyle.fontSize);
         {
             MarkupUndoEntry ue; ue.kind = MarkupUndoEntry::AddNote; ue.page = page;
             ue.uid = tab->annotMgr->lastCreatedUid();
-            ue.noteRect = r;
+            ue.noteRect = rectPdf;   // o keo ban dau; createInlineNote tu nong vua chu khi redo
             ue.noteText = txt;
             ue.noteAuthor = dlg.author();
             ue.noteColor = m_annotStyle.strokeColor;
@@ -4105,6 +4557,7 @@ void MainWindow::openFile(const QString& path) {
         if (!watcher->result()) {
             // Failed — remove tab
             disconnect(tab->scrollConn);
+            stopThumbPool(tab);       // no-op hom nay (pool chua tao) — giu bat-bien moi duong don tab
             m_docTabs->removeTab(m_docTabs->indexOf(tab->view));
             m_openDocs.removeAt(tabIdx);
             delete tab->view;
@@ -4122,6 +4575,13 @@ void MainWindow::openFile(const QString& path) {
         tab->annotLayer = std::make_unique<AnnotationLayer>(this);
         tab->annotLayer->setDocument(tab->doc->raw());
         tab->annotLayer->setAnnotationManager(tab->annotMgr.get());
+        // 🔴 LÁT C 0902: noi soi day ANNOT_VISUAL_ADDED AnnotationLayer da phat tu
+        // 31/08 ma KHONG AI LANG NGHE — hinh/ink/marker vua ve xong da co san
+        // AnnotVisual (dung luc dang giu khoa). Bam no vao hang delta cua
+        // AnnotationManager de refreshAnnotVisuals tron vao cache → hien NGAY,
+        // khong xep hang sau bo dung trang nua.
+        connect(tab->annotLayer.get(), &AnnotationLayer::annotVisualAdded,
+                tab->annotMgr.get(), &AnnotationManager::recordVisualDelta);
 
         // Open persistent tile cache + thumbnail pool in background
         tab->tileCache = std::make_shared<TileCacheFile>();
@@ -4245,6 +4705,21 @@ void MainWindow::openFile(const QString& path) {
             if (img.isNull()) return;
             if (m_thumbPanel && tab == currentTab())
                 m_thumbPanel->acceptFromFullRender(idx, img);
+            // LỖI 2 0902 — duong quay lai cho DEFER vi khoa pdfium ban.
+            // `continuousPageReady` = MOT LUOT VE THAT SU XONG, tuc background VUA
+            // PHONG khoa pdfium va so object cua trang vua xong da duoc biet. Do la
+            // thoi diem an toan de thu lai nhung trang truoc do bi `TryPdfiumLock`
+            // tu choi (ghi vao fgnDeferred o ensureForeignAnnotLayer). Dung DUNG
+            // trang cua chung (`pg`), khong phai `idx` vua xong. Khong timer, khong
+            // polling — chi bat theo su kien render xong von da co.
+            if (tab == currentTab()) {
+                const QSet<int> pending = tab->fgnDeferred;
+                for (int pg : pending) {
+                    if (pg == idx) continue;   // idx tu no se duoc needAnnotVisuals lo
+                    tab->fgnDeferred.remove(pg);
+                    ensureForeignAnnotLayer(tab, pg);
+                }
+            }
         });
 
         tab->pageReadyConn = connect(
@@ -4311,7 +4786,7 @@ if (m_fastMode && m_continuousView) {
                 // Gio: giu NGUYEN cach noi day cu (theo `tab`), chi them phan lam no HIEN RA.
                 qDebug() << "[perf] cont loadTab fast mode zoom=" << tab->zoom;
                 m_continuousView->setZoom(tab->zoom);
-                m_continuousView->setDocument(tab->doc.get(), tab->renderer.get());
+                m_continuousView->setDocument(tab->doc.get(), tab->renderer.get(), &tab->visualsCache, &tab->vecLayers);
                 m_continuousView->setVectorCacheKey(tab->pdfPath.isEmpty() ? tab->doc->filePath() : tab->pdfPath, tab->pdfHash);
                 m_docTabs->setFixedHeight(m_docTabs->tabBar()->sizeHint().height());
                 m_continuousView->show();
@@ -4963,6 +5438,13 @@ void MainWindow::onTabChanged(int) {
     if (m_findBar) m_findBar->reset();
     clearAllSearchHighlights();
     auto* t = currentTab();
+    // LÁT A 09/02: ContinuousView dung chung moi tab → repoint kho visuals VE TAB HIEN
+    // HANH moi lan doi/dong tab, ke ca khi KHONG o fastMode (nhan tro, khong render).
+    // Ngo le: dong tab hien hanh luc dang Single ⇒ con tro cu tro vao DocTab sap delete.
+    if (m_continuousView) m_continuousView->setVisualsStore(t ? &t->visualsCache : nullptr);
+    // LÁT B 09/02: kho lớp vector cũng repoint theo tab — ContinuousView dùng chung,
+    // con trỏ cũ tro vào DocTab đã giải phóng là UB (kể cả khi đang ở chế độ Single).
+    if (m_continuousView) m_continuousView->setVectorStore(t ? &t->vecLayers : nullptr);
     // SUA 2026-08-30: duoi cache uu tien tai lieu KHONG dang xem truoc — bao cho
     // PageCache doc nao la doc cua tab hien tai (doc chua mo xong thi raw() = null).
     PageCache::setActiveDoc(t ? t->doc->raw() : nullptr);
@@ -4998,15 +5480,14 @@ void MainWindow::onTabChanged(int) {
         if (m_continuousView && t->view)
             m_continuousView->setTool(t->view->tool());
         // ── Vector overlay: show existing layer for this tab's current page ──
-        if (t->vecLayer && t->vecLayer->pageIndex() == t->currentPage)
-            setTabVectorLayer(t, t->vecLayer, t->currentPage);
-        else
-            setTabVectorLayer(t, nullptr, t->currentPage);
+        // LÁT B 09/02: kho chung khoa theo trang -> lay dung trang hien hanh, khong con
+        // chot "layer->pageIndex()==currentPage" (mau hien cua ki mot slot).
+        setTabVectorLayer(t, t->vecLayers.value(t->currentPage), t->currentPage);
         if (m_fastMode && m_continuousView && t->doc->isOpen()) {
             // GOC1: use user's zoom, not kFullRenderMaxPx
             qDebug() << "[perf] cont tabChanged fast mode zoom=" << t->zoom;
             m_continuousView->setZoom(t->zoom);
-            m_continuousView->setDocument(t->doc.get(), t->renderer.get());
+            m_continuousView->setDocument(t->doc.get(), t->renderer.get(), &t->visualsCache, &t->vecLayers);
             if (t->annotMgr) refreshAnnotVisuals(t, t->currentPage);
         }
 } else {
@@ -5158,6 +5639,9 @@ void MainWindow::onTabClose(int idx) {
         // Cancel queued renders immediately so the background threads can wind down
         // while the UI is already updating — avoids waitForDone() blocking the close.
         t->renderer->cancelPending();
+        // 0903: dung + CHO worker thumbnail thoat HET truoc khi UI cham PDFium
+        // (clearCache, dong view, mo tab Welcome) — dong cua so dua gay văng pdfium.dll.
+        stopThumbPool(t);
         disconnect(t->pageReadyConn);
         disconnect(t->scrollConn);
         // Doc dong: bo nho dem link theo trang cung duoc xoa (SPEC_PDF_LINKS).
@@ -5221,6 +5705,14 @@ void MainWindow::onPageChanged(int pageIndex) {
         int oldPage = t->currentPage;
         if (pageIndex == oldPage) return;
         t->currentPage = pageIndex;
+        // LAT G: roi trang cu — dong handle rieng neu khong co tac vu dang chay; neu
+        // dang chay thi watcher cua no thay currentPage != pg va dong lai. Reset danh
+        // dien vung nhin de trang moi duoc xet dung region tu dau.
+        if (!t->heavyRegionBuilding) closeHeavyPriv(t);
+        t->heavySeenPage = -1;
+        // SU KIEN 0902 (thay polling 1s): trang MOI den co the la trang nang — goi
+        // ngay updateHeavyRegion (tu guard: khong heavy / nen chua san sang thi return).
+        updateHeavyRegion(t);
         // 🔴🔴 2026-09-01: bao cho bo render biet trang HIEN TAI la trang nao.
         // Thieu buoc nay thi m_currentPage mai la 0, va MOI anh chat luong day du cua
         // trang khac 0 deu bi vut o cua cuoi voi "drop reason=notCurrent" — day la ly do
@@ -5286,7 +5778,7 @@ void MainWindow::onPageChanged(int pageIndex) {
 
         // ── Vector overlay: build if page changed and not already building ──
         if (!t->vecBuilding.contains(pageIndex)
-            && !(t->vecLayer && t->vecLayer->pageIndex() == pageIndex)) {
+            && !t->vecLayers.contains(pageIndex)) {
             int pg = pageIndex;
             t->vecBuilding.insert(pg);
             auto layer = std::make_shared<VectorLayer>();
@@ -5586,6 +6078,14 @@ void MainWindow::closeEvent(QCloseEvent* e) {
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // SU KIEN 0902 (thay polling 1s) — xem comment installEventFilter trong wiring tab:
+    // UpdateRequest = Qt bao "view sap ve lai", den sau khi pan/zoom/resize da ap
+    // dung, dung mot lan moi dam repaint. updateHeavyRegion tu gate (khong heavy /
+    // vung nhin khong doi thi thoat nanogiay), nen gan mien phi cho moi view khac.
+    if (event->type() == QEvent::UpdateRequest) {
+        auto* t = currentTab();
+        if (t && watched == t->view) updateHeavyRegion(t);
+    }
     if (watched == m_findBar->parent() && event->type() == QEvent::Resize && m_findBar->isVisible()) {
         auto* p = qobject_cast<QWidget*>(m_findBar->parent());
         if (p) {

@@ -68,6 +68,12 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.4.2" date="2026-09-03">
+      <description>
+        <p>The Text tool now writes a real FreeText annotation, so text you add is a proper PDF comment that other PDF software can read and edit. Vietnamese can be typed into annotations with any input method. Text wraps to its box and the box can be resized by dragging a corner. Fixes striped text over vector pages, a crash when closing a tab, and very large drawings that previously fell back to a blurred raster page. The Note button was removed and the markup grid rearranged to 5 by 2.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.4.2</url>
+    </release>
     <release version="2.4.1" date="2026-09-01">
       <description>
         <p>Markups now appear instantly instead of re-rendering the page, and stay visible through zoom and in continuous mode. Comments made in other PDF software are drawn by the PDF engine itself, so they keep their own font and background, and pages carrying them stay sharp when zoomed. Large CAD drawings reopen in a fraction of a second instead of a minute and a half. Fixes opening files whose names contain Vietnamese letters with two diacritics, the missing highlight on the current thumbnail, a crash when opening a second tab, and noise blocks in embedded logos on merged documents.</p>

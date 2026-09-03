@@ -271,6 +271,29 @@ void cancelPending();
     // dung cho ca luc RENDER, luc GHI dem va luc DOC dem. Truoc day 3 cho dung 3 cong thuc
     // khac nhau nen chot ghi-dem so voi 4000px da CHAN SACH viec ghi dem o 75 DPI.
     static double contTargetLongPx(double longSidePt);
+    // V1 2026-09-01 (HEAVYCAP): tran chat luong day DU THEO DO NANG cua tung trang.
+    // Trang nang (so object > kHeavyObjectThreshold — CUNG NGUON SO FPDFPage_CountObjects
+    // ma MainWindow in ra "[fgnlayer] SKIP - trang nang objects=") ma ve 4000px thi KHONG
+    // DUOC CAT GIUA CHUNG (log 0901: 100 lan "render CHUA XONG" + 779 RETRY cho mot trang
+    // 2,54 trieu object). Ha ve dung kich thuoc hien thi that (contDpi, mac dinh 150 DPI —
+    // da do 31/08 tren chinh trang nay: 2071 ms/luot, 3/3 trang XONG). Trang thuong giu
+    // nguyen 4000px (bench 4.5M lenh ve: 4000px chi 3265ms — van kip ve dich).
+    // MOT nguon duy nhat cho ca luc RENDER lan luc CHAP NHAN cache — neu hai cho dung hai
+    // so khac nhau thi chot "alreadyFullQuality" khong bao gio khop => bao RETRY.
+    double fullQCapPx(int pageIndex, double longSidePt) const {
+        if (pageObjectCount(pageIndex) <= kHeavyObjectThreshold)
+            return kFullRenderMaxPx;                        // Trang NHE: giu nguyen 4000px.
+        const double dpiCap = contTargetLongPx(longSidePt); // 150 DPI CO DINH — tran CU.
+        // 🔴 SUA 0902: `contTargetLongPx` KHONG phai tran — no la TI LE co dinh, nen trang
+        // cang to so pixel cang lon (A0 2381pt -> 4960px > tran cu 4000px). Trang nang nhat
+        // lai bi tang tai 24% => "render DAY DU 4960px" khong bao gio xong. Tran DUNG phai
+        // theo KICH THUOC HIEN THI THAT tren man hinh (zoom*dpr), lay min voi dpiCap va nhan
+        // he so du phong x1.5 cho zoom (zoom vua phai khong phai ve lai ngay).
+        const double dispFactor = m_contDisplayScale.load(std::memory_order_relaxed);
+        if (dispFactor <= 0.0)
+            return dpiCap;                                  // view chua bom kich thuoc -> nhu cu.
+        return qMin(dpiCap, qMax(1.0, longSidePt) * dispFactor * 1.5);
+    }
     // Thumbnail renders cap at this long-edge pixel count to avoid 43MB
     // thumbnail images for the page-navigation panel.
     // 2026-08-31: 400px lam thumbnail trang A0 ra 357x252 — owner bao "do phan giai rat thap".
@@ -280,6 +303,11 @@ void cancelPending();
     // GOC1: when true, continuous renders use zoom-based scale (capped at
     // kFullRenderMaxPx) instead of always kFullRenderMaxPx.
     void setContinuousUseZoomScale(bool on) { m_continuousUseZoomScale = on; }
+    // 0902: view bom kich thuoc hien thi THAT = (zoom * devicePixelRatio) cua khung nhin.
+    // Dung lam tran cho trang nang thay vi DPI co dinh. Khong doan, khong hardcode.
+    void setContinuousDisplayScale(double zoomTimesDpr) {
+        m_contDisplayScale.store(zoomTimesDpr, std::memory_order_relaxed);
+    }
 
     // Exposed for MainWindow to show placeholder immediately on page navigation
     QImage bestCachedForPage(int pageIndex) const;
@@ -415,5 +443,6 @@ private:
     QSet<int>                   m_annotDirtyPages;   // xem markAnnotDirty()
     mutable QMutex              m_annotDirtyMx;
     bool                        m_continuousUseZoomScale = false;  // GOC1
+    std::atomic<double>         m_contDisplayScale{0.0};   // 0902: zoom*dpr cua khung nhin (0 = chua biet)
 
 };

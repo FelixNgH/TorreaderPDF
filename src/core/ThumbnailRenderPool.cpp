@@ -50,6 +50,10 @@ void ThumbnailWorker::enqueue(int pageIndex, int priority) {
 void ThumbnailWorker::stop() {
     QMutexLocker lock(&m_mutex);
     m_stop = true;
+    // 0903: don hang doi de close()/wait() KHONG phai render het so thumbnail pending
+    // (mot lan dong tab co the con >100 request trong hang doi → drain = treo UI).
+    while (!m_queue.empty()) m_queue.pop();
+    m_queuedPrio.clear();
     m_cond.wakeAll();
 }
 
@@ -60,7 +64,9 @@ void ThumbnailWorker::run() {
             QMutexLocker lock(&m_mutex);
             while (m_queue.empty() && !m_stop)
                 m_cond.wait(&m_mutex);
-            if (m_stop && m_queue.empty()) break;
+            // 0903: stop = HUY toan bo, khong drain hang doi → wait() trong close()
+            // co buoc, khong treo UI thread khi dong tab.
+            if (m_stop) break;
             req = m_queue.top();
             m_queue.pop();
             // Lazy deletion: if this entry's priority doesn't match the best known,
