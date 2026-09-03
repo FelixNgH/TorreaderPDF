@@ -17,11 +17,26 @@ annotation, so what you add is a proper PDF comment.
 Vietnamese now types correctly into annotations with any input method, including those that send
 characters as key packets rather than as keystrokes.
 
+## Sharper and faster pages, in both view modes
+
+Pages that carry comments used to be locked to a raster image for the rest of the session, so they
+stayed soft when zoomed and were slow to redraw. They now use the vector page, in single-page mode
+and in continuous mode alike.
+
+- Dense drawings — site plans, master plans, planning sheets — stay crisp at any zoom instead of
+  blurring, and page flips and zoom steps are noticeably faster on them.
+- The vector page and the comment layer are now separate, so a page no longer has to choose
+  between showing comments and staying sharp.
+
+## Insert Image is now in the markup grid
+
+Insert Image moved out of the Comments tab into the markup grid, as the tenth tool where the Note
+button used to be. The stamp can still be resized by its four corner handles.
+
 ## Fixes
 
 - Text drawn over a vector page no longer appears striped.
 - Closing a tab no longer crashes the app.
-- Very large drawings keep their vector page instead of falling back to a blurred raster image.
 - The annotation store and the vector layer store were merged, so a page is parsed once instead
   of twice.
 
