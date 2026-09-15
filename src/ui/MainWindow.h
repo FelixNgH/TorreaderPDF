@@ -35,6 +35,7 @@ class ContinuousView;
 class QSplitter;
 class Translator;
 class TranslationPopup;
+class LanguagePickerPopup;
 class GoogleAuth;
 class UpdateChecker;
 class QTimer;
@@ -368,6 +369,7 @@ QAction*   m_viewQualityAct = nullptr;
     // Translation feature
     Translator*        m_translator  = nullptr;
     TranslationPopup*  m_transPopup  = nullptr;
+    LanguagePickerPopup* m_langPicker = nullptr;
     GoogleAuth*        m_googleAuth  = nullptr;
     UpdateChecker*     m_updateChecker = nullptr;
     QPoint             m_lastTransPos;

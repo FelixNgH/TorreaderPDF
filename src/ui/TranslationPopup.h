@@ -11,7 +11,8 @@ class TranslationPopup : public QWidget {
 public:
     explicit TranslationPopup(QWidget* parent = nullptr);
     void showTranslation(const QString& original, const QString& translation,
-                         const QPoint& globalPos);
+                         const QPoint& globalPos,
+                         const QString& langPair = QString());
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -20,6 +21,7 @@ private slots:
     void onCopy();
 
 private:
+    QLabel*       m_lblLangPair;
     QLabel*       m_lblOriginal;
     QLabel*       m_lblTranslated;
     QLabel*       m_lblCopied;

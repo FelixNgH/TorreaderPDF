@@ -1,0 +1,122 @@
+name: Windows build
+
+# Builds the portable Windows x64 package so the translate fix can be tested
+# without a local Qt/MSVC toolchain. PDFium is vendored in third_party/;
+# OpenSSL, QPDF and ZLIB come from vcpkg; Tesseract is left out, so OCR is
+# disabled in this build (the app builds and runs fine without it).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+      QT_VERSION: '6.8.1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache env for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: 'qtimageformats'
+          cache: true
+
+      - name: Install vcpkg dependencies (OpenSSL, QPDF, ZLIB, Tesseract)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            openssl:x64-windows qpdf:x64-windows zlib:x64-windows tesseract:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -S . -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows 2>&1 | Tee-Object -Variable cfg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # CMake only warns when Tesseract is missing and builds an OCR stub, which
+          # is far too quiet a way to ship a package with a headline feature gone.
+          if ($cfg -match 'Tesseract khong tim thay') {
+            throw "Tesseract was not found — OCR would be silently disabled in this build"
+          }
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          if (-not (Test-Path $out)) { $out = "build\bin" }
+          Get-ChildItem $out
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations "$out\TorReader.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # windeployqt's --compiler-runtime is a silent no-op on the runner, and
+          # the shipped portable build carries the CRT locally rather than assuming
+          # the VC++ redistributable is installed. Copy it in by hand.
+          $crt = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\2022\*\VC\Redist\MSVC" `
+                   -Directory -Filter 'Microsoft.VC*.CRT' -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\x64\\' } |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "MSVC redistributable CRT not found on the runner" }
+          Write-Host "CRT from $($crt.FullName)"
+          Copy-Item "$($crt.FullName)\*.dll" $out -Force
+          # Vendored PDFium and the vcpkg runtime DLLs sit outside windeployqt's view.
+          Copy-Item third_party\pdfium\bin\pdfium.dll $out -Force
+          $vcbin = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          if (Test-Path $vcbin) {
+            Copy-Item "$vcbin\*.dll" $out -Force -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Verify package contents
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          if (-not (Test-Path $out)) { $out = "build\bin" }
+          $missing = @()
+          foreach ($f in 'TorReader.exe','Qt6Network.dll','pdfium.dll',
+                          'msvcp140.dll','vcruntime140.dll','tls\qschannelbackend.dll') {
+            if (-not (Test-Path "$out\$f")) { $missing += $f }
+          }
+          if (-not (Get-ChildItem "$out" -Filter 'tesseract*.dll' -ErrorAction SilentlyContinue)) {
+            $missing += 'tesseract*.dll'
+          }
+          $langs = @(Get-ChildItem "$out\tessdata" -Filter *.traineddata -ErrorAction SilentlyContinue)
+          Write-Host "tessdata language files: $($langs.Count)"
+          if ($langs.Count -lt 10) { $missing += "tessdata/*.traineddata (found $($langs.Count), expected 10+)" }
+          if ($missing) { throw "Incomplete package, missing: $($missing -join ', ')" }
+          Write-Host "Package verified."
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          if (-not (Test-Path $out)) { $out = "build\bin" }
+          Compress-Archive -Path "$out\*" -DestinationPath TorReaderPDF-win64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TorReaderPDF-win64
+          path: TorReaderPDF-win64.zip
+          retention-days: 14

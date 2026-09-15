@@ -1562,6 +1562,18 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         update();
         return;
     }
+    // Ctrl/Alt + Left drag = marquee selection for translation. Checked here,
+    // before every tool branch below: those branches return unconditionally,
+    // so anywhere further down the gesture would simply never arm.
+    if ((e->modifiers() & (Qt::AltModifier | Qt::ControlModifier))
+        && e->button() == Qt::LeftButton && m_hasImage) {
+        m_selecting = true;
+        m_selStart  = e->position();
+        m_selEnd    = e->position();
+        setCursor(Qt::IBeamCursor);
+        update();
+        return;
+    }
     // Link: chi khi tool la Pan hoac Select, khong bat Ctrl. Bam vao link thi
     // di theo link truoc khi bat dau pan/chon chu (SPEC_PDF_LINKS muc 3).
     if ((m_tool == ViewTool::Pan || m_tool == ViewTool::SelectText)
@@ -1638,15 +1650,6 @@ void PdfGpuView::mousePressEvent(QMouseEvent* e) {
         m_clickClock.restart();
         m_clickValid = true;
         beginTextSelection(e->position(), 1);
-        return;
-    }
-    // Alt+Left drag = text selection for translation
-    if ((e->modifiers() & Qt::AltModifier) && e->button() == Qt::LeftButton) {
-        m_selecting = true;
-        m_selStart  = e->position();
-        m_selEnd    = e->position();
-        setCursor(Qt::IBeamCursor);
-        update();
         return;
     }
     if (e->button() == Qt::LeftButton || e->button() == Qt::MiddleButton) {

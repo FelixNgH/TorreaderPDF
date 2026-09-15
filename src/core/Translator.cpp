@@ -15,21 +15,58 @@
 #include <QMetaObject>
 #include <QSettings>
 #include <QTimer>
+#include <QSslSocket>
 #include <algorithm>
 
-static constexpr const char* kTargetLang = "vi";
 static constexpr const char* kGeminiModel = "gemini-2.5-flash";
 static constexpr const char* kCacheFileName = "translate_cache.json";
 static constexpr int kMaxMemoryEntries = 500;
 static constexpr int kMaxDiskEntries = 2000;
 static constexpr int kCacheSaveDebounceMs = 2000;
+static constexpr int kRequestTimeoutMs = 15000;
 
-static QString makeCacheKey(const QString& lang, const QString& text) {
+static QString makeCacheKey(const QString& srcLang, const QString& dstLang,
+                            const QString& text) {
     return QString::fromLatin1(
         QCryptographicHash::hash(
-            (lang + QLatin1String("\x1f") + text).toUtf8(),
+            (srcLang + QLatin1String("\x1f") + dstLang +
+             QLatin1String("\x1f") + text).toUtf8(),
             QCryptographicHash::Sha1)
         .toHex());
+}
+
+const QList<QPair<QString, QString>>& Translator::languages() {
+    static const QList<QPair<QString, QString>> kLangs = {
+        { QStringLiteral("auto"), QStringLiteral("Detect language") },
+        { QStringLiteral("en"),   QStringLiteral("English") },
+        { QStringLiteral("vi"),   QStringLiteral("Vietnamese") },
+        { QStringLiteral("zh-CN"),QStringLiteral("Chinese (Simplified)") },
+        { QStringLiteral("zh-TW"),QStringLiteral("Chinese (Traditional)") },
+        { QStringLiteral("ja"),   QStringLiteral("Japanese") },
+        { QStringLiteral("ko"),   QStringLiteral("Korean") },
+        { QStringLiteral("fr"),   QStringLiteral("French") },
+        { QStringLiteral("de"),   QStringLiteral("German") },
+        { QStringLiteral("es"),   QStringLiteral("Spanish") },
+        { QStringLiteral("pt"),   QStringLiteral("Portuguese") },
+        { QStringLiteral("it"),   QStringLiteral("Italian") },
+        { QStringLiteral("ru"),   QStringLiteral("Russian") },
+        { QStringLiteral("th"),   QStringLiteral("Thai") },
+        { QStringLiteral("id"),   QStringLiteral("Indonesian") },
+        { QStringLiteral("ms"),   QStringLiteral("Malay") },
+        { QStringLiteral("hi"),   QStringLiteral("Hindi") },
+        { QStringLiteral("ar"),   QStringLiteral("Arabic") },
+        { QStringLiteral("nl"),   QStringLiteral("Dutch") },
+        { QStringLiteral("pl"),   QStringLiteral("Polish") },
+        { QStringLiteral("tr"),   QStringLiteral("Turkish") },
+    };
+    return kLangs;
+}
+
+QString Translator::languageName(const QString& code) {
+    for (const auto& p : languages())
+        if (p.first.compare(code, Qt::CaseInsensitive) == 0)
+            return p.second;
+    return code;
 }
 
 Translator::Translator(QObject* parent)
@@ -45,13 +82,15 @@ Translator::Translator(QObject* parent)
     m_diskCachePath = appData + QLatin1Char('/') + QLatin1String(kCacheFileName);
 }
 
-void Translator::translate(const QString& text) {
-    const QString lang = QString::fromLatin1(kTargetLang);
-    const QString key = makeCacheKey(lang, text);
+void Translator::translate(const QString& text, const QString& srcLangIn,
+                           const QString& dstLangIn) {
+    const QString srcLang = srcLangIn.isEmpty() ? QStringLiteral("auto") : srcLangIn;
+    const QString dstLang = dstLangIn.isEmpty() ? QStringLiteral("vi")   : dstLangIn;
+    const QString key = makeCacheKey(srcLang, dstLang, text);
 
-    auto emitCached = [this, text](const QString& translation) {
-        QMetaObject::invokeMethod(this, [this, text, translation]() {
-            emit finished(text, translation);
+    auto emitCached = [this, text, srcLang, dstLang](const QString& translation) {
+        QMetaObject::invokeMethod(this, [this, text, translation, srcLang, dstLang]() {
+            emit finished(text, translation, srcLang, dstLang);
         }, Qt::QueuedConnection);
     };
 
@@ -70,26 +109,74 @@ void Translator::translate(const QString& text) {
         }
     }
 
-    QUrl url(QStringLiteral("https://translate.googleapis.com/translate_a/single"
-                            "?client=gtx&sl=auto&tl=%1&dt=t").arg(lang));
+    // A Qt build shipped without its TLS backend plugin cannot open *any* https
+    // connection, and the resulting reply error is opaque. Say so plainly.
+    if (!QSslSocket::supportsSsl()) {
+        emit failed(QStringLiteral(
+            "No TLS backend available, so https requests cannot be made. "
+            "The Qt 'tls' plugin folder is missing next to the executable "
+            "(re-run windeployqt on the build)."));
+        return;
+    }
 
-    QNetworkRequest req(url);
+    sendGoogleRequest(text, srcLang, dstLang, key, /*useGet=*/false);
+}
+
+// Google is asked twice before falling back to Gemini: first as the POST the
+// endpoint documents, then as a plain GET. Some proxies and captive networks
+// drop the POST body and hand back an empty 200, which used to look exactly
+// like "no response at all" from the UI.
+void Translator::sendGoogleRequest(const QString& text, const QString& srcLang,
+                                   const QString& dstLang, const QString& key,
+                                   bool useGet)
+{
+    QString urlStr = QStringLiteral("https://translate.googleapis.com/translate_a/single"
+                                    "?client=gtx&sl=%1&tl=%2&dt=t")
+                         .arg(QString::fromLatin1(QUrl::toPercentEncoding(srcLang)),
+                              QString::fromLatin1(QUrl::toPercentEncoding(dstLang)));
+    if (useGet)
+        urlStr += QStringLiteral("&q=") +
+                  QString::fromLatin1(QUrl::toPercentEncoding(text));
+
+    QNetworkRequest req((QUrl(urlStr)));
     req.setHeader(QNetworkRequest::ContentTypeHeader,
                   "application/x-www-form-urlencoded");
     req.setHeader(QNetworkRequest::UserAgentHeader,
                   "Mozilla/5.0 (compatible; TorReaderPDF/2.0.0)");
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::NoLessSafeRedirectPolicy);
+    // Without a timeout a stalled connection never emits finished(), so the UI
+    // would sit on "Translating…" forever with no error.
+    req.setTransferTimeout(kRequestTimeoutMs);
 
-    QByteArray body = "q=" + QUrl::toPercentEncoding(text);
-    QNetworkReply* rep = m_nam->post(req, body);
+    QNetworkReply* rep = useGet
+        ? m_nam->get(req)
+        : m_nam->post(req, QByteArray("q=") + QUrl::toPercentEncoding(text));
 
-    connect(rep, &QNetworkReply::finished, [this, rep, text, lang, key]() {
+    connect(rep, &QNetworkReply::finished, this,
+            [this, rep, text, srcLang, dstLang, key, useGet]() {
         rep->deleteLater();
+
+        const int http = rep->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray raw = rep->readAll();
+
+        qWarning("Translator: %s %s -> http=%d qterr=%d(%s) bytes=%lld",
+                 useGet ? "GET" : "POST",
+                 qPrintable(QStringLiteral("%1->%2").arg(srcLang, dstLang)),
+                 http, int(rep->error()), qPrintable(rep->errorString()),
+                 qint64(raw.size()));
+
         if (rep->error() != QNetworkReply::NoError) {
-            tryGeminiFallback(text, lang, key, rep->errorString());
+            const QString why = QStringLiteral("%1 (HTTP %2)")
+                                    .arg(rep->errorString()).arg(http);
+            if (!useGet)
+                sendGoogleRequest(text, srcLang, dstLang, key, /*useGet=*/true);
+            else
+                tryGeminiFallback(text, srcLang, dstLang, key, why);
             return;
         }
 
-        QByteArray raw = rep->readAll();
         QJsonDocument doc = QJsonDocument::fromJson(raw);
         QString translation;
 
@@ -126,17 +213,26 @@ void Translator::translate(const QString& text) {
         }
 
         if (translation.trimmed().isEmpty()) {
-            tryGeminiFallback(text, lang, key,
-                              QStringLiteral("No translation returned"));
+            // An empty 200 usually means the body never reached Google; retry
+            // as a GET before giving up on the endpoint entirely.
+            if (!useGet) {
+                sendGoogleRequest(text, srcLang, dstLang, key, /*useGet=*/true);
+                return;
+            }
+            tryGeminiFallback(
+                text, srcLang, dstLang, key,
+                QStringLiteral("Google returned HTTP %1 with %2 bytes and no "
+                               "translation").arg(http).arg(raw.size()));
         } else {
             addToCache(key, translation.trimmed());
-            emit finished(text, translation.trimmed());
+            emit finished(text, translation.trimmed(), srcLang, dstLang);
         }
     });
 }
 
-void Translator::tryGeminiFallback(const QString& text, const QString& lang,
-                                   const QString& key, const QString& primaryError)
+void Translator::tryGeminiFallback(const QString& text, const QString& srcLang,
+                                   const QString& dstLang, const QString& key,
+                                   const QString& primaryError)
 {
     if (!m_geminiKeyChecked) {
         m_geminiApiKey = qEnvironmentVariable("GEMINI_API_KEY");
@@ -149,7 +245,7 @@ void Translator::tryGeminiFallback(const QString& text, const QString& lang,
 
     if (m_geminiApiKey.isEmpty()) {
         emit failed(primaryError +
-                    QStringLiteral(" (Gemini fallback: chưa cấu hình GEMINI_API_KEY)"));
+                    QStringLiteral(" (Gemini fallback unavailable: GEMINI_API_KEY is not configured)"));
         return;
     }
 
@@ -161,12 +257,17 @@ void Translator::tryGeminiFallback(const QString& text, const QString& lang,
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     req.setHeader(QNetworkRequest::UserAgentHeader,
                   "Mozilla/5.0 (compatible; TorReaderPDF/2.0.0)");
-    req.setTransferTimeout(15000);
+    req.setTransferTimeout(kRequestTimeoutMs);
+
+    const QString fromPart = (srcLang == QLatin1String("auto"))
+        ? QString()
+        : QStringLiteral("from %1 ").arg(languageName(srcLang));
 
     QJsonObject partObj;
     partObj[QStringLiteral("text")] =
-        QStringLiteral("Translate the following text to %1. Return ONLY the translation, no explanations:\n\n%2")
-            .arg(lang, text);
+        QStringLiteral("Translate the following text %1to %2. "
+                       "Return ONLY the translation, no explanations:\n\n%3")
+            .arg(fromPart, languageName(dstLang), text);
 
     QJsonArray parts;
     parts.append(partObj);
@@ -183,8 +284,16 @@ void Translator::tryGeminiFallback(const QString& text, const QString& lang,
     QByteArray body = QJsonDocument(bodyObj).toJson(QJsonDocument::Compact);
     QNetworkReply* rep = m_nam->post(req, body);
 
-    connect(rep, &QNetworkReply::finished, [this, rep, text, key, primaryError]() {
+    connect(rep, &QNetworkReply::finished, this,
+            [this, rep, text, srcLang, dstLang, key, primaryError]() {
         rep->deleteLater();
+        const int http = rep->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QByteArray raw = rep->readAll();
+        qWarning("Translator: Gemini -> http=%d qterr=%d(%s) bytes=%lld",
+                 http, int(rep->error()), qPrintable(rep->errorString()),
+                 qint64(raw.size()));
+
         if (rep->error() != QNetworkReply::NoError) {
             emit failed(primaryError +
                         QStringLiteral(" (Gemini fallback: ") + rep->errorString() +
@@ -192,7 +301,6 @@ void Translator::tryGeminiFallback(const QString& text, const QString& lang,
             return;
         }
 
-        QByteArray raw = rep->readAll();
         QJsonDocument doc = QJsonDocument::fromJson(raw);
         QString translation;
 
@@ -214,7 +322,7 @@ void Translator::tryGeminiFallback(const QString& text, const QString& lang,
                         QStringLiteral(" (Gemini fallback: empty response)"));
         } else {
             addToCache(key, translation);
-            emit finished(text, translation);
+            emit finished(text, translation, srcLang, dstLang);
         }
     });
 }

@@ -2311,8 +2311,10 @@ const qint64 _m=_e.elapsed(); if(_m>20) qDebug().noquote()<<"[scrollms] wheelEve
 
 void ContinuousView::mousePressEvent(QMouseEvent* event)
 {
-    // Ctrl+Left drag = text selection for translation (giu nguyen, SPEC phan 2).
-    if ((event->modifiers() & Qt::ControlModifier)
+    // Ctrl+Left (or Alt+Left) drag = text selection for translation.
+    // Both modifiers are accepted so the gesture matches PdfGpuView and still
+    // works when the window manager eats Alt+drag.
+    if ((event->modifiers() & (Qt::ControlModifier | Qt::AltModifier))
         && event->button() == Qt::LeftButton)
     {
         m_selecting = true;
