@@ -76,6 +76,9 @@ public:
 
     void setZoom(double scale);
     void centerPage();
+    // Probe-only (--gpuview-zoomanchor-probe 2026-09-21): do lech neo khi setZoom
+    // (nut +/- / o nhap %) sau khi da pan. Tra ve bao cao nhieu dong.
+    QString probeZoomAnchor(double zoomFrom, double zoomTo, const QPointF& pan);
     void setViewMode(ViewMode mode);
     void setDarkMode(bool dark);
     void beginLoading();

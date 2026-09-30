@@ -1,6 +1,8 @@
 #include "TextSearch.h"
 #include "PdfCoords.h"
 #include "PdfiumLock.h"
+#include "DocTaskGate.h"
+#include "Bisect.h"
 #include <QtConcurrent>
 #include <QMutex>
 #include <QThread>
@@ -71,16 +73,26 @@ QString TextSearch::foldForMatch(const QString& text) {
 void TextSearch::search(PdfDocument* doc, const QString& query, Qt::CaseSensitivity cs,
                         bool matchDiacritics) {
     if (!doc || !doc->isOpen() || query.isEmpty()) return;
+    // 0927 LƯỢT 10 (--no-textpage): KHONG tim bang PDFium text. searchPageExact (FPDFText_
+    // LoadPage tai :112) va searchPageFolded (:165) deu la private va CHI co
+    // lambda ben duoi goi ⇒ chan o day la chan ca hai, khong can dong vao từng hàm.
+    if (trNoTextPage()) { emit searchComplete(0); return; }
     m_cancelled.storeRelaxed(0);
 
     FPDF_DOCUMENT rawDoc = doc->raw();
     int totalPages = doc->pageCount();
 
-    QtConcurrent::run([this, rawDoc, query, cs, matchDiacritics, totalPages]() {
+    // 🔴 0928 LƯỢT 22 (reviewer mục 2): token ĐĂNG KÝ LÚC SPAWN (UI thread) + RAII
+    // move — beginClose thấy cả task còn xếp hàng.
+    // 0928 LƯỢT 14: searchPageExact/Folded tự FPDF_LoadPage + FPDFText_LoadPage
+    // (ngoài PageCache) và QFuture bị bỏ rơi ⇒ không chờ được. Token sổ giữ
+    // doc cho tới khi vòng lặp trang cuối xong.
+    trdoc::Task task(rawDoc, "TextSearch::search");
+    QtConcurrent::run([task = std::move(task), this, rawDoc, query, cs, matchDiacritics, totalPages]() {
         int total = 0;
         const int kMaxMatches = 2000;
         for (int i = 0; i < totalPages && !m_cancelled.loadRelaxed()
-             && total < kMaxMatches; ++i) {
+             && !task.cancelled() && total < kMaxMatches; ++i) {
             auto results = matchDiacritics ? searchPageExact(rawDoc, i, query, cs)
                                            : searchPageFolded(rawDoc, i, query, cs);
             for (auto& r : results) {

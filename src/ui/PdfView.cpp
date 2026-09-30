@@ -153,9 +153,17 @@ void PdfView::paintEvent(QPaintEvent*) {
 
     // W2 (01/09): man hinh chao chi phu thuoc hasDocument() — xem PdfGpuView.
     // GIU !m_loading: dang tai trang dau thi nen bao "Loading...", khong phai chao.
+    // LƯỢT 35: day la NGUON DUY NHAT cua man chao (widget thuong, ve bang CPU — khong
+    // con ve chu len QOpenGLWidget nua). Mau theo theme (fgDim: sang #292929 tren
+    // #FFFFFF, toi #D6D6DD tren #000000 — du tuong phan, khong con "trang tren xam").
+    // Cỡ chữ: pointSizeF da duoc Qt quy theo logical DPI cua nen tang, nen no tu
+    // lon/nho theo DPI — chi lay font nen cua widget (khong hardcode pixel).
     if (!hasDocument() && !m_loading) {
-        p.setPen(QColor(200, 200, 200));
-        QFont f = p.font(); f.setPointSize(13); p.setFont(f);
+        const ThemeTokens& th = m_darkMode ? darkHC() : lightHC();
+        p.setPen(QColor(th.fgDim));
+        QFont f = p.font();
+        f.setPointSizeF(qMax(11.0, f.pointSizeF() * 1.15));
+        p.setFont(f);
         p.drawText(rect(), Qt::AlignCenter,
                    "TorReader PDF\n\nOpen a PDF to get started\n"
                    "File → Open   or   drag & drop");

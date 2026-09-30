@@ -69,6 +69,10 @@ public:
     // New reference-counting helpers for library initialization
     static void libAddRef();
     static void libRelease();
+    // 0928 LƯỢT 25 THÍ NGHIỆM (TORREADER_REINIT_IDLE): Destroy+Init lại PDFium khi
+    // rảnh. CHI khi refCount==1 (khong con tai lieu/pool song). Tra ve false neu
+    // refCount khong dung 1 — khong pha giua chung.
+    static bool libReinitIdle();
 
 private:
     FPDF_DOCUMENT   m_doc       = nullptr;

@@ -5,6 +5,7 @@
 #include <QStackedWidget>
 #include <QButtonGroup>
 #include <QAtomicInt>
+#include <QTimer>
 #include <QList>
 #include <QSet>
 #include <QHash>
@@ -23,6 +24,8 @@ class QPushButton;
 class QComboBox;
 class QLabel;
 class QFrame;
+class QDialog;
+class QPlainTextEdit;
 
 class ThumbCurrentPageDelegate;
 
@@ -50,6 +53,42 @@ public:
     void clearThumbnails();
     void setDarkMode(bool dark);
     void selectCommentFor(int pageIndex, int annotIndex);
+
+    // 0927 LUOT 4 (VIEC A/C) - probe doc o sua chu thich trong sidebar.
+    // CHI cho harness --sidebar-edit-probe; khong dung giong duong dung.
+    struct CommentRowProbe {
+        int     page = -1;
+        int     indexInPage = -1;
+        bool    isOwn = false;
+        bool    exists = false;            // hang co that su trong list
+        bool    hasEdit = false;           // co o nhap
+        bool    editableInPlace = false;   // setReadOnly(false) = sua tai cho
+        bool    displayOnly = false;       // true = che do CHI-HIEN-THI
+        bool    hasExpandBtn = false;      // co nut expand mo popup
+        QString text;                      // nguyen van ban hien ra (da them dau ...)
+        bool    tooltipHasAllText = false;
+        int     popupLines = -1;           // so dong trong QPlainTextEdit cua popup
+        bool    popupOkEnabled = true;     // nut OK trong popup co bat hay khong
+    };
+    int  probeCommentRowCount() const;
+    // row = -1 = de doi chon row dau tien. idxInPage dung de doi chieu voi
+    // chi so doc duoc trong list (thuong khop nhau, nhung khong tu dong).
+    CommentRowProbe probeCommentRow(int page, int indexInPage, int row = -1) const;
+    // Mo popup theo DUNG DUONG GIONG NGUOI DUNG: goi dung nghia Qt
+    // (QPushButton::click) tren nut expand, hoac keyPress Return/F2 len o.
+    // false neu khong co gi de bam.
+    bool probeOpenCommentPopup(int page, int indexInPage, int row = -1,
+                               const QString& byButton = QString());
+    // Dat chu MOI (nhieu dong, giu nguyen newline) vao QPlainTextEdit dang mo
+    // roi accept() dung duong OK. false neu chua mo popup.
+    bool probeSetPopupTextAndAccept(const QString& text);
+    bool probeCommentPopupOpen() const { return m_cmtPopup != nullptr; }
+    // 🔴 0927 LUOT 5 (LOI 3) - --sidebar-popup-hold: toa do popup DANG
+    // mo (global) + toa do hang da bam (global), de harness in ra de CEO canh
+    // vung chup man hinh. rGeometry() = trong mau = khi popup chua mo.
+    bool probePopupGeometry(QRect* popupGlobal, QRect* rowGlobal) const;
+    // Dong popup (khong ghi gi) - dung khi ket thuc gioi han giu popup.
+    void closeCommentPopupIfOpen();
 
     // Search
     void addSearchResult(const SearchResult& result);
@@ -79,7 +118,9 @@ public:
     int  currentTabIndex() const { return m_stack ? m_stack->currentIndex() : 0; }
 
 public slots:
-    void onPageReady(int pageIndex, const QImage& image, quint64 epoch);
+    // 0928 LƯỢT 15: `draft` = ảnh CHƯA render xong (quá trần thời gian worker).
+    // Mặc định false để các lời gọi thử nghiệm trong main.cpp không phải sửa.
+    void onPageReady(int pageIndex, const QImage& image, quint64 epoch, bool draft = false);
     // 🔴 2026-08-31: nhan anh trang DAY DU da render san, thu nho lam thumbnail.
     // Do duoc: thumbnail cua trang quai vat ton 11.942 ms — gan bang mot luot render day du,
     // vi PDFium phai DOC LAI toan bo 2,54 trieu doi tuong du anh ra chi 300px.
@@ -109,6 +150,10 @@ signals:
 private:
     friend class ThumbCurrentPageDelegate;
     bool eventFilter(QObject* o, QEvent* e) override;
+    // 0927 LUOT 4 - mo popup sua chu thich (nhieu dong). DUNG LAI
+    // NoteInputDialog (QPlainTextEdit) - khong viet hop thu hai.
+    void  openCommentPopup(QWidget* row, int page, int indexInPage, bool editable);
+    void  closeCommentPopup();
     void requestVisibleThumbnails();
     void resizeEvent(QResizeEvent* event) override;
     void buildBookmarks();
@@ -139,6 +184,10 @@ private:
     ThumbnailRenderPool* m_thumbPool = nullptr;
     QMetaObject::Connection m_thumbPoolConn;
     QMetaObject::Connection m_scrollConn;
+    // 0928 LƯỢT 15b: gom 60 lần valueChanged của một cú cuộn bánh xe thành MỘT lần
+    // đo, sau khi layout đã ngồi xuống. Không có debounce thì đo giữa lúc
+    // `doItemsLayout` đang chạy ⇒ đọc vùng cũ.
+    QTimer        m_scrollDebounce;
     int           m_currentPage = -1;
     QAtomicInt    m_contentGen{0};
     QAtomicInt    m_bookmarkGen{0};
@@ -153,6 +202,11 @@ private:
     QComboBox*   m_sizeCombo   = nullptr;
     QLabel*      m_commentsHint = nullptr;
     QFrame*      m_commentsSep  = nullptr;
+    // Popup sua chu thich: thuoc tinh rieng de giu con trong khi popup
+    // dong. parent = chinh panel (khong phai hang) - QWidget cha khong giu
+    // doi tuong con nen khong lo me tham chieu.
+    QDialog*     m_cmtPopup     = nullptr;
+    QPlainTextEdit* m_cmtPopupEdit = nullptr;
     double       m_annFontSize = 24.0;
     bool         m_sizeIsFont  = false;
     bool         m_dark        = false;

@@ -1,4 +1,5 @@
 #include "PdfGpuView.h"
+#include "LoadingBadge.h"
 #include "../core/PdfiumLock.h"
 #include "../core/PdfDocument.h"
 #include <QOpenGLExtraFunctions>
@@ -508,11 +509,17 @@ void PdfGpuView::paintGL() {
         p.setCompositionMode(QPainter::CompositionMode_Source);
         p.fillRect(rect(), deskBgColor());
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        p.setPen(QColor(200, 200, 200));
-        QFont f = p.font(); f.setPointSize(13); p.setFont(f);
-        p.drawText(rect(), Qt::AlignCenter,
-                   "TorReader PDF\n\nOpen a PDF to get started\n"
-                   "File → Open   or   drag & drop");
+        // LUOT 42 (30/09): chu man chao ve qua QImage CPU, khong qua glyph cache
+        // GL — cung goc benh voi chu Loading (xem LoadingBadge.h). Man chao nay
+        // (!hasDocument()) van con ve truc tiep tren QOpenGLWidget nay, khac voi
+        // ContinuousView (da doi han sang tab "Welcome" rieng tu LUOT 35).
+        {
+            const QImage badge = loadingBadgeImage(
+                QStringLiteral("TorReader PDF\n\nOpen a PDF to get started\n"
+                                "File → Open   or   drag & drop"),
+                13, false, QColor(200, 200, 200), devicePixelRatioF());
+            drawLoadingBadge(p, rect(), badge);
+        }
         return;
     }
 
@@ -769,10 +776,16 @@ void PdfGpuView::paintGL() {
             }
         }
         // "Loading…" chi hien o che do raster; pure vector khong can chu nay
-        if (!pureVector) {
-            QFont f = p.font(); f.setPointSize(26); f.setBold(true); p.setFont(f);
-            p.setPen(QPen(QColor(255, 255, 255), 2));
-            p.drawText(rect(), Qt::AlignCenter, "Loading…");
+        // 🔴 0928 LƯỢT 13 — va CHI khi trang con TRONG. `m_hasImage` = true ngay
+        // tu lan partial dau tien (setPartialImage, :981), tuc la trang DA CO
+        // noi dung dang ve dan. Ban truoc ve chu nay de len chinh noi dung do
+        // ("chu Loading de len trang") — dung thuoc trong yeu cau 5.
+        if (!pureVector && !m_hasImage) {
+            // LUOT 42 (30/09): chu Loading ve qua QImage CPU, khong qua glyph
+            // cache GL (widget nay CHINH NO la QOpenGLWidget, xem LoadingBadge.h).
+            const QImage badge = loadingBadgeImage(QStringLiteral("Loading…"), 26, true,
+                                                    QColor(255, 255, 255), devicePixelRatioF());
+            drawLoadingBadge(p, rect(), badge);
         }
     }
 
@@ -1034,7 +1047,16 @@ void PdfGpuView::beginLoading() {
 }
 
 void PdfGpuView::setZoom(double scale) {
-    m_zoom = qBound(0.1, scale, 10.0);
+    const double newZoom = qBound(0.1, scale, 10.0);
+    // 🔴 LOI 3 (0921): doi zoom bang nut +/- hay o nhap % truoc day KHONG co gian
+    // m_panOffset ⇒ diem duoi TAM khung nhin (pwPt/2 - pan/zoom) troi voi MOI pan!=0
+    // (keo trang roi bam +/- la nhay). Nay neo DUNG nhu duong Ctrl+wheel
+    // (PdfGpuView.cpp wheelEvent): giu diem tai lieu o TAM khung nhin dung yen, tuc
+    // co gian m_panOffset theo ti le zoom. Fit Page goi centerPage() nen khong dinh.
+    const QPointF center(width() / 2.0, height() / 2.0);
+    const QPointF centerPdf = widgetToPdf(center);
+    m_zoom = newZoom;
+    m_panOffset += center - pdfToWidget(centerPdf);
     m_tiles.clear();
     m_tilePage = -1;
     m_tileScale = 0.0;
@@ -1047,6 +1069,47 @@ void PdfGpuView::centerPage() {
     m_panOffset = QPointF();
     invalidateSharp();
     update();
+}
+
+QString PdfGpuView::probeZoomAnchor(double zoomFrom, double zoomTo, const QPointF& pan)
+{
+    // Trang A4 gia: phep do chi dung hinh hoc (pageOrigin + zoom + pan), khong can anh.
+    m_pageSizePt = QSizeF(595.0, 842.0);
+    m_zoom = qBound(0.1, zoomFrom, 10.0);
+    m_panOffset = pan;
+    m_hasImage = false;
+    m_loading = false;
+
+    const QPointF center(width() / 2.0, height() / 2.0);
+    const QPointF before = widgetToPdf(center);   // doc point duoi TAM TRUOC khi setZoom
+    // Mo phong BAN CU (khong gian panOffset): giu pan, chi doi zoom.
+    const QPointF originOld(width() / 2.0 - m_pageSizePt.width()  * qBound(0.1, zoomTo, 10.0) / 2.0,
+                            height() / 2.0 - m_pageSizePt.height() * qBound(0.1, zoomTo, 10.0) / 2.0);
+    const QPointF afterOld = (center - (originOld + pan)) / qBound(0.1, zoomTo, 10.0);
+    setZoom(zoomTo);                              // <-- ham dang kiem
+    const QPointF after = widgetToPdf(center);    // doc point duoi TAM SAU khi setZoom
+    const double devX = (after.x() - before.x()) * m_zoom;
+    const double devY = (after.y() - before.y()) * m_zoom;
+    const double devMax = qMax(qAbs(devX), qAbs(devY));
+    const double devOldX = (afterOld.x() - before.x()) * m_zoom;
+    const double devOldY = (afterOld.y() - before.y()) * m_zoom;
+
+    QString rep;
+    rep += QStringLiteral("GPUVIEW_ZOOMANCHOR pan=(%1,%2) zoom %3 -> %4 size=%5x%6\n")
+               .arg(pan.x(), 0, 'f', 1).arg(pan.y(), 0, 'f', 1)
+               .arg(zoomFrom, 0, 'f', 3).arg(m_zoom, 0, 'f', 3)
+               .arg(width()).arg(height());
+    rep += QStringLiteral("  docPt TAM TRUOC (pt) x=%1 y=%2\n")
+               .arg(before.x(), 0, 'f', 3).arg(before.y(), 0, 'f', 3);
+    rep += QStringLiteral("  docPt TAM SAU   (pt) x=%1 y=%2\n")
+               .arg(after.x(), 0, 'f', 3).arg(after.y(), 0, 'f', 3);
+    rep += QStringLiteral("  lech MOI (px) dx=%1 dy=%2 max=%3  %4\n")
+               .arg(devX, 0, 'f', 3).arg(devY, 0, 'f', 3).arg(devMax, 0, 'f', 3)
+               .arg(devMax < 2.0 ? QStringLiteral("PASS") : QStringLiteral("FAIL"));
+    rep += QStringLiteral("  lech CU  (px) dx=%1 dy=%2 max=%3 (khong gian panOffset)\n")
+               .arg(devOldX, 0, 'f', 3).arg(devOldY, 0, 'f', 3)
+               .arg(qMax(qAbs(devOldX), qAbs(devOldY)), 0, 'f', 3);
+    return rep;
 }
 
 void PdfGpuView::requestTiles() {

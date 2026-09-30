@@ -8,7 +8,9 @@
 #include <QHash>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QFutureSynchronizer>
 #include <QAtomicInt>
+#include <atomic>
 #include <limits>
 #include <memory>
 #include "core/PdfDocument.h"
@@ -54,6 +56,12 @@ struct TextSel {
 };
 
 struct DocTab {
+    // 🔴 0928 LƯỢT 22 — MÃ THẾ HỆ: mọi lambda queued bắt con trỏ DocTab chốt
+    // `m_openDocs.contains(t)` chỉ theo ĐỊA CHỈ; malloc có thể cấp lại đúng địa
+    // chỉ đó cho DocTab mới ⇒ event cũ chạm nhầm tab mới. Serial tăng đơn điệu
+    // theo mỗi `new DocTab` — lambda chụp serial lúc spawn và so khi chạy.
+    inline static quint64 sTabSerial = 0;   // chỉ luồng UI ghi (openFile)
+    quint64 serial = ++sTabSerial;
     std::unique_ptr<PdfDocument>       doc;
     std::unique_ptr<PdfRenderer>       renderer;
     std::unique_ptr<AnnotationManager> annotMgr;
@@ -63,16 +71,58 @@ struct DocTab {
     PdfGpuView* view        = nullptr;
     int      currentPage    = 0;
     double   zoom           = 1.0;
+    // 🔴 LƯỢT 33b (L): offset cuon THAT cua che do Continuous theo tung tab, de quay
+    // lai tab khong bi NHAY VE TRANG 1 (setDocument luôn reset ve dinh). Luu moi lan
+    // cuon lang (pageChanged), khoi phuc sau setDocument + lay layout.
+    int      contScrollY    = 0;
+    bool     contPosSaved   = false;
     QMetaObject::Connection pageReadyConn;
     QMetaObject::Connection scrollConn;
     QList<AnnotInfo> annotCache;
     bool     annotCacheValid = false;
     bool     annotScanInFlight = false;  // guards concurrent full annot scans
+    // 🔴 LƯỢT 33e (muc 2 — reviewer loi 2): tab thanh hien hanh luc scan cu con
+    // in-flight (bi stopScan cat) ⇒ danh dau de finished handler TU spawn lai.
+    bool     annotRescanWanted = false;
     QFuture<void> annotScanFuture;
     QFuture<void> annotVisualsFuture;    // rescan loadPageVisuals in flight (SPEC_NAV_INSTANT)
     QFuture<void> annotPageFuture;       // loadPage background (VIỆC 1 SPEC_SMOOTH_123)
+    // 🔴 0928 LƯỢT 21 — future mở file (docPtr->open chạy trên QtConcurrent).
+    // ĐÓNG TAB KHI OPEN CÒN CHẠY ⇒ closeJob nền PHẢI waitForFinished TRƯỚC
+    // `delete t` (~PdfDocument unmap mmap view trong lúc pdfium còn đọc nó —
+    // dump TorReader_r8.exe.32832: pdfium đọc NULL tại PdfDocument.cpp:101).
+    QFuture<bool> openFuture;
+    // 🔴 0928 LƯỢT 22 — DANH SÁCH future (thay vì một SLOT bị ghi đè):
+    // fgnFuture/annotVisualsFuture/annotPageFuture/fgnRegionFuture/heavyRegionFuture
+    // mỗi trang một lần spawn, slot cũ bị ghi đè ⇒ shutdownTab chỉ chờ CÁI MỚI
+    // NHẤT, task cũ vẫn chạm doc/mgr sau `delete t`. MỌI QtConcurrent::run của
+    // tab chạm PDFium/mgr PHẢI push một lệnh chờ vào đây; shutdownTab chờ HẾT.
+    // (Danh sách hàm-chờ, không phải QFutureSynchronizer<void>: Qt6 từ chối
+    //  addFuture(QFuture<bool>) — không có conversion sang QFuture<void>.)
+    // KHÔNG gom vec build/OCR vào: chúng không đọc t->, token sổ + shared_ptr
+    //  vecGen bảo vệ; chờ chúng trên UI = đứng hình.
+    // 🔴 LƯỢT 22b (reviewer mục 4): thêm cờ "done" để DỌN mục đã xong khi push —
+    // bản L22 chỉ push, danh sách tăng đơn điệu theo số lần spawn của tab.
+    struct BgWait { std::function<void()> wait; std::function<bool()> done; };
+    QList<BgWait> bgWaits;
+    template <class F> void addBgWait(F f) {   // copy theo giá trị — waitForFinished non-const
+        for (int i = bgWaits.size() - 1; i >= 0; --i)
+            if (bgWaits[i].done()) bgWaits.removeAt(i);
+        bgWaits.push_back({ [f]() mutable { f.waitForFinished(); },
+                            [f]() { return f.isFinished(); } });
+    }
     QSet<int>     visualsScanning;       // trang dang co rescan chay (tranh trung lap)
+    // 🔴 LƯỢT 33f (mục 3 — reviewer): tran cho vong hen thu lai ABORTED (500*n, max 5
+    // lan) + danh dau trang KHONG DOC DUOC (fpage null) de dung thu vo han.
+    QHash<int, int> visualsRetry;
+    QSet<int>       visualsUnreadable;
+    // 🔴 LƯỢT 33f (mục 1 — đo full probe): trang quái vật (≥1M object) đã hẹn HOAN 2 s
+    // de flip xong moi quet — tranh chan flip ke tiep 1,65 s (page 4: 1135→3101 ms).
+    QSet<int>       visualsHeavyDue;
     QHash<int, QList<AnnotInfo>> annotPageCache;
+    // 🔴 LƯỢT 40b: retry counters cho lock-busy detection
+    int pickRetryAttempt = 0;    // onAnnotPick retry counter
+    int ctxRetryAttempt = 0;     // onAnnotContext retry counter
     QHash<int, bool> overlayCapablePage;   // cached per-page overlay capability
     // 🔴 CO RIENG 2026-09-01: "overlay co ve HET moi annot cua trang nay khong".
     // KHONG duoc gop vao `overlayCapablePage` — co do con phuc vu viec khac, ha no xuong
@@ -110,6 +160,18 @@ struct DocTab {
     QFuture<bool> fgnRegionFuture;                  // future cua buildRegion dang chay
     int warmingPage = -1;
     QSet<int> vecBuilding;  // pages currently building vector layer (anti-duplicate)
+    // 🔴 0928 LƯỢT 13 — THẾ HỆ ĐỂ HUY VIỆC THỪA. Tăng mỗi lần đổi trang; mọi
+    // `VectorLayer::build` đang chạy cho trang cũ so `vecGen` này và bỏ ở RÁNH
+    // GIỚI LÁT KẾ TIẾP. Đo được trên máy test: End+PgUp×111 làm app dựng vector
+    // cho 26 trang đã lướt qua (349,348,…,324) — 143 s build vector trong một phiên
+    // — và trang ĐANG XEM phải chờ 2905 ms trên khoá chung.
+    // ponytail: đếm nguyên, đọc từ mọi luồng; không cần std::atomic vì chỉ luồng
+    // giao diện ghi, worker chỉ đọc.
+    // 🔴 0928 LƯỢT 22 — shared_ptr: lambda vec build chạy TRÊN LUỒNG NỀN đọc cái
+    // này; `delete t` (closeJob nền) có thể đã giải phóng DocTab khi task còn xếp
+    // hàng/chạy (future vec KHÔNG được chờ — build CAD tới 14 s). shared_ptr sống
+    // cùng lambda, tab chết không kéo theo nó.
+    std::shared_ptr<std::atomic<quint32>> vecGen = std::make_shared<std::atomic<quint32>>(0);
     // 🔴 Trang DA BI SUA trong phien nay (markup/di chuyen note...). Cache .torvec khoa theo
     //    HASH FILE TREN DIA, ma sua trong bo nho thi hash KHONG doi => cache se tra ve hinh
     //    CU va nuot moi chinh sua (loi 2026-08-19: keo comment, o chon di nhung hinh o lai).
@@ -189,6 +251,17 @@ public:
 
     // Probe-only: expose tab hien tai cho --contvec-probe (currentTab la private).
     DocTab* currentTabForProbe() const { return currentTab(); }
+    // Probe-only (0927 LƯỢT 2): gọi ĐÚNG đường Save của app (onSaveFile) —
+    // không phải mgr.saveDocument() trần. Lý do: onSaveFile mới materialize
+    // pagesNeedGenerate, giải phóng handle PDFium rồi replaceFileAtomically;
+    // gọi tầng thấp sẽ BỎ QUA chính những bước đó (đã đo 27/09: probe gọi
+    // mgr.saveDocument() ⇒ không đúng đường người dùng bấm Save).
+    // Đánh dấu tab là dirty rồi trả về đường dẫn đã ghi (rỗng = thất bại).
+    QString probeSaveViaGui(QString* errOut = nullptr);
+    // Probe-only (0927 LƯỢT 2): chạy onSaveFile() TRONG 1 sự kiện vòng lặp
+    // (QTimer 0) + vòng processEvents ⇒ các bước chờ pool/giá trong
+    // onSaveFile vẫn thoát. Hàm trả về khi timer nổ. Rỗng nghĩa là treo.
+    bool probeSaveViaGuiAsync(QString* errOut = nullptr);
 
     // Probe-only: lai che do xem tu dong lenh (dung cho --viewprobe).
     // centerXpt/centerYpt: toa do TRANG PDF (goc duoi-trai, don vi point).
@@ -217,6 +290,8 @@ public:
     // "render bi cat giua chung" — bai do dung yen khong bao gio cham toi nhanh do.
     void probeScrollToPage(int p);   // dinh nghia trong .cpp (ContinuousView chi khai bao truoc o day)
     void probeSetZoom(double z);      // dat zoom cho ContinuousView (bai do markup+zoom)
+    // Probe-only (--zoomanchor-probe 2026-09-21): do lech neo Ctrl+zoom o ContinuousView.
+    QString probeZoomAnchor(int page, double zFrom, double zTo, double fx, double fy);
     void probeSetZoomSingle(double z); // dat zoom cho view Single
     // Bai do TAO ANNOT (2026-09-01): di DUNG duong ma nguoi dung di khi bam nut Note/Text.
     bool probeCreateNote(int page, double xPt, double yPt);
@@ -232,7 +307,64 @@ public:
     int probeCurrentPage() const;
     bool probeIsFastMode() const { return m_fastMode; }
     QString probeMemBreakdown() const;   // bai do bo nho 31/08
+    // 🔴 LƯỢT 30 (VIỆC 1 — DO RAM): soi TỪNG kho giữ bộ nhớ để chỉ ra ai chiếm ≥80%.
+    // docIdx = chi so trong m_openDocs (tab Welcome khong tinh).
+    QString probePoolInfoAll() const;          // pool doc moi tab: slots/everUsed/idle/renders
+    int     probeIdlePoolDocsAll() const;      // tong doc RANH moi tab (de lap vong dong)
+    int     probeOpenDocCount() const { return m_openDocs.size(); }  // so DocTab (khong tinh Welcome)
+    bool    probeContinuousVisible() const;   // LƯỢT 37 muc B: ContinuousView dang AN hay HIEN?
+    bool    probeCloseOneIdlePoolDocTab(int docIdx);  // dong 1 doc ranh cua tab docIdx
+    QString probeRamBreakdown() const;         // pool + globalCache + PageCache + vector + thumb
     void    probeCloseTab(int idx) { onTabClose(idx); }
+    // Probe-only (--owner3tab-probe LƯỢT 17): chi-doc. So tab hien co (Welcome tinh 1)
+    // va trang p da co anh trong m_pageImages cua ContinuousView (tinh hieu that
+    // "trang render xong co anh" — cung kho "[perf] cont ACCEPT" ghi vao).
+    int  probeTabCount() const;
+    bool probePageHasImage(int p) const;
+    // Probe-only (LƯỢT 31b): scale THAT cua anh trang p trong ContinuousView (-1 chua co).
+    double probePageImageScale(int p) const;
+    // Probe-only (LƯỢT 37 bước O): co thu nhỏ nen dang bay? / bao nhieu lan guard bo ban cu?
+    int    probeContDownscaleInFlight() const;
+    qint64 probeContStaleDrops() const;
+    // 🔴 LƯỢT 33a (bai do J/K/L) — getter CHỈ-ĐỌC, phuc vu do "nhay ve trang 1 khi
+    // doi tab": trang tab LUU (DocTab::currentPage), trang view Single THUC VE,
+    // va tam viewport cua ContinuousView dung chung.
+    int  probeTabSavedPage(int idx) const { auto* t = m_openDocs.value(idx); return t ? t->currentPage : -1; }
+    int  probeTabShownPage(int idx) const;
+    bool probeContCenter(int* page, QPointF* c) const;
+    // 🔴 LƯỢT 33f (muc 5): offset cuon THAT cua Continuous (dinh = 0) — do vi tri
+    // tab dang load bang scrollY, khong bang trang o tam viewport.
+    int  probeContScrollY() const;
+    // Probe-only (--owner3tab-probe LƯỢT 21): so closeJob `delete t` dang chay —
+    // step G can biêt closeJob cuoi cung da xong chưa.
+    int  probeCloseJobs() const { return m_thumbCloseJobs; }
+    // 🔴 LƯỢT 22b (reviewer mục 1): probe PHẢI bắt được lỗi thiếu `!` ở tabAlive —
+    // bản lỗi: initWatcher thoát sớm trên tab CÒN SỐNG ⇒ pdfHash=0; ba lambda quét
+    // comment thoát sớm ⇒ annotCache=0 dù file CÓ chú thích (đếm bằng API thật).
+    quint64 probePdfHash(int idx) const { auto* t = m_openDocs.value(idx); return t ? t->pdfHash : 0; }
+    int   probeCommentCache(int idx) const { auto* t = m_openDocs.value(idx); return t ? int(t->annotCache.size()) : -1; }
+    // 🔴 LƯỢT 33e (muc 4 — buoc M, vang lenh CHỈ-DOC): dem overlay visuals cua trang
+    // dang hien trong tab — CA HAI view (Single + Continuous) deu ve tu chinh kho
+    // DocTab::visualsCache (LAT A 09/02 — view khong giu ban chep rieng), nen day la
+    // so visual THUC VE tren man hinh, khong phai so trong danh sach trung gian.
+    int   probeOverlayVisualCount(int idx) const { auto* t = m_openDocs.value(idx);
+        return t ? int(t->visualsCache.value(t->currentPage).size()) : -1; }
+    // So dong comment THUC in trong panel (khong phai gia tri se day vao panel).
+    int   probePanelCommentRows() const;
+    void  probeRequestComments() { onCommentsRequested(); }
+    // Note do PROBE tạo ra là nhân vật chứng, không phải việc của user — gỡ cờ
+    // dirty để onTabClose không bật hộp "Unsaved Changes" modal giữa probe.
+    void  probeClearDirty(int idx) { if (auto* t = m_openDocs.value(idx)) t->dirty = false; }
+    int   probeRealAnnotCount(int idx);   // API thật: AnnotationManager::loadPage từng trang
+    // Probe-only (--torcache-probe 0927): dong open-doc theo chi so m_openDocs —
+    // tu tinh chi so cua m_docTabs, vi tab 0 la "Welcome" nen chi so cua harness
+    // khong dung chi so tab thật.
+    void probeCloseOpenDoc(int docIdx);
+    // Probe-only (--torcache-probe 0927): goi DUNG duong `taiLai` cua nguoi dung
+    // (loadTabFile) de harness kiem chung LOG tren may that ma khong phai viet
+    // lai logic. docIdx la chi so trong m_openDocs.
+    // 0927 LƯỢT 6: khong con `probeClearCacheSlot` — nút Clear cache đã bị gỡ hẳn.
+    bool probeLoadTabFile(int docIdx);
     // Probe-only (--viewfast-twodoc-probe): kich hoat tab doc theo chi so 0-based
     // (giong nguoi dung bam vao tab thu idx) de mo 2 tai lieu cung luc o View Fast.
     void probeActivateTab(int idx);
@@ -264,6 +396,39 @@ public:
     // sidebar (0..5) trong MainWindow. Chi dung cho harness, khong can nguoi dung.
     void probeSelectSidebarTab(int id);
 
+    // 0927 LUOT 4 (VIEC C) --sidebar-edit-probe can vao ThumbnailPanel de
+    // doc o sua chu thich + mo popup theo DUNG DUONG bam chuot cua nguoi dung.
+    // CHI cho harness.
+    ThumbnailPanel* probeThumbPanel() const { return m_thumbPanel; }
+    // 0927 LUOT 6 (VIEC 1) --ftngoai-edit-probe: sua chu thich qua DUNG DUONG
+    // CHUOT PHAI nguoi dung (chuot phai -> "Edit text…"), TU DONG dien `text`
+    // vao hop nhap nhieu dong roi bam OK — de harness kiem ma khong can chuot.
+    // KHONG sua truc tiep: editSelectedAnnot() la ham thuc su cua menu, nen
+    // moi chay dung ma cua nguoi dung (ke ca QMessageBox khi that bai).
+    // Tra ve loi (rong = thanh cong). CHI cho harness.
+    QString probeEditAnnotViaGui(int page, int indexInList, const QString& text,
+                                 QString* errOut = nullptr);
+    // 0927 LUOT 6 (VIEC 2) --sidebar-popup-hold [dark]: bat/tat Dark Mode theo
+    // DUNG DUONG NUT tren toolbar (QAction "Dark Mode".trigger()) — cung duong
+    // voi nguoi dung bam chuot, nen ca qApp stylesheet + ThumbnailPanel::m_dark
+    // doi nhat quyen. Tra false neu khong tim thay nut (harness se bao loi).
+    bool probeSetDarkMode(bool dark);
+    // Nap lai danh sach chu thich cho trang (dung khi probe vua tao annot moi).
+    void probeRefreshComments(int page);
+
+    // Probe-only (--markup-mouse-probe): expose methods for annotation testing
+    DocTab* probeCurrentTab() const;  // Get current tab
+    QWidget* probeCurrentView() const;  // Get PdfGpuView of current tab
+    void probeSelectAnnotTool(int id);  // Select markup tool (0=Pan, 1=SelectText, 2=Line, etc.)
+    int probeAnnotCount() const;  // Get total number of annotations in current doc
+    int probeAnnotCountPerPage(int page) const;  // LƯỢT 40: Get annotations on specific page
+    int probeVisualCount(int page) const;  // Get number of overlay visuals for page
+    // LƯỢT 39p (Sonnet — probe TEST-ONLY, chi-doc): dang co annot nao dang duoc
+    // CHON hay khong (m_selPage/m_selIdx do onAnnotPick() dat khi bam trung annot
+    // bang cong cu Pan). Dung de --markup-mouse-probe kiem "co chon duoc markup
+    // khac sau khi ve" — KHONG doi hanh vi, chi doc lai hai bien da co san.
+    bool probeHasSelection() const { return m_selPage >= 0 && m_selIdx >= 0; }
+
     // Probe-only (--uiprobe-dialog, SPEC_PROBE_DIALOG_FRAMES phan 1): kich hoat
     // QAction cua hop thoai tren toolbar (name = merge/about/sign/print), chup
     // CHINH hop thoai (active modal) ra <outDir>/dialog_<name>.png + .txt roi dong
@@ -275,6 +440,15 @@ public:
     // (thumbnails, trang 2-4, search, comments, ocr, dark on/off), chup mot khung
     // sau moi buoc ra <outDir>/frame_XXX.png. Tra ve so khung da ghi.
     int probeFrames(const QString& outDir, int intervalMs);
+
+    // 0927 LUOT 11 -- thoat NHANH: xoa ban nhap `.tortmp` cua cac tab, thay the
+    // viec xoa trong ~MainWindow (duong cu) ma thoat nhanh bo qua. Chi goi SAU
+    // closeEvent. Tra ve SO ban nhap CON LAI (0 = sach). `ponytail: Windows con
+    // giu handle PDFium tren file nhap nen xoa co the that bai` — nhung do la ban
+    // nhap user da bo, va ~MainWindow cu xoa vo dieu kien nen duong nay khong
+    // lo lang: xoa het thuoc ve user da tra loi "Khong" o hop thoat.
+    // Chinh sach giu/boa: core/FastExit.h (trExitDraftPolicy).
+    int removeDraftsForExit();
 
 protected:
     void dragEnterEvent(QDragEnterEvent* e) override;
@@ -329,6 +503,10 @@ private:
      void applyTheme(bool dark);
     void syncSidebarToTab(int idx, bool forceRebuild = false);
     DocTab* currentTab() const;
+    // LƯỢT 35 — man chao mot nguon duy nhat: khi khong con tai lieu nao, an
+    // ContinuousView (ve chu tren GL bi vo) va hien tab "Welcome" (PdfView CPU).
+    void    applyWelcomeVisibility();
+    PdfView* addWelcomeTab();   // tao + them tab chao, dong bo dark mode hien hanh
     void showThumbnailContextMenu(int pageIndex, QPoint globalPos);
     void reloadTab(DocTab* t, const QString& filePath, const QString& tmpPath);
     void loadTabFile(DocTab* t, const QString& path, bool structureChanged = true);
@@ -348,6 +526,15 @@ private:
 
     QTabWidget*      m_docTabs       = nullptr;
     QList<DocTab*>   m_openDocs;
+    // 🔴 0928 LƯỢT 16 — băng thumbnail khi `delete t` của tab đang đóng còn chạy
+    // nền (MainWindow.cpp closeJob). syncThumbnailPoolsToActiveTab giữ ĐÓNG BĂNG
+    // mọi pool kể cả tab hiện hành khi >0 ⇒ đóng tab không phải xếp hàng sau
+    // thumbnail tab khác giành khoá PDFium (log r8: chờ 2,9 s, app văng).
+    // 🔴 LƯỢT 16b — bool → BỘ ĐẾM số closeJob đang chạy (++ ở onTabClose, --
+    // trong closeJob.finished): đóng 2 tab liên tiếp mà job A xong trước job B,
+    // bool sẽ mở băng giữa lúc `delete t` của B còn chạy nền — đúng cửa sổ tranh
+    // khoá mà lượt 16 muốn chặn.
+    int              m_thumbCloseJobs = 0;
     ThumbnailPanel*  m_thumbPanel    = nullptr;
     ContinuousView*  m_continuousView = nullptr;
     QSplitter*       m_splitter      = nullptr;
@@ -394,8 +581,10 @@ QAction*   m_viewQualityAct = nullptr;
     void onInsertImage();
     void onAnnotResize(DocTab* t, int page, QRectF newRectDisp);
     // Day trang thai chon xuong CA HAI view (gpu + continuous) cho khop dien mao.
+    // VIỆC 3-A1 (0921): `isOwn` = annot CỦA TA. Chỉ annot của ta mới hiện tay nắm gốc
+    // (co giãn); annot phần mềm khác không hiện, vì guardWrite sẽ từ chối mọi lần ghi.
     void setMarkupSelectionViews(DocTab* t, int page, const QRectF& rectPdf,
-                                 const QString& uid, const QString& type);
+                                 const QString& uid, const QString& type, bool isOwn);
     void clearMarkupSelectionViews(DocTab* t);
 
     // Probe-only (--contedit-test, SPEC_CONTINUOUS_MARKUP_EDIT muc NGHIEM THU):
@@ -490,10 +679,29 @@ QAction*   m_viewQualityAct = nullptr;
     // zoomChanged, doi trang, invalidateAnnotPage. Tu guard — goi vo hai khi trang
     // khong heavy / khong phai tab hien hanh / vung nhin khong doi.
     void updateHeavyRegion(DocTab* t);
-    void closeHeavyPriv(DocTab* t);   // LAT G: dong handle rieng (goi khi KHONG co tac vu dang chay)
+    // LAT G: dong handle rieng (goi khi KHONG co tac vu dang chay).
+    // 0928 LƯỢT 26: static — chi cham t-> + khoa PDFium toan cuc ⇒ goi duoc o
+    // closeJob nen (duong "dongTab" doi tail PDFium xuong nen, UI khong cho khoa).
+    static void closeHeavyPriv(DocTab* t);
     void buildVectorLayer(DocTab* t, int pageIndex, bool force = false);
     void ensureForeignAnnotLayer(DocTab* t, int pageIndex);
     void cancelForeignAnnotTasks(DocTab* t);  // cancel+wait cac tac vu lop bu truoc khi dong doc
+    // 0927 LƯỢT 8: ĐƯỜNG THOÁT DUY NHẤT cho MỘT tab — dùng chung cho đóng tab (nút X)
+    // và thoát app (Alt+F4). Xem thân hàm để đọc thứ tự. KHÔNG `delete t` ở đây: hai
+    // đường đó xoá tab ở nơi khác (nền / trực tiếp).
+    // 🔴 0928 LƯỢT 26 (VIỆC 2): `renderWaitMs` = trần chờ render dừng TRÊN LUỒNG UI.
+    // Đóng tab ("dongTab") truyền 300 + `pdfiumTailOnUi=false` — phần chờ còn lại đã
+    // có trong closeJob nền (~PdfRenderer::waitIdle + beginClose theo token), và tail
+    // chạm PDFium (closeHeavyPriv/TextSelection) chạy luôn ở nền đó.
+    // Thoát app/nạp lại giữ nguyên 3000 + tail-on-UI.
+    void shutdownTab(DocTab* t, const char* why, int renderWaitMs = 3000,
+                     bool pdfiumTailOnUi = true, bool waitBgOnUi = true);
+    // 🔴 0928 LƯỢT 22 — chốt "tab còn sống" cho lambda queued: ĐỊA CHỈ còn phải
+    // KHỚP THẾ HỆ (serial chụp lúc spawn). Địa chỉ DocTab vừa free có thể được
+    // malloc cấp lại cho tab mới — contains() thuần địa chỉ sẽ chạm nhầm tab mới.
+    bool tabAlive(DocTab* t, quint64 serial) const {
+        return m_openDocs.contains(t) && t->serial == serial;
+    }
     // 0903: dung bo dung thumbnail cua tab + CHO worker thoat han TRUOC khi doc bi
     // dong/giai phong hoac UI cham PDFium. Goi o MOI duong giai phong tai lieu.
     void stopThumbPool(DocTab* t);
@@ -511,6 +719,7 @@ QAction*   m_viewQualityAct = nullptr;
     DocTab* m_searchTab = nullptr;
     void applySearchHighlights(const QList<SearchResult>& results, int currentIdx);
     void clearAllSearchHighlights();
+void cleanupOrphanTorcache();
 
     // ── OCR qua thao tac chuot (SPEC_OCR_4) ─────────────────────────────
     // Kiem trang/tai lieu dang OCR chua. docHasText: co chu thuc su hay khong

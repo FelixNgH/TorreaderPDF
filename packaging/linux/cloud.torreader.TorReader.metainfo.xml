@@ -68,6 +68,12 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.4.3" date="2026-09-30">
+      <description>
+        <p>A stability release for working with several large drawings at once. Closing a tab no longer crashes the app, switching tabs keeps your page, zoom and markups, and memory use with several heavy files open drops to around 1 GB. Long freezes when zooming or closing a tab on very dense CAD pages are gone. In continuous mode, clicking a comment selects it and jumps to it in the comment list; comments are edited in single-page mode. Also fixes rotated images on rotated pages and distorted Loading and start-screen text.</p>
+      </description>
+      <url>https://github.com/FelixNgH/TorreaderPDF/releases/tag/v2.4.3</url>
+    </release>
     <release version="2.4.2" date="2026-09-03">
       <description>
         <p>The Text tool now writes a real FreeText annotation, so text you add is a proper PDF comment that other PDF software can read and edit. Vietnamese can be typed into annotations with any input method, text wraps to its box, and the box can be resized by dragging a corner. Pages carrying comments now use the vector page in both single-page and continuous mode instead of being locked to a raster image, so dense drawings such as site and master plans stay crisp at any zoom and flip faster. Insert Image moved into the markup grid, replacing the Note button. Fixes striped text over vector pages and a crash when closing a tab.</p>

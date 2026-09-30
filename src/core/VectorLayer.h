@@ -6,6 +6,7 @@
 #include <QIODevice>
 #include <QtGlobal>
 #include <atomic>
+#include <functional>
 #include <fpdfview.h>
 
 struct TextTile {
@@ -21,7 +22,12 @@ struct TextTile {
 class VectorLayer {
 public:
     VectorLayer();
-    bool build(FPDF_DOCUMENT doc, int pageIndex);
+    // 0928 LUOT 13: `shouldCancel` — vet huy THEO LAT. Tra true ⇒ build bo ngay
+    // o ranh giat lat ke tiep (tra ve false, khong giu khoa). Ben goi truyen
+    // predicate "trang nay con la trang nguoi dung dang xem khong". Mac dinh
+    // rong = khong huy (gi nguyen moi noi goi cu).
+    bool build(FPDF_DOCUMENT doc, int pageIndex,
+               const std::function<bool()>& shouldCancel = {});
     int rebuildNoteTiles(FPDF_DOCUMENT doc, FPDF_PAGE page);
     bool isReady() const { return m_ready; }
     bool isComplete() const { return m_complete; }

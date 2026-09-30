@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(TorReader VERSION 2.4.2 LANGUAGES CXX)
+project(TorReader VERSION 2.4.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,11 +19,25 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # Khong co co /utf-8 thi MSVC doc nguon theo codepage ANSI, moi chuoi UTF-8 trong ma se thanh mojibake, con GCC tren Linux van dung nen loi CHI HIEN TREN WINDOWS.
 if(MSVC)
     add_compile_options(/utf-8)
+    # 🔴 0928 LƯỢT 16 — PDB CHO BẢN RELEASE. Crash c0000005 offset 0x179a35 (28/09)
+    # không giải được vì Release không có symbol. /Zi + /DEBUG /OPT:REF /OPT:ICF:
+    # exe vẫn tối ưu y nguyên, chỉ kèm .pdb để lần văng sau dịch được offset ra
+    # file:dòng. /OPT:REF /OPT:ICF vốn đã là mặc định Release của CMake — ghi lại
+    # cho chắc vì /DEBUG bật incremental info nếu thiếu.
+    add_compile_options($<$<CONFIG:Release>:/Zi>)
+    add_link_options($<$<CONFIG:Release>:/DEBUG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
+    set(CMAKE_PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 endif()
 
 # ── AI-only build mode: skip PDF/OpenSSL/QPDF dependencies ─────────────────
 option(TORREADER_NO_PDFIUM "Skip PDFium + PDF dependencies (AI-only build)" OFF)
 option(TORREADER_STORE_BUILD "Build for Microsoft Store (no self-update prompt)" OFF)
+# 🔴 LƯỢT 28 (Thử B): -DTORREADER_SEGHEAP=ON thi rc.exe nhan /D TORREADER_SEGHEAP
+# va nhúng resources/TorReader.manifest (heapType SegmentHeap) vao exe.
+# LƯỢT 28 CHỐT MẶC ĐỊNH ON theo SỐ: bench 1 process mo-dong f3 x4 —
+#   NT/legacy heap: 7,1/7,9/17,3/48,2 s (leo 6,8x)   SegmentHeap: 8,3/9,3/9,2/9,9 s (1,2x)
+# Tat bang -DTORREADER_SEGHEAP=OFF (hoi tran khi can so sanh).
+option(TORREADER_SEGHEAP "Embed Windows SegmentHeap manifest" ON)
 
 # ── OpenSSL (vcpkg) — PdfSigner verify + sign (CMS/PKCS12) ───────────────────
 if(NOT TORREADER_NO_PDFIUM)
@@ -195,6 +209,7 @@ set(SOURCES
 
 set(HEADERS
     $<$<NOT:$<BOOL:${TORREADER_NO_PDFIUM}>>:
+    src/core/DocTaskGate.h
     src/core/PdfDocument.h
     src/core/PdfRenderer.h
     src/core/TileCacheFile.h
@@ -276,6 +291,28 @@ target_compile_definitions(TorReader PRIVATE
 
 if(TORREADER_STORE_BUILD)
     target_compile_definitions(TorReader PRIVATE TORREADER_STORE_BUILD)
+endif()
+
+# 🔴 LƯỢT 28 (Thử B): nhúng heapType SegmentHeap qua /MANIFESTINPUT — link.exe/mt
+# gộp với manifest tự sinh (asInvoker). Nhúng thẳng RT_MANIFEST #1 qua .rc bị
+# CVT1100 duplicate resource (đã đo 29/09).
+if(MSVC AND TORREADER_SEGHEAP)
+    target_link_options(TorReader PRIVATE
+        "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/resources/TorReader.manifest")
+endif()
+
+# 🔴 0928 LƯỢT 16 — bản tr_r8.bat đổi tên exe bằng /p:TargetName=TorReader_r8, nhưng
+# CMake ghim tên .pdb theo tên target (TorReader.pdb). Copy cho khớp tên exe thật để
+# lần văng sau dịch được offset bằng cặp TorReader_r8.exe + TorReader_r8.pdb.
+# $(TargetName)/$(OutDir) để NGUYÊN VẸN — MSBuild tự bung lúc build; build thường
+# (TargetName=TorReader) thì src==dst, copy_if_different thành no-op.
+if(MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+    add_custom_command(TARGET TorReader POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_PDB_FILE:TorReader>"
+            "$(OutDir)$(TargetName).pdb"
+        COMMENT "Luu pdb ten theo exe (TorReader_r8.pdb)"
+    )
 endif()
 
 target_include_directories(TorReader PRIVATE

@@ -3,6 +3,7 @@
 #include "SearchPanel.h"
 #include "ThemeTokens.h"
 #include "../core/PdfiumLock.h"
+#include "../core/DocTaskGate.h"
 #include <QElapsedTimer>
 #include <QDebug>
 #include <QTimer>
@@ -29,6 +30,14 @@
 #include <QClipboard>
 #include <QApplication>
 #include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFontMetrics>
+#include <QScreen>
+#include <QKeyEvent>
+#include <QMouseEvent>
+#include "NoteInputDialog.h"
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QStyledItemDelegate>
@@ -36,6 +45,11 @@
 #include <algorithm>
 #include <functional>
 #include <vector>
+
+// 0927 LUOT 5 (LOI 1): icon nut "mo o sua lon" ve bang QPainter (Win10 thieu
+// glyph U+2922 -> o vuong trong). Khai bao o day vi setDarkMode() goi lai
+// de doi mau theo theme, da DUNG truoc phan dinh nghia duoi.
+static QIcon commentExpandIcon(bool dark);
 
 extern QMutex s_pdfiumMutex;
 
@@ -516,26 +530,56 @@ void ThumbnailPanel::resizeEvent(QResizeEvent* event) {
 }
 
 // ── requestVisibleThumbnails ───────────────────────────────────────────────────
+// 🔴 0928 LƯỢT 15b — VÙNG ĐANG XEM PHẢI LÀ "HÀNG THẬT SỰ CÓ MẶT TRONG KHUNG".
+// Lượt 15 đo bằng `m_list->itemAt(QPoint(0, 1))` và nó LUÔN trả nullptr:
+// `QListView::indexAt` mở đầu bằng
+//     if (flow == LeftToRight && p.x() <= header->width()) return model->index(0,0,header);
+// Tức là x=0 được coi là điểm bấm lên ô HEADER (rè dọc trái), nó trả về index
+// thuộc model của header — khác model của list ⇒ `QListWidget::itemFromIndex`
+// trả nullptr ⇒ `topRow = 0` MÃI MÃI. Log CEO đo đúng thế: 61 lần `vung=0-3`
+// trong khi khung đang hiện 181–185. Hệ quả: xếp hàng theo cự ly tới vùng 0–3
+// rơi thành tuần tự 0,1,2,… nên trang 181 phải chờ 180 lượt (~27 s).
+// Nay duyệt `visualItemRect` của từng hàng và lấy đúng dải giao với
+// `viewport()->rect()` — không đoán bằng công thức chia lưới, không đụng header.
 void ThumbnailPanel::requestVisibleThumbnails() {
     int n = m_list->count();
     if (n == 0) return;
 
-    QListWidgetItem* topItem = m_list->itemAt(QPoint(0, 1));
-    int topRow = topItem ? m_list->row(topItem) : 0;
+    const QRect vp = m_list->viewport()->rect();
+    int first = -1, last = -1;
+    for (int r = 0; r < n; ++r) {
+        // `QListWidget::visualItemRect` che (hides) bản gốc của QAbstractItemView
+        // và nhận con trỏ ITEM, không nhận QModelIndex.
+        if (!m_list->visualItemRect(m_list->item(r)).intersects(vp))
+            continue;
+        if (first < 0) first = r;
+        last = r;
+    }
+    if (first < 0) {
+        qDebug() << "[thumbq] DO viewport rong — bo qua lan do nay (chua layout)";
+        return;
+    }
 
-    int iconH = m_list->iconSize().height() + m_list->spacing() * 2 + 22;
-    int colW  = m_list->iconSize().width()  + m_list->spacing() * 2 + 4;
-    int cols  = qMax(1, m_list->viewport()->width()  / qMax(1, colW));
-    int rows  = qMax(1, m_list->viewport()->height() / qMax(1, iconH));
-    int ahead = (rows + 2) * cols;
-    int visibleCount = rows * cols;
+    // ponytail: không tính lại lưới (số cột × số hàng) — số hàng thật đã có trong
+    // `last - first + 1`, còn `ahead` chỉ là biên an toàn quanh vùng đang xem nên
+    // lệch vài hàng không làm hỏng thứ tự xếp.
+    const int ahead = (last - first + 1) + 2;   // + 2 hàng đệm phía dưới
 
     if (m_thumbPool && !m_thumbPool->isOpen())
         qDebug() << "[perf] thumb requestVisibleThumbnails but pool is NOT open";
-    for (int i = topRow; i < qMin(topRow + ahead, n); ++i) {
+    // 🔴 0928 LƯỢT 15 — BÁO VÙNG ĐANG XEM TRƯỚC KHI XẾP. Đây là thứ quyết định
+    // thứ tự ra khỏi hàng: không có nó thì hàng chỉ biết "ô nào priority 0"
+    // mà không biết "ô nào ĐANG HIỆN", nên 330 việc nền ngang hàng chen vào
+    // giữa 5 ô đang xem. Đặt TRƯỚC vòng xếp để yêu cầu của chính lượt cuộn này
+    // cũng được xếp theo vùng mới.
+    if (m_thumbPool && m_thumbPool->isOpen())
+        m_thumbPool->setVisibleBand(first, last,
+                                    m_list->verticalScrollBar()->value(),
+                                    m_list->verticalScrollBar()->maximum());
+    for (int i = first; i < qMin(first + ahead, n); ++i) {
         auto* item = m_list->item(i);
         if (!item || !item->icon().isNull()) continue;
-        int priority = (i < topRow + visibleCount) ? 0 : 1;
+        int priority = (i <= last) ? 0 : 1;
         if (m_thumbPool && m_thumbPool->isOpen())
             m_thumbPool->requestThumbnail(i, priority);
     }
@@ -652,8 +696,17 @@ void ThumbnailPanel::setDocument(PdfDocument* doc, PdfRenderer* renderer,
     }
 
     if (m_scrollConn) disconnect(m_scrollConn);
+    // 🔴 0928 LƯỢT 15b — DEBOUNCE 50 ms. Một cú cuộn bánh xe 60 nấc bắn ra 60
+    // lần `valueChanged`; đo ngay từng lần thì lúc nào cũng kịp lúc nào không,
+    // và phép `visualItemRect` có thể chạy khi `doItemsLayout` chưa xong. Gom lại
+    // một lần đo sau khi bánh xe đã đứng yên là đủ — vùng đang xem không đổi
+    // trong 50 ms đó.
+    m_scrollDebounce.setSingleShot(true);
+    m_scrollDebounce.setInterval(50);
     m_scrollConn = connect(m_list->verticalScrollBar(), &QScrollBar::valueChanged,
-            this, [this]() { requestVisibleThumbnails(); });
+            this, [this]() { m_scrollDebounce.start(); });
+    connect(&m_scrollDebounce, &QTimer::timeout, this,
+            [this]() { requestVisibleThumbnails(); });
 
     // Request thumbnails for the current visible region
     QTimer::singleShot(0, this, [this]() { requestVisibleThumbnails(); });
@@ -710,6 +763,10 @@ void ThumbnailPanel::clearThumbnails() {
     m_doc = nullptr;
     if (m_scrollConn) disconnect(m_scrollConn);
     m_renderer = nullptr;
+    // 🔴 0928 LƯỢT 22 (reviewer mục 5): panel còn giữ con trỏ POOL của tab đang
+    // đóng — pool chết ở closeJob nền, trong lúc scrollEvent gọi m_thumbPool->
+    // isOpen()/requestThumbnail (568-584) là đọc vùng đã free. Ngắt relay + null.
+    if (m_thumbPool) { disconnect(m_thumbPoolConn); m_thumbPool = nullptr; }
     m_list->clear();
     m_pendingThumbs.clear();
     m_outline->clear();
@@ -825,6 +882,25 @@ void ThumbnailPanel::setDarkMode(bool dark) {
     if (m_ocrPanel) m_ocrPanel->setDarkMode(dark);
     if (m_currentPage >= 0 && m_currentPage < m_list->count())
         m_list->item(m_currentPage)->setBackground(currentPageHighlight());
+    // 0927 LUOT 5 vong 2: icon + vien cua nut "mo o sua lon" ve theo mau CUNG
+    // luc DUNG giu chuot. setComments() chay mot lan khi nap danh sach, nen
+    // doi theme sau do se de lai icon mau cu — phai ve lai tai day.
+    if (m_commentsList) {
+        for (int i = 0; i < m_commentsList->count(); ++i) {
+            QWidget* row = m_commentsList->itemWidget(m_commentsList->item(i));
+            if (!row) continue;
+            for (auto* b : row->findChildren<QPushButton*>()) {
+                if (!b->property("trExpand").toBool()) continue;
+                b->setIcon(commentExpandIcon(dark));
+                b->setStyleSheet(
+                    QStringLiteral(
+                        "QPushButton { background:transparent; border:1px solid %1; border-radius:3px; }"
+                        "QPushButton:hover { border:1px solid %2; }")
+                        .arg(dark ? darkHC().border : lightHC().border,
+                             dark ? darkHC().accent : lightHC().accent));
+            }
+        }
+    }
 }
 
 // ── currentPageHighlight ───────────────────────────────────────────────────────
@@ -853,7 +929,7 @@ void ThumbnailPanel::acceptFromFullRender(int pageIndex, const QImage& fullImg)
     emit lowResPageAvailable(pageIndex, thumbImg);
 }
 
-void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epoch) {
+void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epoch, bool draft) {
     struct _SlotMs {
         QElapsedTimer t; const char* name; int pg;
         _SlotMs(const char* n, int p) : name(n), pg(p) { t.start(); }
@@ -903,7 +979,11 @@ void ThumbnailPanel::onPageReady(int pageIndex, const QImage& image, quint64 epo
         item->setIcon(QIcon(QPixmap::fromImage(image)));
     }
     // Day ban tho sang che do xem lien tuc: co san anh mo de ve ngay khi pan/zoom.
-    if (!image.isNull()) emit lowResPageAvailable(pageIndex, image);
+    // ⛔ 0928 LƯỢT 15 — KHÔNG đưa BẢN NHÁP vào đây. `setPageLowRes` cắm cờ
+    // `daCoGiDeNhin` (ContinuousView.cpp:1680) và chính cờ đó CHẶN lịch render
+    // thật ⇒ một ô trắng 5 giây sẽ thành trang nửa hình vĩnh viễn ở vùng chính.
+    // Bản nháp chỉ dành cho ô thumbnail; lần vẽ trọn sau sẽ ghi đè.
+    if (!image.isNull() && !draft) emit lowResPageAvailable(pageIndex, image);
 }
 
 void ThumbnailPanel::flushPendingThumbs() {
@@ -946,7 +1026,13 @@ void ThumbnailPanel::buildBookmarks() {
 
     auto* watcher = new QFutureWatcher<QVector<BmEntry>>(this);
 
-    auto future = QtConcurrent::run([doc, myGen, this]() -> QVector<BmEntry> {
+    // 🔴 0928 LƯỢT 22 (reviewer mục 2): token ĐĂNG KÝ LÚC SPAWN (UI thread) + RAII
+    // move — beginClose thấy cả task còn xếp hàng.
+    // 0928 LƯỢT 14: token sổ việc nền — FPDFBookmark_* đọc doc; QFuture bị bỏ
+    // rơi (chỉ giữ trong watcher) nên trước đây đóng tab lúc đang dựng bookmark
+    // là đọc vùng đã free.
+    trdoc::Task task(doc, "thumbPanel/bookmark");
+    auto future = QtConcurrent::run([task = std::move(task), doc, myGen, this]() -> QVector<BmEntry> {
         QVector<BmEntry> entries;
         TimedPdfiumLock lock(__FILE__, __LINE__);
         if (m_bookmarkGen.loadAcquire() != myGen) return entries;
@@ -1063,10 +1149,14 @@ void ThumbnailPanel::buildContentTree() {
 
     auto* watcher = new QFutureWatcher<QList<QPair<int,QString>>>(this);
 
-    auto future = QtConcurrent::run([doc, n, myGen, this]() {
+    // 🔴 0928 LƯỢT 22: token lúc SPAWN + RAII move (xem bookmark — cùng khuôn).
+    // 0928 LƯỢT 14: token sổ việc nền — xem buildBookmarks. Task này còn tự
+    // FPDF_LoadPage + FPDFText_LoadPage + tự đóng, tức nắm handle ngoài PageCache.
+    trdoc::Task task(doc, "thumbPanel/noiDung");
+    auto future = QtConcurrent::run([task = std::move(task), doc, n, myGen, this]() {
         QList<QPair<int,QString>> results;
         for (int i = 0; i < n; ++i) {
-            if (m_contentGen.loadAcquire() != myGen) break;
+            if (m_contentGen.loadAcquire() != myGen || task.cancelled()) break;
             QString preview;
             {
                 TimedPdfiumLock lock(__FILE__, __LINE__);
@@ -1126,7 +1216,10 @@ void ThumbnailPanel::buildProperties() {
 
     auto* watcher = new QFutureWatcher<Props>(this);
 
-    auto future = QtConcurrent::run([doc, myGen, this]() -> Props {
+    // 🔴 0928 LƯỢT 22: token lúc SPAWN + RAII move (xem bookmark — cùng khuôn).
+    // 0928 LƯỢT 14: token sổ việc nền — xem buildBookmarks.
+    trdoc::Task task(doc, "thumbPanel/thuocTinh");
+    auto future = QtConcurrent::run([task = std::move(task), doc, myGen, this]() -> Props {
         Props p;
         auto getMeta = [&](const char* tag) -> QString {
             TimedPdfiumLock lk(__FILE__, __LINE__);
@@ -1189,6 +1282,62 @@ void ThumbnailPanel::buildProperties() {
     watcher->setFuture(future);
 }
 
+// 0927 LUOT 4 (VIEC A) - dong dau + dau ... cho o chi-hien-thi.
+static QString firstLineEllipsis(const QString& full);
+
+
+// 🔴 0927 LUOT 5 (LOI 2) - ELIDE THEO BE RONG THAT cua o.
+// QLineEdit KHONG tu elide: no CUON den con tro, nen mot dong dai se
+// hien phan CUOI ("...Viet co dau") dung khi chu da vua duoc gan. O day ta
+// cat bang chinh QFontMetrics cua o (cung font) theo be rong do duoc, nen
+// thoa man "Dong mot tieng Viet co..." luon ra phan DAU.
+//  - doc duoc het dong  -> hien nguyen dong + "\u2026"
+//  - vuot be rong        -> ElideRight theo be rong that
+// - chi tao text moi khi KHAC text cu (tranh vong lap resize).
+static void applyRowElide(QLineEdit* le) {
+    if (!le || !le->isReadOnly()) return;
+    const QString first = le->property("trFirstLine").toString();
+    if (first.isEmpty()) return;
+    // tru 8 px: padding 2 ben + du phong cho con tro/diem danh dau.
+    const int avail = qMax(16, le->width() - 8);
+    const QFontMetrics fm(le->font());
+    const QString shown = (fm.horizontalAdvance(first) <= avail)
+        ? first + QString::fromUtf8("\xE2\x80\xA6")
+        : fm.elidedText(first, Qt::ElideRight, avail);
+    if (le->text() == shown) return;
+    le->setText(shown);
+    le->setCursorPosition(0);
+}
+
+// 0927 LUOT 5 (LOI 1) - ky tu Unicode "\u2922" (\xE2\xA4\xA2) tren Win10
+// khong co glyph => nhan "LUC" thanh O VUONG TRONG (do CEO tren may test).
+// Khong doi font, khong doi he thong: VEE ICON BANG QPainter (2 mui ten cheo).
+// QIcon + stylesheet; nhan van giu dung property trExpand de probe tim thay.
+//
+// 🔴 VONG 2 (aider-review CHANGES_REQUESTED): mau KHONG hard-code #D4D4D4
+// - xam sang do tren nen SANG thi icon tang hinh. Lay token fgDim cua theme
+// (cung kieu chu ma app dung o dong 442), truyen `dark` vao hàm.
+// VONG 2: ve THANG 12x12 (dung bang setIconSize) de khong phai downscale
+// 16 -> 12 (do 16/12 = 1.33, lam mo canh).
+static QIcon commentExpandIcon(bool dark) {
+    QPixmap pm(12, 12);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(QColor(dark ? darkHC().fgDim : lightHC().fgDim),
+                  1.2, Qt::SolidLine, Qt::RoundCap));
+    // Mui ten: 1 goc len-phai + 1 goc xuong-trai (khu 12x12: 1..5 va 6..10).
+    auto arrow = [&p](int x0, int y0, int dx, int dy) {
+        p.drawLine(x0, y0, x0 + dx * 2, y0 + dy * 2);          // than
+        p.drawLine(x0 + dx * 2, y0 + dy * 2, x0, y0 + dy * 3); // canh doc
+        p.drawLine(x0 + dx * 2, y0 + dy * 2, x0 + dx * 3, y0); // canh ngang
+    };
+    arrow(1, 1, +1, +1);    // len phai
+    arrow(10, 10, -1, -1);  // xuong trai
+    p.end();
+    return QIcon(pm);
+}
+
 void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
     if (!m_commentsList) return;
     qDebug().noquote() << "[comments] setComments n=" << comments.size();
@@ -1210,37 +1359,223 @@ void ThumbnailPanel::setComments(const QList<AnnotInfo>& comments) {
         lbl->setStyleSheet("background: transparent;");
         lay->addWidget(lbl, 0);
 
-        auto* edit = new QLineEdit(a.text, row);
-        edit->setPlaceholderText(QStringLiteral("Add a comment\u2026"));
-        edit->setClearButtonEnabled(true);
+        // 🔴 0927 LƯỢT 4 (VIỆC A) — phân 2 chế độ dựa trên NỘI DUNG, không theo
+        // nguồn annot. Quy tắc: có '\n' HOẶC dài hơn bề rộng ô ⇒ CHỈ-HIỂN-THỊ
+        // (hiện dòng đầu + '…', không cho gõ tại chỗ) vì sửa trong QLineEdit
+        // 1 dòng rồi editingFinished sẽ LƯU LẠI chuỗi đã mất xuống dòng.
+        // Ngắn + vừa ô ⇒ vẫn sửa tại chỗ như cũ (đường cũ, không đổi).
+        const QString full = a.text;
+        // Đo bề rộng bằng CHÍNH font của ô (đã trừ 0.5pt) — dùng biến tạm
+        // trước khi tạo ô, tránh phụ thuộc thứ tự khai báo.
+        QFont efRow = lbl->font();
+        efRow.setPointSizeF(efRow.pointSizeF() - 0.5);
+        const QFontMetrics fmRow(efRow);
+        const bool hasNewline = full.contains(QLatin1Char('\n'));
+        const bool tooWide = !hasNewline && (fmRow.horizontalAdvance(full) > 120);
+        const bool displayOnly = hasNewline || tooWide;
+        // Dung LAI cho ca o va property (truoc do tach 2 lan o hai cho).
+        const QString firstLine = displayOnly ? firstLineEllipsis(full) : full;
+
+        auto* edit = new QLineEdit(firstLine, row);
         edit->setFixedHeight(20);
-        QFont ef = edit->font();
-        ef.setPointSizeF(ef.pointSizeF() - 0.5);
-        edit->setFont(ef);
+        edit->setFont(efRow);
         edit->setProperty("trPage", a.pageIndex);
         edit->setProperty("trIdx", a.indexInPage);
-        edit->setProperty("trOrig", a.text);
+        edit->setProperty("trOrig", full);
+        // 0927 LUOT 5 (LOI 2): dong DAU de applyRowElide() cat theo be rong that.
+        // firstLineEllipsis() da tach san phan truoc '\n' — dung lai no, tranh
+        // viet lai logic tach 2 lan o hai cho (dich sanh lech nhau de bi so).
+        // applyRowElide() tu them lai dau \u2026, nen tien o day bo no ra.
+        edit->setProperty("trFirstLine", displayOnly
+            ? firstLine.left(firstLine.length() - 1) : firstLine);
+        edit->setProperty("trOwn", a.isOwn);   // 0927 L4: popup co sua duoc hay khong
+        // 🔴 Ô CHỈ-HIỂN-THỊ: readOnly = KHÔNG sửa tại chỗ + không báo placeholder
+        // gợi ý sai (placeholder chỉ có nghĩa khi ô rỗng và sửa được).
+        edit->setReadOnly(displayOnly);
+        // 🔴 0927 LUOT 5 (LOI 2): o CHI-HIEN-THI luc dau phai hien TU KY TU 0
+        // (chu "Dong mot tieng Viet co dau" => "Dong mot tieng Viet...").
+        // Nguyen nhan: QLineEdit KHONG tu elide — no CUON ban do chu de con tro
+        // hien duoc. Sau setText() con tro mac dinh o CUOI, va QLineEdit sap xep
+        // lai khi duoc gan vao danh sach co the day nhin sang phan CUOI
+        // ("Viet co dau..." do CEO thay tren may test).
+        // Fix: dat con tro ve 0 truoc, ep layout, roi setCursorPosition(0) LAI
+        // mot lan nua (sau khi widget da co kich thoc that trong danh sach).
+        if (displayOnly) {
+            edit->setCursorPosition(0);
+            edit->home(false);
+            edit->setCursorPosition(0);
+        }
         edit->installEventFilter(this);
+        // Đề 7: tooltip của hàng hiện TOÀN VĂN (nhiều dòng).
+        edit->setToolTip(full);
+        if (!a.isOwn) {
+            // 🔴 P0 (0921): chú thích của phần mềm khác — sửa /Contents qua ô này sẽ
+            // làm lệch với /AP gốc (hai bản sự thật). Chỉ-đọc + nói rõ lý do.
+            const QString why = QStringLiteral(
+                "Chú thích của phần mềm khác — sửa chữ sẽ làm lệch với bản vẽ gốc");
+            edit->setReadOnly(true);
+            edit->setPlaceholderText(why);
+            edit->setToolTip(full + QLatin1Char('\n') + why);
+        } else if (!displayOnly) {
+            edit->setPlaceholderText(QStringLiteral("Add a comment…"));
+            edit->setClearButtonEnabled(true);
+        }
         lay->addWidget(edit, 1);
 
         const int pg = a.pageIndex, ix = a.indexInPage;
-        connect(edit, &QLineEdit::editingFinished, this, [this, pg, ix] {
-            auto* senderEdit = qobject_cast<QLineEdit*>(sender());
-            if (!senderEdit) return;
-            QString orig = senderEdit->property("trOrig").toString();
-            QString txt = senderEdit->text();
-            if (txt == orig) return;
-            QTimer::singleShot(0, this, [this, pg, ix, txt] {
-                emit commentTextEdited(pg, ix, txt);
-            });
+        const bool canEdit = a.isOwn;
+
+        // 🔴 Đề 3: nút "⤢" cuối mỗi hàng — CHỈ với chú thích CỦA TA. Chú thích
+        // của phần mềm khác KHÔNG có nút sửa (đề 6); nó mở popup CHỈ ĐỌC để đọc
+        // đủ chữ, nút OK tắt.
+        QPushButton* expand = new QPushButton(row);
+        // 0927 LUOT 5 (LOI 1): ICON VE BANG QPAINTER, khong dung ky tu Unicode
+        // "\u2922" (Win10 thieu glyph => o vuong trong). Giu ten ky tu cu trong
+        // property de probe -sidebar-edit-probe cua LƯỢT 4 van khop nut.
+        expand->setText(QString::fromUtf8("\xE2\xA4\xA2"));
+        expand->setIcon(commentExpandIcon(m_dark));
+        expand->setIconSize(QSize(12, 12));
+        expand->setFixedSize(18, 18);
+        expand->setFocusPolicy(Qt::NoFocus);
+        expand->setToolTip(canEdit
+            ? QStringLiteral("Mở ô sửa lớn (nhiều dòng)")
+            : QStringLiteral("Xem đủ chữ (chỉ đọc — chú thích của phần mềm khác)"));
+        expand->setProperty("trPage", a.pageIndex);
+        expand->setProperty("trIdx", a.indexInPage);
+        expand->setProperty("trExpand", true);
+        // Vong 2: vien cua nut cung lay token (hard-code #666 cung bi mo tren
+        // nen sang) — cung kieu voi cac QSS khac cua panel.
+        expand->setStyleSheet(
+            QStringLiteral(
+                "QPushButton { background:transparent; border:1px solid %1; border-radius:3px; }"
+                "QPushButton:hover { border:1px solid %2; }")
+                .arg(m_dark ? darkHC().border : lightHC().border,
+                     m_dark ? darkHC().accent : lightHC().accent));
+        lay->addWidget(expand, 0);
+        connect(expand, &QPushButton::clicked, this, [this, row, pg, ix, canEdit] {
+            openCommentPopup(row, pg, ix, canEdit);
         });
+
+        if (canEdit && !displayOnly) {
+            // Đường SỬA TẠI CHỖ cũ — chỉ mở khi ô KHÔNG nhiều dòng/nhẹp ⇒ không
+            // bao giờ lưu chuỗi đã mất xuống dòng (nguy cơ mất dữ liệu đã bị chặn).
+            connect(edit, &QLineEdit::editingFinished, this, [this, pg, ix] {
+                auto* senderEdit = qobject_cast<QLineEdit*>(sender());
+                if (!senderEdit) return;
+                QString orig = senderEdit->property("trOrig").toString();
+                QString txt = senderEdit->text();
+                if (txt == orig) return;
+                QTimer::singleShot(0, this, [this, pg, ix, txt] {
+                    emit commentTextEdited(pg, ix, txt);
+                });
+            });
+        } else {
+            // Đề 2: bấm vào ô (hoặc Enter/F2 khi hàng đang chọn) ⇒ mở popup.
+            // Ô readOnly nên không có editingFinished ⇒ không mất dữ liệu.
+            // Bam vao o: eventFilter bat MouseButtonPress (ben tren).
+        }
 
         m_commentsList->addItem(item);
         item->setSizeHint(QSize(0, 26));
         m_commentsList->setItemWidget(item, row);
+        // 0927 LUOT 5 (LOI 2): cat theo be rong that LAN CUOI (sau khi setItemWidget
+        // da do width cua row) + ve con tro ve ky tu 0 de chan thuc "cuon het".
+        if (displayOnly) { applyRowElide(edit); edit->setCursorPosition(0); }
     }
     if (m_commentsList->count() == 0)
         m_commentsList->addItem(new QListWidgetItem(QStringLiteral("(no comments yet)")));
+}
+
+// 0927 LƯỢT 4 (VIỆC A) — dòng đầu + '…' cho ô chỉ-hiển-thị.
+static QString firstLineEllipsis(const QString& full) {
+    const int nl = full.indexOf(QLatin1Char('\n'));
+    const QString first = (nl >= 0) ? full.left(nl) : full;
+    return first + QString::fromUtf8("\xE2\x80\xA6");  // …
+}
+
+// 🔴 0927 LƯỢT 4 (VIỆC A đề 4) — POPUP = DÙNG LẠI NoteInputDialog ở chế độ
+// nhiều dòng (QPlainTextEdit, Enter xuống dòng, Ctrl+Enter OK, Esc huỷ).
+// KHÔNG viết hộp thứ hai. parent = chính panel (không phải hàng) để popup không
+// bị xoá khi list dựng lại; neo NGAY DƯỚI hàng, neo trong màn hình.
+void ThumbnailPanel::openCommentPopup(QWidget* row, int page, int indexInPage, bool editable) {
+    if (!m_commentsList || !row) return;
+    if (m_cmtPopup) { m_cmtPopup->close(); m_cmtPopup = nullptr; m_cmtPopupEdit = nullptr; }
+
+    // Lấy NỘI DUNG GỐC (không phải chuỗi đã cắt '…' của ô chỉ-hiển-thị).
+    QString full;
+    if (auto* le = row->findChild<QLineEdit*>())
+        full = le->property("trOrig").toString();
+
+    // 🔴 0927 LUOT 6 / VIEC 2: popup sidebar lay CUNG theme dang chay
+    // cua app (m_dark do setDarkMode() gan) — giong het hop nhap cua MainWindow,
+    // khong con ep nen TOI. Khong mo cua so thu hai.
+    auto* dlg = new NoteInputDialog(full, m_commentsPanel, /*singleLine=*/false, m_dark);
+    m_cmtPopup = dlg;
+    dlg->setWindowTitle(editable ? QStringLiteral("Edit comment") : QStringLiteral("Comment"));
+    dlg->setMinimumWidth(360);
+    // 🔴 0927 LUOT 5 (LOI 3): giu page/index de probe lay duoc toa do hang.
+    dlg->setProperty("trPopupPage", page);
+    dlg->setProperty("trPopupIdx", indexInPage);
+
+    m_cmtPopupEdit = dlg->findChild<QPlainTextEdit*>();
+    if (m_cmtPopupEdit) {
+        // 🔴 Đề 6: popup CHỈ ĐỌC cho chú thích của phần mềm khác ⇒ tắt nút OK
+        // (không cho ghi đè /Contents của họ). Esc/Cancel vẫn đóng được.
+        m_cmtPopupEdit->setReadOnly(!editable);
+        if (auto* bb = dlg->findChild<QDialogButtonBox*>()) {
+            if (auto* ok = bb->button(QDialogButtonBox::Ok)) {
+                ok->setEnabled(editable);
+                if (!editable) ok->setToolTip(QStringLiteral(
+                    "Chú thích của phần mềm khác — không sửa được"));
+            }
+        }
+        // Đề 4: cao 4–14 dòng theo nội dung, quá thì cuộn (QPlainTextEdit tự
+        // cuộn khi vượt số dòng hiển thị).
+        const int lines = qBound(1, m_cmtPopupEdit->document()->blockCount(), 14);
+        const int lh = qMax(1, m_cmtPopupEdit->fontMetrics().lineSpacing());
+        m_cmtPopupEdit->setFixedHeight(qBound(4, lines, 14) * lh + 12);
+        m_cmtPopupEdit->setFocus();
+    }
+
+    // Neo NGAY DƯỚI hàng; nằm ngoài màn hình ⇒ đẩy vào trong.
+    const QPoint anchor = row->mapToGlobal(QPoint(0, row->height()));
+    if (QScreen* scr = QApplication::screenAt(anchor)) {
+        const QRect avail = scr->availableGeometry();
+        QSize sz = dlg->sizeHint();
+        sz.setWidth(qMax(360, sz.width()));
+        int x = anchor.x();
+        int y = anchor.y();
+        if (x + sz.width() > avail.right())  x = avail.right() - sz.width();
+        if (y + sz.height() > avail.bottom()) y = avail.top();
+        if (x < avail.left()) x = avail.left();
+        if (y < avail.top()) y = avail.top();
+        dlg->move(x, y);
+    }
+
+    // Đề 5: OK ⇒ emit commentTextEdited với chuỗi GIỮ NGUYÊN '\n' ⇒ đi đúng
+    // đường sửa hiện có (/Contents '\r' + /AP nhiều dòng). Huỷ ⇒ không đổi gì.
+    if (editable) {
+        connect(dlg, &QDialog::accepted, this, [this, page, indexInPage] {
+            if (m_cmtPopupEdit)
+                emit commentTextEdited(page, indexInPage, m_cmtPopupEdit->toPlainText());
+        });
+    }
+    connect(dlg, &QDialog::finished, this, [this] {
+        // Giải phóng con trỏ TRƯỚC khi dialog tự xoá.
+        QDialog* d = m_cmtPopup;
+        m_cmtPopup = nullptr;
+        m_cmtPopupEdit = nullptr;
+        if (d) d->deleteLater();
+    });
+
+    dlg->show();                       // không exec(): sidebar phải tương tác được
+    dlg->raise();
+    dlg->activateWindow();
+}
+
+void ThumbnailPanel::closeCommentPopup() {
+    if (m_cmtPopup) { m_cmtPopup->close(); m_cmtPopup = nullptr; }
+    m_cmtPopupEdit = nullptr;
 }
 
 void ThumbnailPanel::setCommentsLoading(bool loading) {
@@ -1273,6 +1608,7 @@ void ThumbnailPanel::selectCommentFor(int pageIndex, int annotIndex) {
         auto* item = m_commentsList->item(i);
         if (item && item->data(Qt::UserRole).toInt() == pageIndex &&
             item->data(Qt::UserRole + 1).toInt() == annotIndex) {
+            selectTab(2);
             m_commentsList->setCurrentItem(item);
             m_commentsList->scrollToItem(item);
             qDebug().noquote() << "[comments] sync PDF→list page=" << pageIndex << "idx=" << annotIndex << "found=1";
@@ -1283,11 +1619,131 @@ void ThumbnailPanel::selectCommentFor(int pageIndex, int annotIndex) {
     qDebug().noquote() << "[comments] sync PDF→list page=" << pageIndex << "idx=" << annotIndex << "found=0";
 }
 
+// 🔍 0927 LƯỢT 4 (VIỆC C) — probe đọc trạng thái ô sửa chú thích.
+// CHỈ đọc; KHÔNG tự khai "đạt" thay người chấm.
+int ThumbnailPanel::probeCommentRowCount() const {
+    return m_commentsList ? m_commentsList->count() : -1;
+}
+
+ThumbnailPanel::CommentRowProbe ThumbnailPanel::probeCommentRow(int page, int indexInPage,
+                                                                int row) const {
+    CommentRowProbe r;
+    if (!m_commentsList) return r;
+    if (row < 0) {
+        row = 0;
+        for (int i = 0; i < m_commentsList->count(); ++i) {
+            auto* it = m_commentsList->item(i);
+            if (it && it->data(Qt::UserRole).toInt() == page
+                && it->data(Qt::UserRole + 1).toInt() == indexInPage) { row = i; break; }
+        }
+    }
+    auto* it = m_commentsList->item(row);
+    if (!it) return r;
+    QWidget* w = m_commentsList->itemWidget(it);
+    if (!w) return r;
+    r.exists = true;
+    r.page = it->data(Qt::UserRole).toInt();
+    r.indexInPage = it->data(Qt::UserRole + 1).toInt();
+    if (auto* le = w->findChild<QLineEdit*>()) {
+        r.hasEdit = true;
+        r.text = le->text();
+        r.editableInPlace = !le->isReadOnly();
+        r.displayOnly = le->isReadOnly();
+        r.tooltipHasAllText = (le->toolTip() == le->property("trOrig").toString());
+        r.isOwn = le->property("trOwn").toBool();
+    }
+    for (auto* b : w->findChildren<QPushButton*>())
+        if (b->property("trExpand").toBool()) { r.hasExpandBtn = true; break; }
+    if (m_cmtPopupEdit) {
+        r.popupLines = m_cmtPopupEdit->document()->blockCount();
+        if (auto* bb = m_cmtPopup->findChild<QDialogButtonBox*>())
+            if (auto* ok = bb->button(QDialogButtonBox::Ok))
+                r.popupOkEnabled = ok->isEnabled();
+    }
+    return r;
+}
+
+bool ThumbnailPanel::probeOpenCommentPopup(int page, int indexInPage, int row,
+                                           const QString& byButton) {
+    if (!m_commentsList) return false;
+    if (row < 0) {
+        row = 0;
+        for (int i = 0; i < m_commentsList->count(); ++i) {
+            auto* it = m_commentsList->item(i);
+            if (it && it->data(Qt::UserRole).toInt() == page
+                && it->data(Qt::UserRole + 1).toInt() == indexInPage) { row = i; break; }
+        }
+    }
+    auto* it = m_commentsList->item(row);
+    if (!it) return false;
+    QWidget* w = m_commentsList->itemWidget(it);
+    if (!w) return false;
+
+    // ĐÚNG ĐƯỜNG: click giả lập = QPushButton::click() (phát tín hiệu clicked y
+    // như người dùng bấm chuột) hoặc bắn QKeyEvent y như bàn phím.
+    if (!byButton.isEmpty()) {
+        for (auto* b : w->findChildren<QPushButton*>()) {
+            if (!b->property("trExpand").toBool()) continue;
+            if (b->text() == byButton) { b->click(); return m_cmtPopup != nullptr; }
+        }
+        return false;
+    }
+    auto* le = w->findChild<QLineEdit*>();
+    if (!le) return false;
+    const int key = (byButton == QLatin1String("F2")) ? Qt::Key_F2 : Qt::Key_Return;
+    QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
+    QApplication::sendEvent(le, &press);
+    QKeyEvent rel(QEvent::KeyRelease, key, Qt::NoModifier);
+    QApplication::sendEvent(le, &rel);
+    return m_cmtPopup != nullptr;
+}
+
+// 🔴 0927 LUOT 5 (LOI 3) - lay toa do popup + hang de harness in ra.
+// rowGlobal: tim hang tuong ung trong danh sach theo page/indexInPage ma
+// popup dang mo; dung hien trang thi -1 de -1.
+bool ThumbnailPanel::probePopupGeometry(QRect* popupGlobal, QRect* rowGlobal) const {
+    if (popupGlobal) *popupGlobal = QRect();
+    if (rowGlobal)   *rowGlobal   = QRect();
+    if (!m_cmtPopup) return false;
+    if (popupGlobal) *popupGlobal = m_cmtPopup->geometry();
+    if (rowGlobal && m_commentsList) {
+        const QVariant vp = m_cmtPopup->property("trPopupPage");
+        const QVariant vi = m_cmtPopup->property("trPopupIdx");
+        if (vp.isValid() && vi.isValid()) {
+            for (int i = 0; i < m_commentsList->count(); ++i) {
+                auto* it = m_commentsList->item(i);
+                if (!it || it->data(Qt::UserRole).toInt() != vp.toInt()) continue;
+                if (it->data(Qt::UserRole + 1).toInt() != vi.toInt()) continue;
+                if (QWidget* rw = m_commentsList->itemWidget(it)) {
+                    *rowGlobal = QRect(rw->mapToGlobal(QPoint(0, 0)), rw->size());
+                    break;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+void ThumbnailPanel::closeCommentPopupIfOpen() { closeCommentPopup(); }
+
+bool ThumbnailPanel::probeSetPopupTextAndAccept(const QString& text) {
+    if (!m_cmtPopup || !m_cmtPopupEdit) return false;
+    m_cmtPopupEdit->setPlainText(text);
+    if (!m_cmtPopupEdit->isReadOnly())
+        m_cmtPopup->accept();          // đúng đường OK của hộp
+    else
+        m_cmtPopup->reject();
+    return true;
+}
+
 bool ThumbnailPanel::eventFilter(QObject* o, QEvent* e) {
-    if (e->type() == QEvent::FocusIn) {
-        if (auto* le = qobject_cast<QLineEdit*>(o)) {
-            int pg = le->property("trPage").toInt();
-            int ix = le->property("trIdx").toInt();
+    auto* le = qobject_cast<QLineEdit*>(o);
+    if (le) {
+        // 0927 LUOT 5 (LOI 2): be rong o chay theo sidebar -> cat lai cho vua.
+        if (e->type() == QEvent::Resize) applyRowElide(le);
+        const int pg = le->property("trPage").toInt();
+        const int ix = le->property("trIdx").toInt();
+        if (e->type() == QEvent::FocusIn) {
             if (m_commentsList) {
                 for (int i = 0; i < m_commentsList->count(); ++i) {
                     auto* it = m_commentsList->item(i);
@@ -1297,6 +1753,26 @@ bool ThumbnailPanel::eventFilter(QObject* o, QEvent* e) {
                             m_commentsList->setCurrentItem(it);
                         break;
                     }
+                }
+            }
+        }
+        // 🔴 0927 LUOT 4 (VIEC A de 2): o CHI-HIEN-THI (readOnly) —
+        // bam vao hoac Enter/F2 = mo popup. Đuong cua nguoi dung: phai
+        // chuyen sang chinh no bang chuot hay phim, khong phai ngoi rat ba lenh.
+        // o sua TAI CHO (readOnly=false) thi bo qua — gõ tay theo duong cu.
+        if (le->isReadOnly()) {
+            if (e->type() == QEvent::MouseButtonPress) {
+                if (auto* w = le->parentWidget())
+                    openCommentPopup(w, pg, ix, /*editable=*/le->property("trOwn").toBool());
+                return true;
+            }
+            if (e->type() == QEvent::KeyPress) {
+                auto* ke = static_cast<QKeyEvent*>(e);
+                if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter ||
+                    ke->key() == Qt::Key_F2) {
+                    if (auto* w = le->parentWidget())
+                        openCommentPopup(w, pg, ix, /*editable=*/le->property("trOwn").toBool());
+                    return true;
                 }
             }
         }

@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QEvent>
+#include <QMessageBox>
 #include <QStyleFactory>
 #include <QThreadPool>
 #include <QThread>
@@ -20,11 +22,14 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <vector>
 #ifndef TORREADER_NO_PDFIUM
 #include "ui/MainWindow.h"
+#include "ui/ContinuousView.h"
 #include "ui/AboutDialog.h"
 #include "ui/ThemeTokens.h"
 #include "ui/ThumbnailPanel.h"
+#include "ui/LoadingBadge.h"
 #include "core/PdfEditor.h"
 #include "core/PdfDocument.h"
 #include "core/PdfRenderer.h"
@@ -38,11 +43,14 @@
 #include "core/PdfLinks.h"
 #include "core/PageCache.h"
 #include "core/PdfiumLock.h"
+#include "core/Bisect.h"
+#include "core/FastExit.h"
 #include "annotations/AnnotationManager.h"
 #include "annotations/AnnotationLayer.h"
 #include "annotations/AnnotationTypes.h"
 #include "core/ThumbnailRenderPool.h"
 #include "core/TileCacheFile.h"
+#include "core/VectorCacheFile.h"
 #include <fpdfview.h>
 #include <fpdf_edit.h>
 #include <fpdf_save.h>
@@ -52,6 +60,8 @@
 #include <fpdf_formfill.h>
 #include <QPdfWriter>
 #include <QPainter>
+#include <QFont>
+#include <QFontMetricsF>
 #include <QPageLayout>
 #include <QPageSize>
 extern QMutex s_pdfiumMutex;
@@ -61,8 +71,15 @@ extern QMutex s_pdfiumMutex;
 #endif
 #ifdef Q_OS_WIN
 #include "core/VkPacketInputFilter.h"
+// 0927 LƯỢT 11: TerminateProcess/GetCurrentProcess cho đường thoát nhanh.
+#include <windows.h>
+#include <heapapi.h>   // 🔴 LƯỢT 28: PROCESS_HEAP_SUMMARY/HeapSummary/GetProcessHeaps (LEAN_AND_MEAN khong nap heapapi)
+#endif
+#ifndef Q_OS_WIN
+#include <unistd.h>   // 0927 LƯỢT 11: _exit() cho đường thoát nhanh
 #endif
 #include <QCoreApplication>
+#include <QRandomGenerator>
 #include <QEventLoop>
 #include <QDir>
 #include <QImage>
@@ -82,6 +99,7 @@ extern QMutex s_pdfiumMutex;
 #include <QDockWidget>
 #include <QLineEdit>
 #include <QKeyEvent>
+#include <QPlainTextEdit>
 #include <QInputDialog>
 #include <QTimer>
 #include <QToolBar>
@@ -114,6 +132,13 @@ static void logHandler(QtMsgType type, const QMessageLogContext&, const QString&
                      : (type == QtWarningMsg)  ? 'W'
                      : (type == QtCriticalMsg) ? 'C'
                      : (type == QtFatalMsg)    ? 'C' : 'D';
+    // 🔴 LƯỢT 34 (muc 1 — DO): gan nhan chu THE cho moi dong khi TORREADER_GUILOCK=1 de
+    // tim TAN GO cho UI dung hinh: khoa = khoang trong lon nhat giua HAI dong [UI] lien tiep.
+    static const bool kTagThread = !qEnvironmentVariableIsEmpty("TORREADER_GUILOCK");
+    static const QThread* kMainThr = []{
+        return QCoreApplication::instance() ? QCoreApplication::instance()->thread() : nullptr;
+    }();
+    const bool isMain = kTagThread && (QThread::currentThread() == kMainThr);
     {
         QMutexLocker lk(&g_logMutex);
         if (g_logFile.isOpen()) {
@@ -121,6 +146,7 @@ static void logHandler(QtMsgType type, const QMessageLogContext&, const QString&
             line += " [";
             line += level;
             line += "] ";
+            if (kTagThread) line += isMain ? "[UI] " : "[bg] ";
             line += msg.toUtf8();
             line += '\n';
             g_logFile.write(line);
@@ -167,13 +193,180 @@ struct TRFileWriter {
                                static_cast<qint64>(size)) == static_cast<qint64>(size) ? 1 : 0;
     }
 };
+
+// ── 0927 LƯỢT 11 — THOÁT NHANH (vá tạm) ──────────────────────────────────────
+// Crash 0x80000003 lúc thoát nằm trong ~MainWindow (UI → PageCache::closeEntry →
+// FPDF_ClosePage), ~50% lượt với file CAD nặng. Gốc chưa rõ ⇒ vá tạm ở ĐƯỜNG THOÁT:
+// gọi đúng MỘT chỗ sau mỗi `app.exec()` của ĐƯỜNG APP THẬT, huỷ tiến trình thay vì
+// để chạy hàm huỷ. Chi tiết + lý do: REPORT_CRASH_EYACHO_0927.md §"LƯỢT 11".
+//
+// 🔴 HỢP ĐỒNG (không được phá):
+//   1. Chỉ gọi SAU `app.exec()` — mọi việc người dùng cần nằm trong closeEvent và
+//      nó đã chạy xong trước lúc exec() trả về (closeEvent tự báo qua trExitReady).
+//   2. Không đụng đường ĐÓNG TAB (app vẫn chạy) — hàm này chỉ ở cuối vòng đời app.
+//   3. Bật `--thoat-cham` (xem Bisect.h) = đường CŨ, để CEO tái hiện crash.
+static void trThoatNhanh(int rc, MainWindow* w) {
+    if (trThoatCham()) {
+        qDebug().noquote() << QStringLiteral("[thoat] duongCu rc=%1 lyDo=thoatCham").arg(rc);
+        return;   // đường cũ: chạy đủ hàm huỷ, crash 0x80000003 quay lại nếu có
+    }
+    if (!trExitReady()) {
+        // Không đi qua closeEvent (qApp->quit() ở GateDialog, probe tự quit) ⇒
+        // KHÔNG chắc việc bắt buộc đã xong ⇒ không giết, đi tiếp như cũ.
+        qDebug().noquote() << QStringLiteral("[thoat] duongCu rc=%1 lyDo=closeEventChuaXong").arg(rc);
+        return;
+    }
+    QSettings().sync();              // đẩy hết ghi QSettings còn treo (token, ngôn ngữ, ocr/root)
+    const int left = w ? w->removeDraftsForExit() : 0;
+    if (left > 0)
+        qWarning().noquote() << QStringLiteral("[thoat] banNhapConLai=%1 (handle PDFium con mo)").arg(left);
+    const qint64 sauDon = trExitDoneClock().isValid() ? trExitDoneClock().elapsed() : -1;
+    qDebug().noquote() << QStringLiteral("[thoat] nhanh rc=%1 sauDonMs=%2").arg(rc).arg(sauDon);
+    fflush(nullptr);                 // stdout + stderr (probe in ra đây) — TRƯỚC khi giết
+    g_logFile.flush();
+    g_logFile.close();
+#ifdef Q_OS_WIN
+    if (!::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(rc))) ::_exit(rc);
+#else
+    _exit(rc);
+#endif
+}
 #endif
 
-int main(int argc, char* argv[]) {
+// 🔴 LƯỢT 28 (VIỆC 1a — heap KHỐI LỚN): 2 000 lan malloc/free kich co 64 KB–4 MB,
+// SEED CO DINH (moi lan do cung mot day kich thuoc). LFH chi phuc vu khoi ≤16 KB;
+// khoi lon di free-list cua process heap (pdfium.dll dung CRT/ucrt malloc =
+// GetProcessHeap). hp_big_ns TANG THEO LAP ⇒ gia thuyet CEO dung: phan manh khoi
+// lon (QImage cache + bitmap + path arrays churn) lam moi cap phat lon cham dan.
+// Nhat: chinh day malloc cung phan manh them heap — bang nhau giua cac lan do thi
+// so VAN so duoc voi nhau. Linux tra -1 (dung pfCount L25 — mang Linux bien dich).
+static long long heapBigNs() {
+#ifdef Q_OS_WIN
+    QElapsedTimer t; t.start();
+    unsigned x = 20260929u;
+    for (int i = 0; i < 2000; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        const size_t sz = 65536 + (x % (4u * 1024u * 1024u - 65536u));
+        void* p = malloc(sz);
+        if (p) { *static_cast<volatile char*>(p) = 1; free(p); }
+    }
+    return t.nsecsElapsed();
+#else
+    return -1;
+#endif
+}
+// Dem heap (GetProcessHeaps) + HeapWalk cua GetProcessHeap: so block FREE + tong
+// bytes free (cap 200k entry — probe-only; LFH an block nho trong HeapWalk nen
+// con lai chu yeu khoi lon; nen khac van cap phat song song ⇒ so xap xi, XU HU la
+// du). Segment Heap khong ho tro HeapWalk ⇒ -1 la tin hieu manifest da noi (tren
+// Win11 — may do Win10 19044, xem REPORT).
+static void heapSummary(long long& nHeaps, long long& freeKB, long long& freeBlocks) {
+    nHeaps = -1; freeKB = -1; freeBlocks = -1;
+#ifdef Q_OS_WIN
+    nHeaps = GetProcessHeaps(0, nullptr);
+    PROCESS_HEAP_ENTRY e{};
+    long long fb = 0, fk = 0, seen = 0;
+    const HANDLE h = GetProcessHeap();
+    while (seen < 2000000 && HeapWalk(h, &e)) {   // tran 2M entry — buoc chay co thoi han
+        ++seen;
+        if (!(e.wFlags & (PROCESS_HEAP_REGION | PROCESS_HEAP_UNCOMMITTED_RANGE |
+                          PROCESS_HEAP_ENTRY_BUSY)) && e.cbData) {
+            ++fb; fk += (long long)e.cbData / 1024;
+        }
+    }
+    freeKB = fk; freeBlocks = fb;
+#endif
+}
+
+// 🔴 LƯỢT 34 (muc 1 — DO): [slotms] tong quat tren moi lan phat su kien o luong GIAO DIEN.
+// Bao cao MỌI handler cua UI thread chay > 100 ms (ke ca paintEvent, timer, slot cua signal
+// queued) kem ten doi tuon nhan + loai su kien. Chi bat khi TORREADER_GUILOCK=1 (che do DO),
+// mac dinh tat va khong them chi phi. Day la thu duy nhat bat duoc cho UI dung >100ms MA
+// KHONG phai do doi khoa pdfium (ca [guilock]/[lockwait] deu ~0 trong cua so zoom 200%).
+class TrProbeApp : public QApplication {
+public:
+    using QApplication::QApplication;
+    static const char* evName(int t) {
+        switch (t) {
+        case QEvent::Timer: return "Timer";
+        case QEvent::Paint: return "Paint";
+        case QEvent::Show: return "Show";
+        case QEvent::Resize: return "Resize";
+        case QEvent::UpdateRequest: return "UpdateRequest";
+        case QEvent::MouseMove: return "MouseMove";
+        case QEvent::MouseButtonPress: return "MouseButtonPress";
+        case QEvent::Wheel: return "Wheel";
+        default: return "ev";
+        }
+    }
+    bool notify(QObject* recv, QEvent* ev) override {
+        static const bool audit = !qEnvironmentVariableIsEmpty("TORREADER_GUILOCK");
+        if (!audit) return QApplication::notify(recv, ev);
+        QElapsedTimer t; t.start();
+        const bool r = QApplication::notify(recv, ev);
+        const qint64 ms = t.elapsed();
+        if (ms > 100)
+            qDebug().noquote() << "[slotms] notify" << (recv ? recv->metaObject()->className() : "?")
+                               << evName(int(ev->type())) << "ms=" << ms;
+        return r;
+    }
+};
+
+// 🔴 LƯỢT 36 (mục 0) — THOÁT PROBE SẠCH, chặn MỘT choke point:
+// Mọi chế độ `--*-probe`/`--*-bench` `return` khỏi main trong khi task nền (render
+// pool, closeJob) VẪN còn chạy ⇒ destructor tĩnh chạy giữa lúc worker đang giữ
+// khoá ⇒ văng (bằng chứng 15:32: --welcome-probe Qt6Core ← TimedPdfiumLock ←
+// ProgressiveRenderTask::run PdfRenderer.cpp:590). Nay main() là wrapper: đường
+// probe kết thúc bằng flush + TerminateProcess (ĐÚNG đường thoát nhanh của
+// trThoatNhanh) — không chạy bất kỳ hàm huỷ nào. Đường APP THẬT (cờ dưới) KHÔNG
+// đổi: vẫn app.exec() → trThoatNhanh, --thoat-cham vẫn về đường huỷ cũ.
+static bool g_trRealAppPath = false;
+
+static int trMainImpl(int argc, char* argv[]) {
+    // 0927 LƯỢT 12 — CỜ NGƯỢC `--pool-song-par` (thay `--pool-lock` của LƯỢT 9).
+    // Mặc định KHÔNG có cờ ⇒ KHOÁ PDFium là mặc định vĩnh viễn (xem core/PdfiumLock.h
+    // để biết vì sao: ASan heap-use-after-free trên ColorSpace toàn cục + TSan 229
+    // tranh chấp dính pdfium ⇒ pdfium KHÔNG thread-safe kể cả khác FPDF_DOCUMENT).
+    // Cờ này CHỈ để CEO tái hiện lại đường KHÔNG khoá đã biết là hỏng. KHÔNG bật ở
+    // bản phát hành.
+    {
+        int nFlags = 0;
+        const TrBisectFlag* flags = trBisectFlags(&nFlags);
+        for (int i = 1; i < argc; ) {
+            const QString a = QString::fromLocal8Bit(argv[i]);
+            if (a == QLatin1String("--pool-lock")) {
+                // Cờ cũ đã bị gỡ — cảnh báo thay vì im lặng để không ai tưởng còn hiệu lực.
+                qWarning("[khoachung] --pool-lock da bi GO BO: khoa PDFium la mac dinh. "
+                         "Dung --pool-song-par neu can tai hien loi.");
+            } else if (a == QLatin1String("--pool-song-par")) {
+                qWarning("[khoachung] BA CHAY CHE DO --pool-song-par: PDFium khong khoa "
+                         "=> biet truoc se dung 0x80000003 / heap 0xc0000374.");
+                qputenv("TORREADER_POOL_SONGPAR", "1");
+                for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                --argc;   // không bỏ argv[argc] — phần còn lại không đọc tới
+                continue;
+            } else {
+                bool matched = false;
+                for (int f = 0; f < nFlags; ++f) {
+                    if (a != QLatin1String(flags[f].cli)) continue;
+                    qputenv(flags[f].env, "1");
+                    for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+                    --argc;
+                    matched = true;
+                    break;
+                }
+                if (!matched) ++i;
+                continue;
+            }
+            for (int j = i; j + 1 < argc; ++j) argv[j] = argv[j + 1];
+            --argc;   // --pool-lock: bỏ khỏi argv như các cờ khác (không để lọc 2 lần)
+        }
+    }
+
     QApplication::setHighDpiScaleFactorRoundingPolicy(
         Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
 
-    QApplication app(argc, argv);
+    TrProbeApp app(argc, argv);
     app.setApplicationName("TorReader PDF");
     app.setApplicationVersion(FELIXPDF_VERSION);
     app.setOrganizationName("Loc Nguyen Huy");
@@ -207,6 +400,462 @@ int main(int argc, char* argv[]) {
     qDebug() << "[gate] app version =" << FELIXPDF_VERSION;
 
 #ifndef TORREADER_NO_PDFIUM
+
+    // 0927 LƯỢT 12: dòng XÁC NHẬN. Gọi hàm ở đây để nó đọc biến ĐÚNG MỘT LẦN ngay
+    // lúc khởi động, trước khi luồng nền gọi tới. bat=1 là HÀNH VI ĐÚNG.
+    qDebug().noquote() << "[poollock] bat=" << (trPoolLockOn() ? 1 : 0)
+                       << (trPoolLockOn() ? "(mac dinh — MOI loi goi PDFium deu khoa)"
+                                          : "(!! --pool-song-par — TAI HIEN LOI, khong phat hanh !!)");
+
+    // 0927 LƯỢT 10: MỘT dòng `[bisect] <ten>=1` cho MỖI công tắc đang BẬT (tên = cờ
+    // bỏ `--`). Không có dòng nào = mặc định (hành vi hiện tại) = lượt chạy vô nghĩa.
+    {
+        int nFlags = 0;
+        const TrBisectFlag* flags = trBisectFlags(&nFlags);
+        for (int f = 0; f < nFlags; ++f) {
+            if (!qEnvironmentVariableIsEmpty(flags[f].env)) continue;
+            qDebug().noquote() << "[bisect]" << flags[f].cli + 2 << "=1";   // bỏ "--"
+        }
+    }
+
+    // 📐 NAC 1 (0921): doi chung pixel — sua FreeText NGOAI bang DUNG CHU CU roi
+    // ghi /AP moi qua QPDF. usage: --ftngoai-ap <in.pdf> <page> <annotIndex> <out.pdf>
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftngoai-ap")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "FTAP: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        QString oldText;
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc.raw(), pageIndex);
+            FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, annotIndex);
+            unsigned long n = FPDFAnnot_GetStringValue(a, "Contents", nullptr, 0);
+            if (n > 2) {
+                std::vector<char16_t> b(n/2+1, 0);
+                FPDFAnnot_GetStringValue(a, "Contents", (FPDF_WCHAR*)b.data(), n);
+                oldText = QString::fromUtf16(b.data());
+            }
+            FPDFPage_CloseAnnot(a); FPDF_ClosePage(p);
+        }
+        // argv[6] (tuy chon): chu MOI (UTF-8). Thieu ⇒ giu DUNG chu cu.
+        const QString newText = (argc >= 7) ? QString::fromUtf8(argv[6]) : oldText;
+        out << "FTAP: oldText=[" << oldText << "]\n";
+        out << "FTAP: newText=[" << newText << "]\n"; out.flush();
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            mgr.setAllowForeignFreeTextEdit(true);   // harness do — GUI KHONG bat
+            bool ok = mgr.retextNote(pageIndex, annotIndex, newText);
+            out << "FTAP: retextNote=" << (ok?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "FTAP: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 P1 (0921): thu DUONG HOAN TAC. usage: --ftap-restore <in.pdf> <page> <idx> <out.pdf>
+    // in.pdf phai la ban DA VA (co /TR_AP_ORIG). Dat lai /AP/N tu /TR_AP_ORIG roi xoa khoa.
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftap-restore")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) { out << "FTAPR: FAIL copy\n"; out.flush(); return 1; }
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "FTAPR: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            bool ok = mgr.restoreForeignAp(pageIndex, annotIndex);
+            out << "FTAPR: restore=" << (ok?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 P0 (0921): thu chot so huu setAnnotStyle.
+    // usage: --ftap-style <in.pdf> <page> <idx> <out.pdf> [--own]
+    //   (khong --own) : annot NGOAI  → phai tra false, /AP khong doi mot byte.
+    //   --own         : gan TRUID truoc → annot CUA TA → phai tra true (doi mau duoc).
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftap-style")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        const bool makeOwn = (argc >= 7 && QString::fromLocal8Bit(argv[6]) == QLatin1String("--own"));
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "FTAPS: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            if (makeOwn) {
+                mgr.setAllowTestStampUid(true);   // harness: mo phong annot CUA TA
+                QString uid = mgr.generateUid();
+                bool set = mgr.setAnnotUid(pageIndex, annotIndex, uid);
+                out << "FTAPS: makeOwn setUid=" << (set?"true":"false") << " uid=" << uid << "\n";
+            }
+            bool ok = mgr.setAnnotStyle(pageIndex, annotIndex, QColor(0, 128, 255), 4.0f, false, 255);
+            out << "FTAPS: setAnnotStyle=" << (ok?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "FTAPS: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 P0 (0921): chot so huu setAnnotContents (o nhap comment o sidebar).
+    // usage: --ftap-contents <in.pdf> <page> <idx> <out.pdf> [--own] [chu_moi]
+    //   (khong --own): annot NGOAI → phai false, /Contents khong doi mot byte.
+    //   --own        : gan TRUID truoc → annot CUA TA → phai true (van go duoc).
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftap-contents")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        const bool makeOwn = (argc >= 7 && QString::fromLocal8Bit(argv[6]) == QLatin1String("--own"));
+        const QString newText = (argc >= 8) ? QString::fromUtf8(argv[7])
+                                            : QStringLiteral("TORREADER edited content 0921");
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "FTAPC: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            if (makeOwn) {
+                mgr.setAllowTestStampUid(true);   // harness: mo phong annot CUA TA
+                QString uid = mgr.generateUid();
+                bool set = mgr.setAnnotUid(pageIndex, annotIndex, uid);
+                out << "FTAPC: makeOwn setUid=" << (set?"true":"false") << " uid=" << uid << "\n";
+            }
+            bool ok = mgr.setAnnotContents(pageIndex, annotIndex, newText);
+            out << "FTAPC: own=" << (makeOwn?"true":"false")
+                << " setAnnotContents=" << (ok?"true":"false")
+                << " newText=[" << newText << "]\n";
+            bool sv = mgr.saveDocument();
+            out << "FTAPC: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 P1 (0921): moveAnnot tren annot NGOAI (Ink) — phai false VA /Rect khong doi.
+    // usage: --move-test <in.pdf> <page> <idx> <out.pdf>
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--move-test")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "MOVET: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            bool ok = mgr.moveAnnot(pageIndex, annotIndex, 50.0, 30.0);
+            out << "MOVET: moveAnnot=" << (ok?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "MOVET: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 VIỆC 1 (0921): chứng minh CỬA DUY NHẤT — in quyết định guardWrite cho từng
+    // loại ghi, rồi gọi THẬT các hàm ghi để đối chiếu (annot ngoài phải false hết,
+    // trừ Delete; --own mô phỏng annot của ta ⇒ phải true).
+    // usage: --guardwrite-suite <in.pdf> <page> <idx> <out.pdf> [--own]
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--guardwrite-suite")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        const bool makeOwn = (argc >= 7 && QString::fromLocal8Bit(argv[6]) == QLatin1String("--own"));
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "GUARD: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            if (makeOwn) {
+                mgr.setAllowTestStampUid(true);
+                QString uid = mgr.generateUid();
+                bool set = mgr.setAnnotUid(pageIndex, annotIndex, uid);
+                out << "GUARD: makeOwn setUid=" << (set?"true":"false") << " uid=" << uid << "\n";
+            }
+            out << "GUARD: own=" << (makeOwn?"true":"false") << "\n";
+            const struct { const char* name; AnnotationManager::AnnotWrite what; } kinds[] = {
+                {"Contents", AnnotationManager::AnnotWrite::Contents},
+                {"Style",    AnnotationManager::AnnotWrite::Style},
+                {"Rect",     AnnotationManager::AnnotWrite::Rect},
+                {"Geometry", AnnotationManager::AnnotWrite::Geometry},
+                {"Delete",   AnnotationManager::AnnotWrite::Delete},
+                {"Uid",      AnnotationManager::AnnotWrite::Uid},
+            };
+            for (const auto& k : kinds) {
+                QString why;
+                bool g = mgr.guardWrite(pageIndex, annotIndex, k.what, &why);
+                out << "GUARD: guardWrite." << k.name << "=" << (g?"true":"false")
+                    << " why=[" << why << "]\n";
+            }
+            // Gọi THẬT (có thể ghi nếu là annot của ta). Chỉ để in true/false.
+            out << "GUARD: real.setAnnotContents=" << (mgr.setAnnotContents(pageIndex, annotIndex, QStringLiteral("GUARD-TEST"))?"true":"false") << "\n";
+            out << "GUARD: real.moveAnnot="       << (mgr.moveAnnot(pageIndex, annotIndex, 7.0, 5.0)?"true":"false") << "\n";
+            out << "GUARD: real.setAnnotRectDisplay=" << (mgr.setAnnotRectDisplay(pageIndex, annotIndex, QRectF(10,10,200,120))?"true":"false") << "\n";
+            out << "GUARD: real.setAnnotStyle="  << (mgr.setAnnotStyle(pageIndex, annotIndex, QColor(0,128,255), 4.0f, false, 255)?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "GUARD: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 VIỆC 3-A1 (0921): co giãn gốc annot — annot ngoài phải false, /Rect không đổi.
+    // usage: --resize-test <in.pdf> <page> <idx> <out.pdf>
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--resize-test")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "RESIZET: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            bool ok = mgr.setAnnotRectDisplay(pageIndex, annotIndex, QRectF(20, 20, 260, 180));
+            out << "RESIZET: setAnnotRectDisplay=" << (ok?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "RESIZET: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 VIỆC 3-A3 (0921): "backup rồi xoá" + dựng lại byte-bằng.
+    // usage: --annotdel <in.pdf> <page> <idx> <out.pdf>
+    //   → in ra đường dẫn sidecar (backup) rồi xoá annot, lưu `out.pdf`.
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotdel")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) { out << "ANNOTDEL: FAIL copy\n"; out.flush(); return 1; }
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "ANNOTDEL: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            const QString side = mgr.backupAnnotForDelete(pageIndex, annotIndex);
+            out << "ANNOTDEL: sidecar=[" << side << "]\n";
+            if (side.isEmpty()) { out << "ANNOTDEL: backup=false\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+            bool rm = mgr.removeAnnot(pageIndex, annotIndex);
+            out << "ANNOTDEL: removeAnnot=" << (rm?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "ANNOTDEL: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // usage: --annotundel <in.pdf> <page> <insertIdx> <sidecar.pdf> <out.pdf>
+    if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotundel")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int insertAt = QString::fromLocal8Bit(argv[4]).toInt();
+        QString sidePath = QString::fromLocal8Bit(argv[5]);
+        QString outPath = QString::fromLocal8Bit(argv[6]);
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) { out << "ANNOTUNDEL: FAIL copy\n"; out.flush(); return 1; }
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "ANNOTUNDEL: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            bool ok = mgr.restoreAnnotFromBackup(pageIndex, insertAt, sidePath);
+            out << "ANNOTUNDEL: restore=" << (ok?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // 🔴 P0 (0921): REDO "xoá annot ngoài" — mô phỏng ĐÚNG việc MainWindow::doRedo phải
+    // làm trước khi loadTabFile (nạp lại TỪ ĐĨA): removeAnnot rồi GHI XUỐNG ĐĨA.
+    //   --old : tái hiện lỗi cũ (KHÔNG saveDocument) ⇒ tệp không đổi ⇒ xoá bị mất.
+    //   mặc định: nhánh ĐÃ VÁ (saveDocument) ⇒ tệp đổi, số annot giảm 1 (kiểm bằng --annotcount).
+    // usage: --annotredo <in.pdf> <page> <idx> <out.pdf> [--old]
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotredo")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        const bool oldMode = (argc >= 7 && QString::fromLocal8Bit(argv[6]) == QLatin1String("--old"));
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) { out << "ANNOTREDO: FAIL copy\n"; out.flush(); return 1; }
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        // Mở bản GỐC, ghi ra `outPath` (giống --annotdel): tránh tự ghi đè tệp đang mở.
+        if (!doc.open(inPath)) { out << "ANNOTREDO: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        bool rm = false, sv = oldMode;   // --old: KHÔNG ghi (đúng lỗi cũ)
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            rm = mgr.removeAnnot(pageIndex, annotIndex);
+            if (!oldMode) sv = mgr.saveDocument();   // 🔴 P0: GHI trước khi nạp lại tab
+        }
+        out << "ANNOTREDO: mode=" << (oldMode ? "OLD" : "NEW")
+            << " removeAnnot=" << (rm?"true":"false")
+            << " save=" << (sv?"true":"false")
+            << (oldMode ? " (OLD: co y KHONG ghi — tai hien loi)" : " (NEW: da ghi xuong dia)")
+            << "\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return (rm && (oldMode || sv)) ? 0 : 1;
+    }
+
+    // Đếm annot một trang trong tệp (mở MỚI hoàn toàn) — dùng để nghiệm thu REDO.
+    // usage: --annotcount <in.pdf> <page>
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--annotcount")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        QTextStream out(stdout);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "ANNOTCOUNT: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        int n = -1;
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), inPath);
+            n = mgr.annotCount(pageIndex);
+        }
+        out << "ANNOTCOUNT: page=" << pageIndex << " count=" << n << "\n";
+        out.flush();
+        PdfDocument::libRelease();
+        return n >= 0 ? 0 : 1;
+    }
+
+    // 🔴 P2 (0921): chung minh addSnapshot CO THE that bai (subtype PDFium khong tao
+    // lai duoc, vd /Line) ⇒ nhanh shape undo/redo phai boc `if (ok)`.
+    // usage: --addsnap-test <in.pdf> <page> <out.pdf> [--old]
+    //   (khong --old): nhanh MOI — chi gan uid khi addSnapshot true.
+    //   --old        : nhanh CU — gan uid bat ke ket qua (de doi chieu).
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--addsnap-test")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[4]);
+        const bool oldMode = (argc >= 6 && QString::fromLocal8Bit(argv[5]) == QLatin1String("--old"));
+        QTextStream out(stdout);
+        QFile::remove(outPath);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "SNAPT: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            int before = mgr.annotCount(pageIndex);
+            AnnotSnapshot s;
+            s.valid = true;
+            s.subtype = FPDF_ANNOT_LINE;     // PDFium khong tao lai duoc
+            s.rl = 100; s.rt = 200; s.rr = 300; s.rb = 150;
+            s.uid = QStringLiteral("P2TESTUID");
+            bool ok = mgr.addSnapshot(pageIndex, s);
+            int after = mgr.annotCount(pageIndex);
+            out << "SNAPT: addSnapshot=" << (ok?"true":"false")
+                << " annotCount " << before << " -> " << after << "\n";
+            bool stamped = false;
+            if (oldMode) {
+                if (after > 0) stamped = mgr.setAnnotUid(pageIndex, after - 1, s.uid);
+                out << "SNAPT: mode=OLD (bat ke ket qua) stamped=" << (stamped?"true":"false") << "\n";
+            } else {
+                if (ok && after > 0) stamped = mgr.setAnnotUid(pageIndex, after - 1, s.uid);
+                out << "SNAPT: mode=NEW guard_skipped_stamp=" << (ok?"false":"true")
+                    << " stamped=" << (stamped?"true":"false") << "\n";
+            }
+            bool sv = mgr.saveDocument();
+            out << "SNAPT: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
+    // TEMP PROBE 0921: kiem tra GetAP tra ve gi voi AP stream that + SetAP ghi ra stream hay string.
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--apdump-test")) {
+        QString inPath = QString::fromLocal8Bit(argv[2]);
+        int pageIndex = QString::fromLocal8Bit(argv[3]).toInt();
+        int annotIndex = QString::fromLocal8Bit(argv[4]).toInt();
+        QString outPath = QString::fromLocal8Bit(argv[5]);
+        QTextStream out(stdout);
+        PdfDocument::libAddRef();
+        PdfDocument doc;
+        if (!doc.open(inPath)) { out << "APDUMP: FAIL open\n"; out.flush(); PdfDocument::libRelease(); return 1; }
+        {
+            QMutexLocker lock(&s_pdfiumMutex);
+            FPDF_PAGE p = FPDF_LoadPage(doc.raw(), pageIndex);
+            FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, annotIndex);
+            if (!a || !p) { out << "APDUMP: FAIL annot\n"; out.flush(); FPDF_ClosePage(p); PdfDocument::libRelease(); return 1; }
+            unsigned long n = FPDFAnnot_GetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, nullptr, 0);
+            out << "APDUMP: orig GetAP len=" << n << "\n";
+            if (n > 2) {
+                std::vector<unsigned short> buf(n/2+1, 0);
+                FPDFAnnot_GetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL, (FPDF_WCHAR*)buf.data(), n);
+                QString s = QString::fromUtf16((const char16_t*)buf.data());
+                out << "APDUMP: orig GetAP text=[" << s.left(300) << "]\n";
+            }
+            FS_RECTF r{}; FPDFAnnot_GetRect(a, &r);
+            out << "APDUMP: rect=" << r.left << "," << r.bottom << "," << r.right << "," << r.top << "\n";
+            FPDFPage_CloseAnnot(a); FPDF_ClosePage(p);
+        }
+        {
+            AnnotationManager mgr;
+            mgr.setDocument(doc.raw(), outPath);
+            bool ok = mgr.createInlineNote(pageIndex, QRectF(50,100,300,30),
+                        QStringLiteral("An detail nay"), QStringLiteral("tmp"),
+                        false, QColor(255,0,0), 15.0f);
+            out << "APDUMP: createInlineNote=" << (ok?"true":"false") << "\n";
+            bool sv = mgr.saveDocument();
+            out << "APDUMP: save=" << (sv?"true":"false") << " err=" << mgr.lastError() << "\n";
+        }
+        out.flush();
+        PdfDocument::libRelease();
+        return 0;
+    }
+
     // Hidden headless CLI mode for crash reproduction
     if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == "--merge") {
         QStringList inputs;
@@ -359,6 +1008,57 @@ int main(int argc, char* argv[]) {
             << " (expected>=6, got " << found << ")\n";
         out.flush();
         return (okLoad && found >= 6) ? 0 : 1;
+    }
+
+    // usage: --loading-badge-probe <out.png>
+    // LUOT 42 (30/09): nghiem thu ham dung chung loadingBadgeImage()/drawLoadingBadge()
+    // (xem ui/LoadingBadge.h) — chu Loading/man chao ve qua QImage CPU thay vi
+    // drawText() thang len QOpenGLWidget (glyph cache GL hong sau khi GL resource
+    // cac tab bi huy/tao lai lam chu vo bien dang, owner bao 30/09). Khong can GL:
+    // chi goi ham dung chung o dpr 1.0 va 1.5 voi CHINH tham so dang dung o
+    // ContinuousView (xam 150 nen trang) va PdfGpuView (trang 26pt bold nen toi),
+    // ghep len mot QImage nen roi luu PNG.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--loading-badge-probe")) {
+        const QString outPath = QString::fromLocal8Bit(argv[2]);
+
+        const int cellW = 420, cellH = 140, pad = 12;
+        const int cols = 2, rows = 2;   // (dpr 1.0/1.5) x (Continuous xam/PdfGpuView trang)
+        QImage sheet(cols * cellW, rows * cellH, QImage::Format_ARGB32_Premultiplied);
+        sheet.fill(Qt::white);
+        QPainter sp(&sheet);
+
+        auto drawCell = [&](int col, int row, const QColor& cellBg, const QImage& badge,
+                             const QString& label) {
+            const QRect cellRect(col * cellW, row * cellH, cellW, cellH);
+            sp.fillRect(cellRect, cellBg);
+            drawLoadingBadge(sp, QRectF(cellRect.adjusted(pad, pad, -pad, -pad)), badge);
+            sp.setPen(Qt::red);
+            sp.drawText(cellRect.adjusted(4, 2, -4, -2), Qt::AlignLeft | Qt::AlignTop, label);
+            sp.setPen(QColor(0, 0, 0, 60));
+            sp.drawRect(cellRect.adjusted(0, 0, -1, -1));
+        };
+
+        // Cot 0 = dpr 1.0, cot 1 = dpr 1.5. Hang 0 = ContinuousView (Loading xam
+        // tren nen trang), hang 1 = PdfGpuView (Loading trang bold tren nen toi).
+        const qreal dprs[2] = {1.0, 1.5};
+        for (int c = 0; c < 2; ++c) {
+            const QImage contBadge = loadingBadgeImage(QStringLiteral("Loading..."), 11, false,
+                                                        QColor(150, 150, 150), dprs[c]);
+            drawCell(c, 0, Qt::white, contBadge,
+                     QString("dpr=%1 ContinuousView").arg(dprs[c]));
+
+            const QImage gpuBadge = loadingBadgeImage(QStringLiteral("Loading…"), 26, true,
+                                                       QColor(255, 255, 255), dprs[c]);
+            drawCell(c, 1, QColor(45, 45, 45), gpuBadge,
+                     QString("dpr=%1 PdfGpuView").arg(dprs[c]));
+        }
+        sp.end();
+
+        const bool ok = sheet.save(outPath, "PNG");
+        fprintf(stdout, "LOADINGPROBE: %s w=%d h=%d\n", ok ? "PASS" : "FAIL",
+                sheet.width(), sheet.height());
+        fflush(stdout);
+        return ok ? 0 : 1;
     }
 
     // usage: --imgstamp-test <out.pdf>
@@ -990,18 +1690,21 @@ int main(int argc, char* argv[]) {
             rendererC->setDocument(&docC);
 
             // Open persistent tile cache like the app does
-            auto tileCacheC = std::make_shared<TileCacheFile>();
+            // 0927 M2: qua registry + tra CHUNG doi tuong cho pool (nhu app), thay vi
+            // tu `open()` roi pool lai tu mo them 1 doi tuong rieng tren cung file.
+            std::shared_ptr<TileCacheFile> tileCacheC;
             {
                 uint64_t hash = TileCacheFile::hashFile(inputPath);
                 QFile szFile(inputPath);
                 uint64_t sz   = static_cast<uint64_t>(szFile.size());
-                if (tileCacheC->open(inputPath, hash, sz, docC.pageCount()))
+                tileCacheC = TileCacheRegistry::acquire(inputPath, hash, sz, docC.pageCount());
+                if (tileCacheC->isOpen())
                     rendererC->setTileCache(tileCacheC);
             }
 
             // Start ThumbnailRenderPool like the app does (R1: dung CHUNG doc cua renderer)
             auto thumbPoolC = std::make_unique<ThumbnailRenderPool>();
-            if (thumbPoolC->open(inputPath, docC.raw())) {
+            if (thumbPoolC->open(inputPath, docC.raw(), 0, 0, 0, tileCacheC)) {
                 thumbPoolC->prefetchRange(0, docC.pageCount() - 1);
                 QCoreApplication::processEvents();
                 QThread::msleep(500);
@@ -1071,6 +1774,11 @@ int main(int argc, char* argv[]) {
             }
 
             if (thumbPoolC) thumbPoolC->close();
+            // 0927: nha handle + xoa .torcache/.lock. Bo dong nay thi TEST C giu
+            // QLockFile va file .torcache tren dia (chi `moCoi` lan sau don duoc).
+            rendererC->setTileCache(nullptr);
+            if (tileCacheC) TileCacheRegistry::release(tileCacheC);
+            tileCacheC.reset();
         }
         out.flush();
 
@@ -4883,7 +5591,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // usage: --viewprobe <input.pdf> <out.png> <continuous:0|1> <zoomPercent> <page1Based> [waitMs] [centerXpt] [centerYpt]
+    // usage: --viewprobe <input.pdf> <out.png> <continuous:0|1> <zoomPercent> <page1Based> [waitMs] [centerXpt] [centerYpt] [zoom2Percent]
+    //   dat VIEWPROBE_GL=1 de chup framebuffer GL (Continuous khong bi trang).
     // Probe: lai che do xem lien tuc + zoom + trang de nghiem thu annot tren ban ve CAD nang
     if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--viewprobe")) {
         QString inputPath = QString::fromLocal8Bit(argv[2]);
@@ -4903,7 +5612,10 @@ int main(int argc, char* argv[]) {
         }
 
         MainWindow w;
-        w.resize(1600, 1000);
+        // LUOT 38: cho phep thu nho cua so de chup OS-level (Continuous GL) khi man hinh nho.
+        const int envW = qEnvironmentVariableIntValue("VIEWPROBE_W");
+        const int envH = qEnvironmentVariableIntValue("VIEWPROBE_H");
+        w.resize(envW > 0 ? envW : 1600, envH > 0 ? envH : 1000);
         w.show();
         QCoreApplication::processEvents();
 
@@ -4939,8 +5651,11 @@ int main(int argc, char* argv[]) {
                 for (int k = 0; k < 400; ++k) { QCoreApplication::processEvents(); QThread::msleep(25); }
             }
         }
-        QPixmap pm = w.grab();
-        QImage img = pm.toImage();
+        // LUOT 38: che do GL (Continuous) — w.grab() khong chup duoc QOpenGLWidget (ra trang).
+        // Dat VIEWPROBE_GL=1 de lay framebuffer cua chinh widget GL.
+        QImage img;
+        if (qEnvironmentVariableIsSet("VIEWPROBE_GL")) img = w.probeGrabView();
+        else                                            img = w.grab().toImage();
         if (img.isNull()) {
             fprintf(stderr, "VIEWPROBE: FAIL grab returned null\n");
             return 1;
@@ -4951,6 +5666,61 @@ int main(int argc, char* argv[]) {
         }
 
         fprintf(stdout, "VIEWPROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // ── LƯỢT 35 — MÀN HÌNH CHÀO: chụp CẢ CỬA SỔ ở 4 ca ───────────────────────────
+    // usage: --welcome-probe <pdf> <outprefix>
+    //   outprefix vd "C:/Users/Public/welcome" → welcome_first/_single/_cont/_dark.png
+    // Chứng minh màn chào sau khi ĐÓNG HẾT TAB là widget THƯỜNG (PdfView/CPU),
+    // chữ theo theme, KHÔNG còn vỡ trên GL. CEO nhìn ảnh.
+    if (argc >= 4 && QCoreApplication::arguments().value(1) == QLatin1String("--welcome-probe")) {
+        const QStringList as = QCoreApplication::arguments();
+        auto strip = [](QString v) {
+            if (v.size() > 1 && v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString pdf = strip(as.value(2));
+        const QString outPrefix = strip(as.value(3));
+        MainWindow w; w.resize(1400, 900); w.show();
+        auto spin = [](int ms) { int n = qMax(ms / 50, 1);
+            for (int i = 0; i < n; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); } };
+        spin(1200);
+        auto shot = [&](const char* name) {
+            QCoreApplication::processEvents();
+            const QString p = outPrefix + QLatin1Char('_') + QString::fromLatin1(name) + QLatin1String(".png");
+            const bool ok = w.grab().save(p, "PNG");
+            fprintf(stdout, "WELCOME %s ok=%d tabs=%d docs=%d contVisible=%d\n",
+                    p.toLocal8Bit().constData(), ok ? 1 : 0, w.probeTabCount(), w.probeOpenDocCount(),
+                    w.probeContinuousVisible() ? 1 : 0);
+            fflush(stdout);
+        };
+        auto closeAll = [&] {
+            for (int n = w.probeTabCount(); n > 0; ) {
+                w.probeCloseTab(0);
+                const int n2 = w.probeTabCount();
+                if (n2 >= n) break;
+                n = n2;
+            }
+            spin(1500);
+        };
+        auto waitOpen = [&] { QElapsedTimer t; t.start();
+            while (t.elapsed() < 30000 && w.probePageCount() < 1) spin(100); };
+
+        shot("first");                                                        // ca 1: mo app lan dau
+        w.probeSetFastMode(false); w.openFile(pdf); waitOpen(); closeAll(); shot("single"); // ca 2: Single
+        w.probeSetFastMode(true);  w.openFile(pdf); waitOpen(); closeAll(); shot("cont");   // ca 3: Continuous (BUG goc)
+        w.probeSetFastMode(false); w.probeSetDarkMode(true); w.openFile(pdf); waitOpen(); closeAll(); shot("dark"); // ca 4: Dark
+        // 🔴 LƯỢT 37 (mục B, reviewer lỗi 2): KHONG CON TAB nao ⇒ bam View Fast / Quality.
+        // setViewMode(true) show ContinuousView VO DIEU KIEN ⇒ ban khong sua thi CV trong hien ra,
+        // Welcome bi ep con chieu cao thanh tab ⇒ MAT man chao. Sau sua: applyWelcomeVisibility()
+        // cuoi setViewMode an CV ⇒ ca 2 anh van LA man chao.
+        w.probeSetDarkMode(false);                               // ve sang de anh de doi chieu
+        w.probeSetFastMode(false); closeAll();                    // ve Quality, chac chan het tab
+        w.probeSetFastMode(true);  shot("fast_notab");            // ca 5: het tab roi bam VIEW FAST
+        w.probeSetFastMode(false); shot("quality_notab");         // ca 6: het tab roi bam QUALITY
+        fprintf(stdout, "WELCOME: DONE\n"); fflush(stdout);
         return 0;
     }
 
@@ -5023,6 +5793,1173 @@ int main(int argc, char* argv[]) {
         w.probeCloseTab(0); spin(8000);
         dump("sau khi DONG 2 tab nang");
         fprintf(stdout, "TABCLOSE: DONE\n"); fflush(stdout);
+        return 0;
+    }
+
+    // ── LƯỢT 17 — BÀI TEST TỰ ĐỘNG KỊCH BẢN OWNER 3 TAB (đêm 28/09) ─────────────
+    //   --owner3tab-probe <f1> <f2> <f3> [lap=1]
+    // Tái hiện đúng VONG_LAP_DEM_0928: eYACHO → MEP 244MB (chưa kịp xong thumbnail
+    // nền — CỐ Ý chỉ chờ 6 s) → tab3 "Phan ngam" → cuộn tab3 đo từng trang →
+    // đóng tab3 khi MEP còn chạy → đóng tab NỀN → đóng 2 tab liên tiếp → đóng hết.
+    // CÁCH ĐO "trang render xong có ảnh": ContinuousView::hasPageImage(p) =
+    // m_pageImages[p] khác rỗng — CHÍNH CÁI KHO mà signal thật
+    // PdfRenderer::continuousPageReady → "[perf] cont ACCEPT continuousPageReady
+    // idx= p" (ContinuousView.cpp ~433) ghi vào. Không phải tín hiệu giả.
+    // Đường dẫn đọc bằng QCoreApplication::arguments() — Qt phân giải UTF-8 đúng
+    // cho tên tiếng Việt; fromLocal8Bit(argv) sẽ hỏng (f3 có "Ầ Ử Ơ &").
+    if (argc >= 5 && QCoreApplication::arguments().value(1) == QLatin1String("--owner3tab-probe")) {
+        const QStringList as = QCoreApplication::arguments();
+        // Duong dan co dau cach + dau nhay hay bi cmd/WSL tach thanh nhieu arg
+        // (da do 28/09: arg = "\"C:\\...260920"). Noi lai cho den khi dau nhay
+        // dong; arg khong mo dau nhay = giu nguyen.
+        int cur = 2;
+        auto nextPath = [&as, &cur]() -> QString {
+            QString v;
+            for (int j = cur; j < as.size(); ++j) {
+                v = v.isEmpty() ? as.value(j) : v + QLatin1Char(' ') + as.value(j);
+                cur = j + 1;
+                if (!(v.startsWith(QLatin1Char('"')) && !v.endsWith(QLatin1Char('"')))) break;
+            }
+            if (v.size() > 1 && v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                v = v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString f1 = nextPath(), f2 = nextPath(), f3 = nextPath();
+        const int laps = (cur < as.size()) ? qMax(1, as.value(cur).toInt()) : 1;
+        // 🔴 LƯỢT 33a: OWNER3TAB_ONLY=JKL ⇒ bỏ qua A–I/G/H cho nhanh, CHỈ chạy J/K/L
+        // (đo tranh quyền tab + nhảy trang 1 trên mã r31b — CEO tái hiện lỗi owner).
+        const bool jklOnly = (qEnvironmentVariable("OWNER3TAB_ONLY") == QLatin1String("JKL"));
+        // 🔴 LƯỢT 37: OWNER3TAB_ONLY=O ⇒ CHỈ chạy bước O (đo nhanh mục A, không kéo A–I).
+        const bool oOnly = (qEnvironmentVariable("OWNER3TAB_ONLY") == QLatin1String("O"));
+        for (const QString& f : {f1, f2, f3}) {
+            if (!QFile::exists(f)) {
+                fprintf(stdout, "OWNER3TAB: FAIL file khong ton tai: %s\n",
+                        f.toLocal8Bit().constData()); fflush(stdout);
+                return 2;
+            }
+        }
+
+        MainWindow w; w.resize(1400, 900); w.show();
+        QCoreApplication::processEvents();
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+        bool allOk = true; QString reason;
+        // 0928 LƯỢT 23 (DO): RSS + trang PDFium dang mo, in cung moi buoc va moi trang
+        // do duoc. Gia thuyet can kiem chung: lap 2 cham KHONG phai tranh khoa (da do
+        // voi TORREADER_NO_THUMB=1 — van cham 4,7 lan MỖI object), ma do bo nho cua
+        // ca process phinh to tu lap 1 ⇒ moi lan PDFium cham object la mot lan
+        // fault/TLB miss.
+        auto rssMB = []() -> long long {
+            long long ws = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                ws = (long long)(pmc.WorkingSetSize / 1048576);
+#endif
+            return ws;
+        };
+        // 🔴 LƯỢT 27 (săn rò): bo nho COMMIT (PrivateUsage) — khong bi OS thu hoi.
+        // WorkingSet co the la do da free nhung Windows chua tra ve OS; commit moi la
+        // "app dang thuc giu". commit cao khi docMo=0 ⇒ RO THAT; commit thap ⇒ giu
+        // working set cua vung da giai phong (khong phai ro).
+        auto commitMB = []() -> long long {
+            long long pv = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                pv = (long long)(pmc.PrivateUsage / 1048576);
+#endif
+            return pv;
+        };
+        // 🔴 LƯỢT 27: ép OS thu hoi working set (EmptyWorkingSet). Neu RSS sau trim
+        // ≈ commit ⇒ phan "leak" chi la trang da free chua tra ve OS (khong phai ro
+        // handle). Neu RSS sau trim van ≈ truoc trim va commit cao ⇒ giu that.
+        auto trimWS = []() -> bool {
+#ifdef Q_OS_WIN
+            return EmptyWorkingSet(GetCurrentProcess()) != FALSE;
+#else
+            return false;
+#endif
+        };
+        // 0928 LƯỢT 23 (DO): tong so loi trang cua process (soft + hard). Neu lap 2
+        // "an" nhieu loi trang hon het cho mot trang thi cham la do fault, khong
+        // phai do PDFium tinh cham.
+        auto pfCount = []() -> long long {
+            // 0928 LƯỢT 25 (reviewer L23+L24 mục 1): psapi chỉ tồn tại trên Windows —
+            // bọc Q_OS_WIN như rssMB ở trên, nhánh khác trả -1 (Linux vẫn biên dịch).
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            return GetProcessMemoryInfo(GetCurrentProcess(),
+                       reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))
+                       ? (long long)pmc.PageFaultCount : -1;
+#else
+            return -1;
+#endif
+        };
+        // 🔴 0928 LƯỢT 26 (VIỆC 1): tong CPU MOI LUONG cua process (user+kernel).
+        // So voi [latcpu] cua rieng luong render: proc_cpu >> cpu_render ⇒ co luong
+        // khac dang an CPU (thumbnail/vector/luong dong tab) — "bi cuop CPU".
+        auto procCpuMs = []() -> long long {
+#ifdef Q_OS_WIN
+            FILETIME c, e, u, k;
+            if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &u, &k)) return -1;
+            LARGE_INTEGER lu, lk;
+            lu.LowPart = u.dwLowDateTime; lu.HighPart = u.dwHighDateTime;
+            lk.LowPart = k.dwLowDateTime; lk.HighPart = k.dwHighDateTime;
+            return (long long)((lu.QuadPart + lk.QuadPart) / 10000);   // 100ns -> ms
+#else
+            return -1;
+#endif
+        };
+        // 0928 LƯỢT 23 (DO): nhịp đồng hồ CPU THỰC. Mot vong lap tinh toan tinh co
+        // dinh (16M lan FNV) — neu no cham di 3-4 lan o lap 2 thi cham la do may
+        // (tan so/heat/doi nutrition), khong phai do PDFium. Khac biot = giu nguyen.
+        auto cpuNs = []() -> long long {
+            volatile unsigned long long acc = 0;
+            QElapsedTimer t; t.start();
+            for (unsigned long long i = 0; i < 16000000ULL; ++i) acc = (acc ^ i) * 1099511628211ULL;
+            const qint64 el = t.nsecsElapsed();
+            return el;   // ns cho 16M vong (khong chia — chia nguyen ra 0)
+        };
+        auto noteFail = [&allOk, &reason](const QString& r) {
+            if (!allOk) return;                 // gi nguyen ly do DAU TIEN
+            allOk = false; reason = r;
+        };
+        // 🔴 LƯỢT 30 (BẮT BUỘC, vĩnh viễn): TRẦN RAM. commit (PrivateUsage) vượt
+        // 3000 MB ở BẤT KỲ bước nào = FAIL. Sau khi đóng hết tab (docMo=0) commit phải
+        // về dưới 1,5× mức khởi động + 300 MB. Chủ nhân báo RAM 10 GB mà thước cũ
+        // không có trần RAM ⇒ chiều đó chưa được chứng minh.
+        long long commitMax = 0, commitBaseline = -1;
+        auto noteCommit = [&](const char* where) {
+            const long long c = commitMB();
+            if (c > commitMax) commitMax = c;
+            if (c > 3000)
+                noteFail(QStringLiteral("commit %1MB > 3000MB tran RAM (%2)").arg(c).arg(where));
+        };
+        // 0928 LƯỢT 24 (DO, khong sua pdfium): toc do Windows heap — 100k lan
+        // malloc(16..255) + free, cham hon lap 1 tuc phan manh hoat dong cua
+        // PDFium (font/glyph cache toan cuc, CPDF_PageModule) hoac heap nan.
+        // So voi cpu_ns16M (giu nguyen) de tach "may cham" / "heap cham" / "PDFium cham".
+        auto heapNs = []() -> long long {
+            QElapsedTimer t; t.start();
+            for (int i = 0; i < 100000; ++i) {
+                void* p = malloc(static_cast<size_t>(16 + (i % 240)));
+                if (p) { *static_cast<volatile char*>(p) = 1; free(p); }
+            }
+            return t.nsecsElapsed();
+        };
+        // 🔴 LƯỢT 21 — ĐO ĐỨNG HÌNH LUỒNG GIAO DIỆN: QTimer 20 ms, ghi khoảng cách
+        // lớn nhất giữa 2 tick trong từng bước. FAIL nếu > 1000 ms.
+        static QAtomicInteger<long long> pageObj[512];   // [heavycap] pre-count, theo trang
+        QElapsedTimer tickT; tickT.start();
+        qint64 freezeMax = 0; char curStep = '?'; int curLap = 0;
+        QTimer freeze;
+        QObject::connect(&freeze, &QTimer::timeout, &freeze, [&]{
+            const qint64 g = tickT.restart();
+            if (g > freezeMax) freezeMax = g;
+            // 🔴 LƯỢT 34 (muc 1 — DO): in TAN GO dung hinh. Handler chay tren UI luong,
+            // ngay SAU khi UI thoat khoi nop >700ms ⇒ dong nay co timestamp [UI] de
+            // chong voi log: nop nam giua dong [UI] TRUOC no va chinh no.
+            static const bool kDbg = !qEnvironmentVariableIsEmpty("TORREADER_GUILOCK");
+            if (kDbg && g > 700)
+                qDebug().noquote() << "[FREEZE] gap=" << g << "ms step=" << curStep;
+        });
+        freeze.start(20);
+        auto reportFreeze = [&]() {
+            if (curStep == '?') return;
+            fprintf(stdout, "OWNER3TAB freeze_max step=%c lap=%d ms=%lld ok=%d\n",
+                    curStep, curLap, (long long)freezeMax, freezeMax <= 1000 ? 1 : 0);
+            fflush(stdout);
+            if (freezeMax > 1000)
+                noteFail(QStringLiteral("lap %1: step %2 dung hinh %3ms > 1000ms")
+                             .arg(curLap).arg(curStep).arg((long long)freezeMax));
+            freezeMax = 0; tickT.restart();
+        };
+        auto step = [&](char s, int lap) {
+            reportFreeze();   // dong bang dong ding cua buoc TRUOC do
+            curStep = s; curLap = lap;
+            // 🔴 LƯỢT 28 (VIỆC 1a): them hp_big_ns + tom tat heap — neu hp_big_ns
+            // tang theo lap ⇒ phan manh khoi lon (gia thuyet CEO), bang thi loai heap.
+            long long nh = -1, fk = -1, fb = -1;
+            const long long hbig = heapBigNs();
+            heapSummary(nh, fk, fb);
+            fprintf(stdout, "OWNER3TAB step=%c lap=%d rss=%lldMB commit=%lldMB cpu_ns16M=%lld hp_ns100k=%lld"
+                            " hp_big_ns=%lld nHeaps=%lld hsFreeKB=%lld hsFreeBlocks=%lld"
+                            " docMo=%d pageMo=%d poolMo=%d\n",
+                    s, lap, rssMB(), commitMB(), cpuNs(), heapNs(),
+                    hbig, nh, fk, fb,
+                    g_pdfiumDocOpen.loadRelaxed() - g_pdfiumDocClose.loadRelaxed(),
+                    g_pdfiumPageOpen.loadRelaxed() - g_pdfiumPageClose.loadRelaxed(),
+                    g_pdfiumPoolOpen.loadRelaxed() - g_pdfiumPoolClose.loadRelaxed());
+            fflush(stdout);
+            noteCommit("step");   // 🔴 LƯỢT 30: trần RAM 3000 MB ở mọi bước
+        };
+        // 🔴 LƯỢT 27 (săn rò): do tai lieu da DONG HET (docMo=0) thi in CAN LEAK:
+        // rss truoc/sau EmptyWorkingSet + commit + so handle PageCache con song.
+        // commit thấp + RSS sau trim ≈ commit ⇒ KHÔNG rò handle, chỉ là trang đã free
+        // chưa trả OS. commit cao + doomed/orphan>0 ⇒ rò FPDF_PAGE cua tab đã đóng.
+        auto leakCheck = [&](const char* tag, int lap) {
+            const long long ws0 = rssMB(), cm = commitMB();
+            const bool trimmed = trimWS();
+            const long long ws1 = rssMB();
+            fprintf(stdout, "OWNER3TAB LEAKCHECK tag=%s lap=%d ws_tr=%lldMB ws_sau_trim=%lldMB commit=%lldMB trim_ok=%d"
+                            " docMo=%d poolMo=%d pageMo=%d liveDocs=%d pcEntries=%d pcDoomed=%d pcOrphan=%d\n",
+                    tag, lap, ws0, ws1, cm, trimmed ? 1 : 0,
+                    g_pdfiumDocOpen.loadRelaxed()  - g_pdfiumDocClose.loadRelaxed(),
+                    g_pdfiumPoolOpen.loadRelaxed() - g_pdfiumPoolClose.loadRelaxed(),
+                    g_pdfiumPageOpen.loadRelaxed() - g_pdfiumPageClose.loadRelaxed(),
+                    PdfCloseTrace::liveDocs(),
+                    PageCache::entryCount(), PageCache::doomedCount(), PageCache::orphanCount());
+            fflush(stdout);
+            // 🔴 LƯỢT 30: sau khi đóng HẾT tab (docMo=0) commit phải về gần mức khởi động.
+            noteCommit(tag);
+            const int docMo = g_pdfiumDocOpen.loadRelaxed() - g_pdfiumDocClose.loadRelaxed();
+            if (docMo == 0 && commitBaseline >= 0 && cm > commitBaseline * 3 / 2 + 300)
+                noteFail(QStringLiteral("%1: commit %2MB > 1,5x khoi dong (%3)+300 — khong ve sau khi dong het tab")
+                             .arg(tag).arg(cm).arg(commitBaseline));
+        };
+        fprintf(stdout, "OWNER3TAB do_anh=ContinuousView::m_pageImages (kho cua 'cont ACCEPT')\n");
+        fflush(stdout);
+
+        // Đếm [lockhold] ms= qua handler CHUỖI: giữ nguyên logHandler của
+        // installTextLog (gọi lại handler trước). Handler nổ trên nhiều luồng ⇒ atomic.
+        static QAtomicInteger<long long> lhMax{0};
+        static QAtomicInteger<int>       lhOver{0};
+        static QtMessageHandler          prevHd = nullptr;
+        prevHd = qInstallMessageHandler([](QtMsgType tp, const QMessageLogContext& ctx, const QString& msg) {
+            if (msg.startsWith(QLatin1String("[lockhold] ms="))) {
+                const long long v = msg.section(QLatin1Char(' '), 2, 2).toLongLong();
+                if (v > lhMax.loadRelaxed()) lhMax.storeRelaxed(v);
+                if (v > 2000) lhOver.fetchAndAddRelaxed(1);
+            }
+            // 🔴 LƯỢT 21: "page= N objects= M" → mục 3 và 5 (qDebug tach token bang khoang trang).
+            if (msg.startsWith(QLatin1String("[heavycap] pre-count"))) {
+                const int pg = msg.section(QLatin1Char(' '), 3, 3).toInt();
+                const long long n = msg.section(QLatin1Char(' '), 5, 5).toLongLong();
+                if (pg >= 0 && pg < 512) pageObj[pg].storeRelaxed(n);
+            }
+            if (prevHd) prevHd(tp, ctx, msg);   // ponytail: race ~vài ns giữa install và gán prevHd — probe-only, chấp nhận
+        });
+
+        static const int kPages[] = {3, 4, 5, 6, 8, 10, 20};
+        // Do mot trang toi khi m_pageImages co anh — tran 30 s/trang (LƯỢT 21: trang
+        // ≥1M object duoc phep toi 30 s; truong hop khong anh bao gio den van bi bat),
+        // de phong lenh cuon roi (rescroll moi 500 ms). In SO OBJECT canh moi dong page=.
+        auto measurePage = [&](int p, qint64* msOut) -> bool {
+            { QElapsedTimer bt; bt.start(); w.probeScrollToPage(p);
+              if (bt.elapsed() > 100) qDebug().noquote() << "[BLOCK] measurePage-scrollToPage ms=" << bt.elapsed(); }
+            const long long pf0 = pfCount();          // 0928 LƯỢT 23 (DO): loi trang
+            QElapsedTimer et; et.start();
+            int lastRescroll = 0;
+            while (et.elapsed() < 30000) {
+                spin(50);
+                if (w.probePageHasImage(p)) break;
+                if (et.elapsed() - lastRescroll >= 500) {
+                    w.probeScrollToPage(p); lastRescroll = (int)et.elapsed();
+                }
+            }
+            const qint64 ms = et.elapsed();
+            const long long nObj = (p >= 0 && p < 512) ? pageObj[p].loadRelaxed() : 0;
+            const bool img = w.probePageHasImage(p);
+            fprintf(stdout, "OWNER3TAB page=%d ms=%lld objs=%lld ok=%d rss=%lldMB fault=%lld\n",
+                    p, (long long)ms, nObj, img ? 1 : 0, rssMB(), pfCount() - pf0);
+            fflush(stdout);
+            *msOut = ms;
+            return img;
+        };
+        // 🔴 LƯỢT 19 (CEO 18.7): lap chay HET A-F, KHONG dung som khi B fail —
+        // C/D/E/F la duong dong tab (cho văng), tat ca lap deu phai chay; PASS/FAIL
+        // tong in cuoi. Ly do chi ghi lan dau.
+        // 🔴 LƯỢT 21: BO MỐC 0 + nguong "baseline × 1.5" — trang 3 Phần ngầm có
+        // 2,18M object, 10–15 s là BẢN CHẤT trang, không phải tranh khoá. Ngưỡng
+        // mới theo SỐ OBJECT: <1M obj ⇒ 3 s; ≥1M obj ⇒ 30 s. Thêm bước G (ca crash).
+        // 🔴 LƯỢT 30: mức commit LÚC KHỞI ĐỘNG (chưa mở file nào) — mốc so "về sau khi
+        // đóng hết tab". Đo ngay trước vòng lap, khi docMo=0.
+        commitBaseline = commitMB();
+        fprintf(stdout, "OWNER3TAB commit_baseline=%lldMB\n", commitBaseline); fflush(stdout);
+        // 🔴 LƯỢT 37 (mục A, reviewer lỗi 1) — bước O:
+        //   Anh THU NHO nen cua tai lieu CU khong duoc ghi vao kho tai lieu MOI.
+        //   Mo f1 + f3, zoom 200% trang 3 (f3) ⇒ phat mot luot thu nho nen; DOI NGAY sang f1
+        //   va keo f1 ve trang 0 (f1 KHONG hien trang 3 ⇒ f1 khong tu ve no). Cho luot thu
+        //   nho f3 ve. FIXED: guard docGen bo ⇒ m_pageImages[3] TRONG + staleDrops tang.
+        //   BUG: anh f3 ghi nguoc vao kho f1 ⇒ con anh trang 3 ⇒ FAIL.
+        auto runStepO = [&](int lap) {
+            step('O', lap);
+            w.openFile(f1);
+            { QElapsedTimer dt; dt.start(); while (dt.elapsed() < 30000 && w.probePageCount() < 1) spin(100); }
+            spin(3000);
+            w.openFile(f3);
+            { QElapsedTimer dt; dt.start(); while (dt.elapsed() < 30000 && w.probePageCount() < 21) spin(100); }
+            w.probeActivateTab(w.probeTabCount() - 1); spin(300);   // f3 hien hanh
+            // Trang 3 quai vat: mo o ZOOM THAP ⇒ anh DISK-CACHE ~4966px duoc phuc vu OVERSIZE
+            // (needW nho) ⇒ acceptContinuousImage rui vao NHANH THU NHO NEN (QtConcurrent) — dung
+            // cua sổ race reviewer lỗi 1 mô tả (giong het f1 page 0/1 "4000px -> 1100" trong log).
+            // Thu vài muc zoom de chac chan phat duoc thu nho nen, ke ca khi cache lanh.
+            QElapsedTimer it; it.start();
+            bool inFlight = false;
+            const double zls[] = { 0.4, 0.25, 0.6, 1.0 };
+            for (double z : zls) {
+                if (inFlight) break;
+                w.probeSetZoom(z); spin(150);
+                w.probeScrollToPage(3);
+                for (int k = 0; k < 60 && !inFlight; ++k) {   // toi da ~6 s/zoom
+                    if (w.probeContDownscaleInFlight() > 0) { inFlight = true; break; }
+                    w.probeScrollToPage(3);
+                    spin(100);
+                }
+            }
+            const qint64 drops0 = w.probeContStaleDrops();
+            w.probeActivateTab(0);                   // DOI NGAY sang f1 (giữa cửa sổ thu nhỏ)
+            w.probeScrollToPage(0);                  // f1 ve trang 0 — khong yeu cau ve trang 3
+            spin(6000);                              // du cho luot thu nho f3 ve toi finished+guard
+            const bool p3clean = !w.probePageHasImage(3);
+            const qint64 dropsSau = w.probeContStaleDrops();
+            const bool okO = inFlight && p3clean && (dropsSau > drops0);
+            fprintf(stdout, "OWNER3TAB O inFlight=%d p3clean=%d staleDrops=%lld ok=%d\n",
+                    inFlight ? 1 : 0, p3clean ? 1 : 0, (long long)(dropsSau - drops0), okO ? 1 : 0);
+            fflush(stdout);
+            if (!okO)
+                noteFail(QStringLiteral("O: thu nhỏ nen tai lieu cu ghi vao tab moi (inFlight=%1 p3clean=%2 drops=%3)")
+                             .arg(inFlight ? 1 : 0).arg(p3clean ? 1 : 0).arg((long long)(dropsSau - drops0)));
+            w.probeSetZoom(1.0); spin(300);
+            for (int n = w.probeTabCount(); n > 0; ) {   // don ve trang de cac buoc tiep chay nhu cu
+                w.probeCloseTab(0);
+                const int n2 = w.probeTabCount();
+                if (n2 >= n) break;
+                n = n2;
+            }
+            spin(2000);
+            leakCheck("O", lap);
+        };
+        if (oOnly) { for (int lap = 1; lap <= laps; ++lap) runStepO(lap); }
+        if (!jklOnly && !oOnly)   // 🔴 LƯỢT 33a: OWNER3TAB_ONLY=JKL bo qua A–I/G/H
+        for (int lap = 1; lap <= laps; ++lap) {
+            // A. mở 3 tab đúng thứ tự, đúng cửa sổ thời gian kịch bản owner
+            step('A', lap);
+            w.openFile(f1); spin(8000);
+            w.openFile(f2); spin(6000);   // MEP còn vẽ thumbnail nền — cố ý không chờ
+            w.openFile(f3);
+            // Chờ doc tab3 mở xong (async) — đo 28/09: cuộn lúc doc chưa mở là no-op,
+            // view ở lại trang 0 và page 3 "timeout" GIẢ. 30 s trần.
+            { QElapsedTimer dt; dt.start();
+              while (dt.elapsed() < 30000 && w.probePageCount() < 21) spin(100);
+              fprintf(stdout, "OWNER3TAB doc3 pages=%d ms=%lld\n",
+                      w.probePageCount(), (long long)dt.elapsed()); fflush(stdout);
+            }
+            // 🔴 LƯỢT 22b (reviewer mục 1): BẮT LỖI THIẾU `!` ở tabAlive. Bản lỗi:
+            //   MainWindow.cpp:5261 `if (tabAlive(tab,s)) return;` — initWatcher thoát
+            //     sớm trên tab CÒN SỐNG ⇒ pdfHash không bao giờ được gán ⇒ ok=0.
+            //   MainWindow.cpp:6262/6294/6301 — lambda quét comment thoát sớm ⇒
+            //     annotCache không bao giờ nạp ⇒ panel Comments trống ⇒ comments=0.
+            // Probe cũ (r22) PASS vì không soi hai đường này. f1 (site plan Checked)
+            // KHÔNG có /Annots trên đĩa (đã đếm thô 0) — nên probe TỰ tạo một note
+            // bằng API thật (probeCreateNote) rồi mới quét: có annot chắc chắn để
+            // bản lỗi phải lộ. Note là nhân vật chứng ⇒ xoá cờ dirty sau khi đo.
+            {
+                w.probeActivateTab(0); spin(300);
+                const quint64 h = w.probePdfHash(0);
+                fprintf(stdout, "OWNER3TAB pdfHash ok=%d\n", h != 0 ? 1 : 0); fflush(stdout);
+                if (h == 0)
+                    noteFail(QStringLiteral("lap %1: f1 pdfHash rong — initWatcher tabAlive thieu `!`").arg(lap));
+                const bool noteOk = w.probeCreateNote(0, 100.0, 100.0);
+                const int real = w.probeRealAnnotCount(0);
+                w.probeRequestComments();
+                QElapsedTimer ct; ct.start();
+                while (ct.elapsed() < 30000 && w.probeCommentCache(0) <= 0) spin(100);
+                const int cached = w.probeCommentCache(0);
+                fprintf(stdout, "OWNER3TAB comments f1=%d real=%d note=%d\n", cached, real, noteOk ? 1 : 0);
+                fflush(stdout);
+                if (!noteOk)
+                    noteFail(QStringLiteral("lap %1: probeCreateNote FAIL — khong dung duoc tinh huong co annot").arg(lap));
+                else if (cached <= 0)
+                    noteFail(QStringLiteral("lap %1: file co annot (note=%2 real=%3) nhung panel cache=%4 — scan lambda thieu `!`")
+                                 .arg(lap).arg(noteOk ? 1 : 0).arg(real).arg(cached));
+                w.probeClearDirty(0);
+                w.probeActivateTab(2); spin(300);   // tra ve tab3 cho buoc B
+            }
+            // B. cuộn tab3 (tab hiện hành, index 2), đo từng trang TỚI KHI XONG hết
+            //    kPages — lượt 19/20 chỉ đo trang 3 rồi break vì ngưỡng baseline;
+            //    ngưỡng mới theo object nên các trang nhẹ vẫn phải qua cửa 3 s.
+            step('B', lap);
+            // 0928 LƯỢT 26 (VIỆC 1): do CPU toan process truoc/sau buoc B.
+            const long long pcB0 = procCpuMs();
+            QElapsedTimer wallB; wallB.start();
+            for (int p : kPages) {
+                qint64 ms = 0;
+                if (!measurePage(p, &ms)) {
+                    noteFail(QStringLiteral("lap %1: page %2 khong co anh trong 30s").arg(lap).arg(p));
+                    break;   // trang khong bao gio co anh => cuon tiep vo nghia
+                }
+                const long long nObj = (p >= 0 && p < 512) ? pageObj[p].loadRelaxed() : 0;
+                const qint64 limit = (nObj >= 1000000) ? 30000 : 3000;
+                if (ms >= limit)
+                    noteFail(QStringLiteral("lap %1: page %2 %3ms >= %4ms (objs=%5)")
+                                 .arg(lap).arg(p).arg((long long)ms).arg((long long)limit).arg(nObj));
+            }
+            fprintf(stdout, "OWNER3TAB proc_cpu step=B lap=%d ms=%lld wall=%lld\n",
+                    lap, procCpuMs() - pcB0, (long long)wallB.elapsed());
+            fflush(stdout);
+            // C. đóng tab3 NGAY khi MEP còn chạy nền (không chờ)
+            step('C', lap);
+            w.probeCloseTab(2); spin(3000);
+            fprintf(stdout, "OWNER3TAB step=C tabs_con_lai=%d\n", w.probeTabCount()); fflush(stdout);
+            leakCheck("C", lap);   // 🔴 LƯỢT 27: ngay sau khi DONG tab Phan ngam
+            // D. về tab0, đóng tab NỀN (MEP index 1 — không phải tab hiện hành),
+            //    cuộn tab0 vài trang: paint SAU khi đóng tab nền (nhánh L16.2 chưa ai bắt)
+            step('D', lap);
+            w.probeActivateTab(0);
+            w.probeCloseTab(1); spin(3000);
+            fprintf(stdout, "OWNER3TAB step=D tabs_con_lai=%d\n", w.probeTabCount()); fflush(stdout);
+            for (int q : {1, 3, 5, 7}) { w.probeScrollToPage(q); spin(400); }
+            // E. mở lại f2+f3, đóng 2 tab LIÊN TIẾP không chờ (m_thumbCloseJobs=2)
+            step('E', lap);
+            w.openFile(f2); w.openFile(f3);
+            w.probeCloseTab(2); w.probeCloseTab(1); spin(5000);
+            fprintf(stdout, "OWNER3TAB step=E tabs_con_lai=%d\n", w.probeTabCount()); fflush(stdout);
+            // F. đóng hết tab còn lại. Welcome KHÔNG phải DocTab ⇒ onTabClose(0)
+            //    không làm gì nó — chỉ đi tiếp khi số tab thực giảm (chống lặp vô hạn).
+            step('F', lap);
+            for (int n = w.probeTabCount(); n > 0; ) {
+                w.probeCloseTab(0);
+                const int n2 = w.probeTabCount();
+                if (n2 >= n) break;
+                n = n2;
+            }
+            spin(2000);
+            fprintf(stdout, "OWNER3TAB step=F tabs_con_lai=%d\n", w.probeTabCount()); fflush(stdout);
+            leakCheck("F", lap);   // 🔴 LƯỢT 27: sau khi DONG HET tab (docMo phai=0)
+            // 🔴 0928 LƯỢT 25 mục 3 — THÍ NGHIỆM (chi do, co env TORREADER_REINIT_IDLE=1,
+            // mac dinh TAT): sau khi tai lieu cuoi dong xong (moi closeJob xong, khong
+            // pool/doc/page mo — dung bo dem san co + PdfCloseTrace::liveDocs), destroy
+            // + init lai PDFium tren UI luong, duoi s_pdfiumMutex (libReinitIdle).
+            // So lap2 p3 + RSS step A lap 2 voi base khong co khi.
+            if (qEnvironmentVariableIsSet("TORREADER_REINIT_IDLE")) {
+                // pageMo AM (pageOpen<pageClose, ~-111) la anomaly dem-kap co tu
+                // truoc (PageCache dong trang khong tang giu lenh) => dung can bang
+                // pageOpen==pageClose thi VONG LUON tran 60s va destroy duoi tai.
+                // Dao an idle that = closeJobs het + doc/pool can bang + liveDocs=0.
+                QElapsedTimer rt; rt.start();
+                bool idle = false;
+                while (rt.elapsed() < 20000) {
+                    spin(100);
+                    if (w.probeCloseJobs() == 0 &&
+                        g_pdfiumDocOpen.loadRelaxed()  == g_pdfiumDocClose.loadRelaxed() &&
+                        g_pdfiumPoolOpen.loadRelaxed() == g_pdfiumPoolClose.loadRelaxed() &&
+                        PdfCloseTrace::liveDocs() == 0) { idle = true; break; }
+                }
+                const qint64 rss0 = rssMB();
+                const bool done = idle && PdfDocument::libReinitIdle();
+                spin(500);
+                fprintf(stdout, "OWNER3TAB reinit idle=%d wait=%lldms rss_tr=%lldMB rss_sau=%lldMB\n",
+                        done ? 1 : 0, (long long)rt.elapsed(), (long long)rss0, (long long)rssMB());
+                fflush(stdout);
+            }
+            // 🔴 0928 LƯỢT 25 mục 5 — buoc I (co env OWNER3TAB_STEP_I=1): ca thuc te
+            // cua owner — GIU tab f1 mo, dong f3 roi MO LAI f3, do lai trang 3.
+            // KHONG phai luc nao cung dong het tab (nhánh F khong bao gio chay).
+            if (qEnvironmentVariableIsSet("OWNER3TAB_STEP_I")) {
+                step('I', lap);
+                w.openFile(f1); spin(8000);
+                w.openFile(f3);
+                { QElapsedTimer dt; dt.start();
+                  while (dt.elapsed() < 30000 && w.probePageCount() < 21) spin(100); }
+                w.probeActivateTab(w.probeTabCount() - 1); spin(300);
+                qint64 mI1 = 0; measurePage(3, &mI1);
+                fprintf(stdout, "OWNER3TAB stepI page=3 ms=%lld (lan1, f1 van mo)\n", (long long)mI1);
+                fflush(stdout);
+                // 🔴 LƯỢT 37 muc C: do DUNG LENH TRUC TIEP nay (khong qua notify ⇒ [slotms]
+                // khong bat duoc) de quy nguyen 2.4 s dung hinh step I cho ai.
+                auto blkI = [](const char* what, auto&& fn) {
+                    QElapsedTimer t; t.start(); fn();
+                    const qint64 ms = t.elapsed();
+                    if (ms > 100) qDebug().noquote() << "[BLOCK]" << what << "ms=" << ms;
+                };
+                blkI("probeCloseTab", [&]{ w.probeCloseTab(w.probeTabCount() - 1); });
+                spin(3000);   // dong f3, f1 CON mo
+                blkI("openFile-f3", [&]{ w.openFile(f3); });
+                { QElapsedTimer dt; dt.start();
+                  while (dt.elapsed() < 30000 && w.probePageCount() < 21) spin(100); }
+                blkI("activateTab", [&]{ w.probeActivateTab(w.probeTabCount() - 1); });
+                spin(300);
+                qint64 mI2 = 0; measurePage(3, &mI2);
+                fprintf(stdout, "OWNER3TAB stepI page=3 ms=%lld (lan2, mo-lai-khi-chua-dong-het)\n", (long long)mI2);
+                fflush(stdout);
+                // 🔴 LƯỢT 31b (reviewer mục 2): ZOOM LỚN KHÔNG MỜ KẸT. Mở lại f3 ⇒ cache
+                // hit, ảnh trang 3 chỉ ~357px (scale thật ~0,6). Zoom 200% ⇒ trong ≤ 20 s
+                // ảnh trang phải có renderedScale >= 0,9×2,0 = 1,8 (nhãn full-quality giả
+                // trên ảnh tạm ⇒ ContinuousView không vẽ lại ⇒ kẹt mờ ⇒ FAIL ở đây).
+                w.probeSetZoom(2.0); spin(300);
+                w.probeScrollToPage(3);
+                QElapsedTimer zt; zt.start();
+                double zScale = -1.0;
+                while (zt.elapsed() < 20000) {
+                    zScale = w.probePageImageScale(3);
+                    if (zScale >= 2.0 * 0.9) break;
+                    spin(200);
+                }
+                fprintf(stdout, "OWNER3TAB zoomsharp page=3 ms=%lld scale=%.3f ok=%d\n",
+                        (long long)zt.elapsed(), zScale, zScale >= 2.0 * 0.9 ? 1 : 0);
+                fflush(stdout);
+                if (zScale < 2.0 * 0.9)
+                    noteFail(QStringLiteral("lap %1: zoom 200%% page 3 mo ket sau %2ms (scale=%3 < 1.8)")
+                                 .arg(lap).arg((long long)zt.elapsed()).arg(zScale, 0, 'f', 3));
+                w.probeSetZoom(1.0); spin(300);
+                for (int n = w.probeTabCount(); n > 0; ) {   // don ve trang de G/H chay nhu cu
+                    w.probeCloseTab(0);
+                    const int n2 = w.probeTabCount();
+                    if (n2 >= n) break;
+                    n = n2;
+                }
+                spin(2000);
+                leakCheck("I", lap);   // 🔴 LƯỢT 27: sau buoc I (dong mo-lai f3), docMo phai=0
+            }
+            if (qEnvironmentVariableIsSet("OWNER3TAB_STEP_O")) runStepO(lap);
+            // G. 🔴 LƯỢT 21 — CA CRASH NÀY (dump 32832): mo f2 (244 MB) roi dong tab
+            //    NGAY LAP TUC (open() con chay tren pool — `dongTab ms=0`). 3 lan
+            //    lien tiep, KHONG spin giua open va close. closeJob nen phai
+            //    waitForFinished(openFuture) truoc `delete t`; dong nghia UI khong
+            //    duoc dung hinh (freeze_max step=G <= 1000 ms).
+            step('G', lap);
+            for (int k = 1; k <= 3; ++k) {
+                w.openFile(f2);
+                w.probeCloseTab(w.probeTabCount() - 1);
+                QElapsedTimer gt; gt.start();
+                while (gt.elapsed() < 60000 && w.probeCloseJobs() > 0) spin(100);
+                fprintf(stdout, "OWNER3TAB step=G try=%d ms=%lld tabs_con_lai=%d closeJobs=%d\n",
+                        k, (long long)gt.elapsed(), w.probeTabCount(), w.probeCloseJobs());
+                fflush(stdout);
+            }
+            // H. 🔴 LƯỢT 22 — THOÁT CỬA SỔ LÚC open() CÒN CHẠY: MainWindow THỨ HAI
+            //    trên heap, openFile(f2) (244 MB — open ngốn giây trên pool), rồi
+            //    `delete` NGAY ⇒ ~MainWindow chạy giữa chừng: shutdownTab + chờ
+            //    openFuture TRÊN UI (1285) + `delete t` đồng bộ. Đây là đường
+            //    G không phủ ("đóng tab" ≠ "đóng cả cửa sổ"). Lặp 2 lần/lap.
+            //    (freeze_max của H được reset quanh delete: ~MainWindow CHỜ mở xong
+            //    là HÀNH VI ĐÚNG — app đang tắt — không tính là đứng hình.)
+            step('H', lap);
+            for (int k = 1; k <= 2; ++k) {
+                QElapsedTimer ht; ht.start();
+                auto* w2 = new MainWindow;
+                w2->resize(900, 700);
+                w2->show();
+                w2->openFile(f2);
+                spin(300);                 // cho open() kịp xếp hàng vào pool
+                tickT.restart();           // đếm lại từ trước delete
+                delete w2;                 // ~MainWindow chờ openFuture — cửa sổ chết
+                const qint64 hms = ht.elapsed();
+                freezeMax = 0; tickT.restart();   // H chờ CÓ CHỦ ĐÍCH — không gate freeze
+                fprintf(stdout, "OWNER3TAB step=H try=%d delete_ms=%lld song\n",
+                        k, (long long)hms);
+                fflush(stdout);
+            }
+        }
+
+        // ═══ LƯỢT 33a — BÀI ĐO J/K/L (CHỈ ĐO, KHÔNG SỬA HÀNH VI APP) ═══════════════
+        // Owner 29/09 trên r31b: (1) tab nặng đang render ⇒ tab mới mở không load nổi
+        // [J]; (2) đóng tab ⇒ chặn UI / văng [K]; (3) đổi tab ⇒ NHẢY VỀ TRANG 1 [L].
+        // Chạy riêng: OWNER3TAB_ONLY=JKL. Chạy đủ: sau A–I/H. Không dừng sớm khi FAIL.
+        // LƯỢT 37: OWNER3TAB_ONLY=O ⇒ bo J/K/L/M, chi giu ket luan cuoi.
+        if (!oOnly) {
+            auto closeAllTabs = [&]() {
+                for (int n = w.probeTabCount(); n > 0; ) {
+                    w.probeCloseTab(0);
+                    const int n2 = w.probeTabCount();
+                    if (n2 >= n) break;
+                    n = n2;
+                }
+                spin(2000);
+            };
+            auto waitDoc = [&](int minPages) -> long long {
+                QElapsedTimer dt; dt.start();
+                while (dt.elapsed() < 30000 && w.probePageCount() < minPages) spin(100);
+                return (long long)dt.elapsed();
+            };
+            // Chup CA CUA SO (nghiem thu GUI phai nhin thay trang hien hanh).
+            auto shot = [&](const char* buoc) {
+                const QString path = QStringLiteral("C:/Users/Public/jkl_%1.png").arg(buoc);
+                const bool sv = w.grab().save(path);
+                fprintf(stdout, "OWNER3TAB shot=%s ok=%d\n",
+                        path.toLocal8Bit().constData(), sv ? 1 : 0); fflush(stdout);
+            };
+            // ── J: mo f3, cuon trang 3 (quai vat) KHONG cho; +300 ms mo f2 ⇒ do ms
+            //    toi khi trang 0 CUA F2 co anh (can probePageCount()>=1 de khong dem
+            //    nhiam anh trang 0 cua f3 van con trong view dung chung).
+            // 🔴 LƯỢT 33d: nguong 1500 ms (muc tieu CEO). Trang 3 PHAI duoc ve LAN
+            //    DAU — dong het tab (release file cache) roi XOA cache dia cua f3
+            //    (.torcache anh nen + .torvec vector, key = chinh app sinh ra) truoc
+            //    khi mo; in `J cache_f3=cold` lam bang chung.
+            step('J', 1);
+            closeAllTabs();
+            {
+                // 🔴 LƯỢT 33e (muc 5): ten file cache cua f3 CO CHU TIENG VIET
+                // ("PHẦN CHUNG & PHẦN NGẦM - Copy.pdf_<hex>.torcache/_p<N>.torvec").
+                // r33d dung entryList(pattern) — pattern qua 8-bit tren Windows khong
+                // bao gio khop ten co dau (removed=0). Den bu: Liet ke TOAN BO temp
+                // bang QString, so sanh startsWith/endsWith truc tiep (Unicode day du,
+                // khong qua pattern/8-bit). In base bang UTF-8 de log doc duoc.
+                const QString base = QFileInfo(f3).fileName() + QLatin1Char('_');
+                QDir td(QDir::temp());
+                int removed = 0;
+                const QStringList all = td.entryList(QDir::Files);
+                for (const QString& fn : all) {
+                    if (!fn.startsWith(base, Qt::CaseInsensitive)) continue;
+                    if (!fn.contains(QLatin1String(".torcache"), Qt::CaseInsensitive)
+                        && !fn.contains(QLatin1String(".torvec"), Qt::CaseInsensitive))
+                        continue;
+                    if (QFile::remove(td.absoluteFilePath(fn))) ++removed;
+                }
+                const int anyCache = td.entryList(QStringList()
+                        << QStringLiteral("*.torcache") << QStringLiteral("*.torvec"),
+                        QDir::Files).size();
+                fprintf(stdout, "OWNER3TAB J cache_f3=cold removed=%d tmp=%s anyCache=%d base=%s\n",
+                        removed, QDir::tempPath().toUtf8().constData(),
+                        anyCache, base.toUtf8().constData());
+                fflush(stdout);
+            }
+            w.openFile(f3);
+            const long long jd3 = waitDoc(21);
+            fprintf(stdout, "OWNER3TAB J doc3=%lldms pages=%d\n",
+                    jd3, w.probePageCount()); fflush(stdout);
+            w.probeScrollToPage(3);            // noi dung ve quai vat — khong cho xong
+            spin(300);
+            QElapsedTimer jt; jt.start();
+            w.openFile(f2);                    // tab MOI len dau — do tu luc nay
+            qint64 jms = 30000; bool jImg = false;
+            while (jt.elapsed() < 30000) {
+                spin(50);
+                if (w.probePageCount() >= 1 && w.probePageHasImage(0)) {
+                    jms = jt.elapsed(); jImg = true; break;
+                }
+            }
+            fprintf(stdout, "OWNER3TAB J mep_first_ms=%lld ok=%d tabs=%d\n",
+                    (long long)jms, (jImg && jms <= 1500) ? 1 : 0, w.probeTabCount());
+            fflush(stdout);
+            if (!jImg)
+                noteFail(QStringLiteral("J: trang 0 f2 khong co anh trong 30s (f3 dang ve trang 3)"));
+            else if (jms > 1500)
+                noteFail(QStringLiteral("J: mep_first_ms=%1 > 1500 — tab nang chan tab moi").arg((long long)jms));
+            // ── K: f3 DANG ve trang 3 (giua luot) ⇒ dong tab ⇒ do ms UI CHAN qua
+            //    khe giua 2 tick freeze 20ms. FAIL > 500 ms. NEU VĂNG: process chet
+            //    TRUOC khi in dong OWNER3TAB K — thieu dong nay tren log la bang chung.
+            //    (Thu 'mo f2 roi dong ngay khi dang load' da co buoc G — gi nguyen.)
+            step('K', 1);
+            w.probeActivateTab(0);             // ve f3 (tab 0; f2 dang hien hanh)
+            w.probeScrollToPage(3);            // noi dung ve giua luot
+            spin(300);
+            freezeMax = 0; tickT.restart();
+            QElapsedTimer kt; kt.start();
+            w.probeCloseTab(0);
+            const qint64 kWall = kt.elapsed();
+            spin(300);                         // cho tick freeze no de lay duoc khe
+            const qint64 kBlock = freezeMax; freezeMax = 0;
+            fprintf(stdout, "OWNER3TAB K close_ms=%lld wall=%lld tabs_con_lai=%d ok=%d\n",
+                    (long long)kBlock, (long long)kWall, w.probeTabCount(),
+                    (kBlock <= 500) ? 1 : 0); fflush(stdout);
+            if (kBlock > 500)
+                noteFail(QStringLiteral("K: UI bi chan %1ms khi dong tab dang ve > 500ms").arg((long long)kBlock));
+            // ── L: vi tri tab khi doi tab. Continuous (mac dinh) + Single + ca truong
+            //    hop tab DICH CON DANG LOAD. In trang hien + trang ky vong + offset
+            //    tam viewport so voi luc da cuon. FAIL neu nhay ve trang khong phai
+            //    trang da dat (0/1). Poll toi 5s de khong dem nham "cham render" = "nhay trang".
+            step('L', 1);
+            closeAllTabs();
+            auto checkL = [&](const char* mode, int idx, const char* name, int expect,
+                              double savedDy, int loading, const char* buoc) {
+                const bool single = (mode[0] == 'S');
+                const int loading0 = loading;   // in gia tri NGUYEN BAN (tab dang load)
+                // 🔴 LƯỢT 33f (muc 5 — L f2 "hien trang 2 thay vi 0"): bang log 33f,
+                // KHONG AI cuon sau restoreScrollY 0 (khong co [cont-scroll] nao giua
+                // restore va do; [thumbq] scroll=0/59457). "page=2" la trang o TAM
+                // viewport — trang thap hon khung nhin (zoom 0.1) nen tam roi trang 2
+                // DU VIEW DUNG O DINH. Voi tab CHUA TUNG cuon, vi tri DUNG = dinh:
+                // do scrollY THAT, khong do trang tam.
+                const bool dinh = loading0 && !single;
+                w.probeActivateTab(idx);
+                QElapsedTimer lt; lt.start();
+                int pg = -1; QPointF c;
+                if (loading) {
+                    // 🔴 LƯỢT 33d (mục 3): "tab dang load" — do sau khi doc MO XONG
+                    // (duong 5415+ da setDocument + restoreScrollY). Do MOT lan luc
+                    // doc chua mo la do gia dinh cua view (noi dung tab cu), khong
+                    // phai loi — loi THAT la vi tri SAI sau khi load xong.
+                    while (lt.elapsed() < 15000 && w.probePageCount() < 1) spin(100);
+                    spin(400);                 // cho setDocument + layout + ve
+                    loading = 0;               // poll nhu tab da mo
+                }
+                for (;;) {
+                    spin(100);
+                    c = QPointF();
+                    if (single) pg = w.probeTabShownPage(idx);
+                    else        w.probeContCenter(&pg, &c);
+                    const bool dat = dinh ? (w.probeContScrollY() == 0) : (pg == expect);
+                    if (loading || dat || lt.elapsed() >= 5000) break;
+                }
+                const bool ok = dinh ? (w.probeContScrollY() == 0) : (pg == expect);
+                fprintf(stdout, "OWNER3TAB L mode=%s tab=%s(%d) page=%d expect=%d saved=%d"
+                                " dy=%.1f saved_dy=%.1f wait=%lldms loading=%d ok=%d\n",
+                        mode, name, idx, pg, expect, w.probeTabSavedPage(idx),
+                        c.y(), savedDy, (long long)lt.elapsed(), loading0, ok ? 1 : 0);
+                fflush(stdout);
+                shot(buoc);
+                if (!ok && !loading)
+                    noteFail(QStringLiteral("L %1: doi sang tab %2 ra trang %3 (expect %4) — khong giu vi tri")
+                                 .arg(mode).arg(name).arg(pg).arg(expect));
+            };
+            // Cuon + de view LANG (scrollToPage animate; trang A0 loai 3400px can
+            // re-scroll nhu measurePage). Tra ve trang THUC O TAM viewport — do chinh
+            // la "vi tri da dat" ma 4 lan doi tab phai giu (nominal co the khac khi
+            // trang nho hon viewport: tam viewport nam o trang ke tiep).
+            auto contSettle = [&](int nominal, double* dyOut) -> int {
+                QElapsedTimer t; t.start();
+                int pg = -1, last = -999, stable = 0;
+                QPointF c;
+                for (;;) {
+                    w.probeScrollToPage(nominal);
+                    spin(500);
+                    if (!w.probeContCenter(&pg, &c)) pg = -1;
+                    if (pg == nominal) break;
+                    if (pg == last) { if (++stable >= 3) break; } else stable = 0;
+                    last = pg;
+                    if (t.elapsed() > 15000) break;
+                }
+                *dyOut = c.y();
+                return pg;
+            };
+            // L — Continuous: f1→trang 5, f3→trang 20, doi f1→f3→f1→f3.
+            w.openFile(f1);
+            const long long ld1 = waitDoc(6);
+            fprintf(stdout, "OWNER3TAB L doc1=%lldms pages=%d\n",
+                    ld1, w.probePageCount()); fflush(stdout);
+            double dyF1 = 0.0, dyF3 = 0.0;
+            const int expF1 = contSettle(5, &dyF1);
+            fprintf(stdout, "OWNER3TAB L setup mode=Cont tab=f1 nominal=5 reached=%d saved=%d dy=%.1f\n",
+                    expF1, w.probeTabSavedPage(0), dyF1); fflush(stdout);
+            w.openFile(f3);
+            const long long ld3 = waitDoc(21);
+            fprintf(stdout, "OWNER3TAB L doc3=%lldms pages=%d\n",
+                    ld3, w.probePageCount()); fflush(stdout);
+            const int expF3 = contSettle(20, &dyF3);
+            fprintf(stdout, "OWNER3TAB L setup mode=Cont tab=f3 nominal=20 reached=%d saved=%d dy=%.1f\n",
+                    expF3, w.probeTabSavedPage(1), dyF3); fflush(stdout);
+            checkL("Cont", 0, "f1", expF1, dyF1, 0, "L_cont_1");
+            checkL("Cont", 1, "f3", expF3, dyF3, 0, "L_cont_2");
+            checkL("Cont", 0, "f1", expF1, dyF1, 0, "L_cont_3");
+            checkL("Cont", 1, "f3", expF3, dyF3, 0, "L_cont_4");
+            // L — Continuous, tab dich CON DANG LOAD: mo f2 khong cho, doi di roi doi lai.
+            w.openFile(f2);                    // tab 2 = f2 dang load
+            w.probeActivateTab(0); spin(300);  // roi sang f1 khi f2 chua mo xong
+            checkL("Cont", 2, "f2", 0, 0.0, 1, "L_cont_load");      // doi sang tab dang load
+            waitDoc(1);                        // tab hien hanh = f2 — cho mo xong that
+            checkL("Cont", 0, "f1", expF1, dyF1, 0, "L_cont_back");  // f1 van giu vi tri?
+            // L — Single: moi tab co PdfGpuView rieng; do trang view THUC VE.
+            w.probeSetView(false, 100.0, 1); spin(500);
+            w.probeActivateTab(0); w.probeSetPage(5);  spin(500);
+            w.probeActivateTab(1); w.probeSetPage(20); spin(500);
+            fprintf(stdout, "OWNER3TAB L setup mode=Single f1 saved=%d f3 saved=%d\n",
+                    w.probeTabSavedPage(0), w.probeTabSavedPage(1)); fflush(stdout);
+            checkL("Single", 0, "f1", 5,  0.0, 0, "L_single_1");
+            checkL("Single", 1, "f3", 20, 0.0, 0, "L_single_2");
+            checkL("Single", 0, "f1", 5,  0.0, 0, "L_single_3");
+            checkL("Single", 1, "f3", 20, 0.0, 0, "L_single_4");
+            // L — Single, tab dich dang load.
+            w.probeCloseTab(2); spin(1500);
+            w.openFile(f2);
+            w.probeActivateTab(0); spin(300);
+            checkL("Single", 2, "f2", 0, 0.0, 1, "L_single_load");
+            waitDoc(1);
+            w.probeSetView(true, 100.0, 1); spin(300);   // tra ve Continuous mac dinh
+            closeAllTabs();
+            // ── M (LƯỢT 33e — BẮT BUỘC vĩnh viễn): markup + comment của f1 PHẢI còn
+            //    nguyên sau mỗi lần đổi tab. Ba lỗi reviewer bắt ở 33b/33d (visuals
+            //    rỗng bị cache, scan chết không ai spawn lại, stopScan lây lúc
+            //    activeDoc null) đều biểu hiện đúng bằng HIỆN TƯỢNG này — đếm bằng
+            //    getter CHỈ-ĐỌC: overlay visuals của trang hiện (kho mà CẢ HAI view
+            //    vẽ từ đó) + số comment trong panel. Chuyển f1→f3→f1 NHANH (≤200 ms)
+            //    và CHẬM (2 s), 3 lần; kèm case mở tab mới (activeDoc null giữa
+            //    chuyển tiếp) rồi quay về f1. Sau mỗi lần chờ ≤3 s phải bằng mốc đầu.
+            step('M', 1);
+            w.openFile(f1); waitDoc(6);
+            w.openFile(f3); waitDoc(21);
+            w.probeActivateTab(0); spin(400);
+            if (w.probeCommentCache(0) <= 0) {          // JKL-only: buoc B chua tao note
+                w.probeCreateNote(0, 100.0, 100.0);     // note tren trang 0 = trang dang hien
+                w.probeClearDirty(0);
+            }
+            w.probeRequestComments();
+            int baseV = 0, baseC = 0;
+            { QElapsedTimer bt; bt.start();
+              do { spin(100);
+                   baseV = w.probeOverlayVisualCount(0); baseC = w.probeCommentCache(0); }
+              while (bt.elapsed() < 10000 && (baseV < 1 || baseC < 1)); }
+            fprintf(stdout, "OWNER3TAB M baseline visuals=%d comments=%d panel=%d\n",
+                    baseV, baseC, w.probePanelCommentRows()); fflush(stdout);
+            if (baseV < 1 || baseC < 1)
+                noteFail(QStringLiteral("M: moc dau thieu visuals=%1 hoac comments=%2 (f1 da co note)").arg(baseV).arg(baseC));
+            auto checkM = [&](int lap, const char* mode) {
+                QElapsedTimer wt; wt.start();
+                int v = -1, c = -1;
+                while (wt.elapsed() <= 3000) {
+                    v = w.probeOverlayVisualCount(0); c = w.probeCommentCache(0);
+                    if (v == baseV && c == baseC) break;
+                    spin(100);
+                }
+                const bool ok = (v == baseV && c == baseC);
+                fprintf(stdout, "OWNER3TAB M lap=%d mode=%s visuals=%d/%d comments=%d/%d wait=%lldms ok=%d\n",
+                        lap, mode, v, baseV, c, baseC, (long long)wt.elapsed(), ok ? 1 : 0);
+                fflush(stdout);
+                if (!ok)
+                    noteFail(QStringLiteral("M lap %1 (%2): doi tab lam mat markup/comment (visuals=%3/%4 comments=%5/%6)")
+                                 .arg(lap).arg(QString::fromUtf8(mode)).arg(v).arg(baseV).arg(c).arg(baseC));
+            };
+            for (int lap = 1; lap <= 3; ++lap) {
+                w.probeActivateTab(1); spin(150);  w.probeActivateTab(0); checkM(lap, "fast");
+                w.probeActivateTab(1); spin(2000); w.probeActivateTab(0); checkM(lap, "slow");
+            }
+            // Ca MO TAB MOI (activeDoc NULL giua chuyen tiep) roi quay ve f1:
+            w.openFile(f2); spin(100);                   // f2 dang mo — activeDoc = null
+            w.probeActivateTab(0); checkM(4, "newtab");
+            waitDoc(1); spin(500);                       // de f2 mo xong roi don tab
+            closeAllTabs();
+            // ── N (LƯỢT 33h — stress đóng tab GIỮA lượt vẽ trang quái vật): lặp 20 lần
+            //    { mở f3 → cuộn trang 3 (đang vẽ dở) → chờ NGẪU NHIÊN 0–1500 ms → đóng }.
+            //    Đúng cửa sổ race dump r33g: closeJob nền đang shutdownHeavy/doc->close
+            //    trong khi UI giao event cho renderer. 0 văng (process sống tới dòng PASS
+            //    + Event Log sạch sau mỗi lần) mới coi là sửa.
+            step('N', 1);
+            for (int lap = 1; lap <= 20; ++lap) {
+                closeAllTabs();
+                w.openFile(f3);
+                waitDoc(21);
+                w.probeScrollToPage(3);                  // noi dung ve quai vat — KHONG cho xong
+                spin(QRandomGenerator::global()->bounded(1500));
+                w.probeCloseTab(0);                      // dong GIUA luot ve
+                QElapsedTimer nt; nt.start();            // cho closeJob nen xong + UI `delete t`
+                while (nt.elapsed() < 15000 && w.probeCloseJobs() > 0) spin(50);
+                fprintf(stdout, "OWNER3TAB N lap=%d tabs_con_lai=%d closejobs=%d\n",
+                        lap, w.probeTabCount(), w.probeCloseJobs()); fflush(stdout);
+            }
+            closeAllTabs();
+        }
+
+        reportFreeze();   // buoc cuoi cung (G) khong co buoc ke tiep dong bang ho
+        fprintf(stdout, "OWNER3TAB lockhold_max=%lld lockhold_over2000=%d\n",
+                (long long)lhMax.loadRelaxed(), lhOver.loadRelaxed());
+        fflush(stdout);
+        // 🔴 LƯỢT 30 (BẮT BUỘC): in trần RAM đã đo + mốc khởi động để so sánh giữa các bản.
+        fprintf(stdout, "OWNER3TAB commit_max=%lldMB commit_baseline=%lldMB\n",
+                commitMax, commitBaseline);
+        fflush(stdout);
+        qInstallMessageHandler(prevHd);   // gỡ hook, trả lại logHandler gốc
+        // 🔴 LƯỢT 18 (VIỆC 4): lockhold_max > 2000 ms la FAIL (VONG_LAP_DEM muc 3).
+        if (lhMax.loadRelaxed() > 2000)
+            noteFail(QStringLiteral("lockhold_max %1ms > 2000ms").arg((long long)lhMax.loadRelaxed()));
+        if (allOk) { fprintf(stdout, "OWNER3TAB: PASS\n"); fflush(stdout); return 0; }
+        fprintf(stdout, "OWNER3TAB: FAIL %s\n", reason.toLocal8Bit().constData());
+        fflush(stdout);
+        return 2;
+    }
+
+    // ── LƯỢT 30 — RAM PROBE (VIỆC 1: ĐO để chỉ ra ai giữ ≥80% RAM) ──────────────
+    //   --ram-probe <f3> <f2> [maxPages=75]
+    // f3 = trang quái vật (PHẦN CHUNG & PHẦN NGẦM, 75 tr, trang 3 = 2,18M obj),
+    // f2 = MEP 244 MB. Kịch bản chủ nhân: CHỈ 2 file mà RAM lên 10 GB.
+    // Mở f3 → cuộn Continuous TỪNG trang 0..maxPages-1 (chờ có ảnh hoặc ≤15 s),
+    // zoom 100% vài trang; mở f2 → cuộn ~40 trang. Sau mỗi 5 trang in: commit
+    // (PrivateUsage), RSS, BẢNG PHÂN RÃ (pool doc từng dùng, globalCache ảnh,
+    // PageCache, vector layers, thumbnails). CUỐI: đóng TỪNG pool doc RẢNH, đo
+    // commit+RSS delta ⇒ ước lượng mỗi pool doc giữ bao nhiêu (nghi phạm A).
+    // FAIL: commit > 3000 MB ở bất kỳ bước nào, hoặc sau khi đóng hết tab commit
+    // không về dưới 1,5× lúc khởi động + 300 MB. In `OWNER3TAB commit_max=`.
+    if (argc >= 4 && QCoreApplication::arguments().value(1) == QLatin1String("--ram-probe")) {
+        const QStringList as = QCoreApplication::arguments();
+        int cur = 2;
+        auto nextPath = [&as, &cur]() -> QString {
+            QString v;
+            for (int j = cur; j < as.size(); ++j) {
+                v = v.isEmpty() ? as.value(j) : v + QLatin1Char(' ') + as.value(j);
+                cur = j + 1;
+                if (!(v.startsWith(QLatin1Char('"')) && !v.endsWith(QLatin1Char('"')))) break;
+            }
+            if (v.size() > 1 && v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                v = v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString f3 = nextPath(), f2 = nextPath();
+        const int maxPages = (cur < as.size()) ? qMax(1, as.value(cur).toInt()) : 75;
+        for (const QString& f : {f3, f2}) {
+            if (!QFile::exists(f)) {
+                fprintf(stdout, "RAMP: FAIL file khong ton tai: %s\n",
+                        f.toLocal8Bit().constData()); fflush(stdout);
+                return 2;
+            }
+        }
+        MainWindow w; w.resize(1400, 900); w.show();
+        QCoreApplication::processEvents();
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+        auto commitMB = []() -> long long {
+            long long pv = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                pv = (long long)(pmc.PrivateUsage / 1048576);
+#endif
+            return pv;
+        };
+        auto rssTrimMB = []() -> long long {
+            long long ws = 0;
+#ifdef Q_OS_WIN
+            EmptyWorkingSet(GetCurrentProcess());   // ép OS thu hồi trang đã free -> RSS = live
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                ws = (long long)(pmc.WorkingSetSize / 1048576);
+#endif
+            return ws;
+        };
+        // Working set TRUOC khi ép OS thu hồi (so voi rssLive = sau trim).
+        auto rssMB = []() -> long long {
+            long long ws = 0;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                ws = (long long)(pmc.WorkingSetSize / 1048576);
+#endif
+            return ws;
+        };
+        bool allOk = true; QString reason;
+        auto noteFail = [&allOk, &reason](const QString& r) {
+            if (!allOk) return; allOk = false; reason = r;
+        };
+        long long commitMax = 0, commitBaseline = -1;
+        auto noteCommit = [&](const char* where) {
+            const long long c = commitMB();
+            if (c > commitMax) commitMax = c;
+            if (c > 3000)
+                noteFail(QStringLiteral("commit %1MB > 3000MB tran RAM (%2)").arg(c).arg(where));
+        };
+        // Cuon toi trang p, co anh hoac ≤15 s. Tra ve co anh khong.
+        auto measurePage = [&](int p) -> bool {
+            w.probeScrollToPage(p);
+            QElapsedTimer et; et.start();
+            int lastRescroll = 0;
+            while (et.elapsed() < 15000) {
+                spin(50);
+                if (w.probePageHasImage(p)) break;
+                if (et.elapsed() - lastRescroll >= 500) {
+                    w.probeScrollToPage(p); lastRescroll = (int)et.elapsed();
+                }
+            }
+            return w.probePageHasImage(p);
+        };
+        auto waitDocOpen = [&](int minPages) {
+            QElapsedTimer dt; dt.start();
+            while (dt.elapsed() < 30000 && w.probePageCount() < minPages) spin(100);
+        };
+        // In một dòng phân rã: commit + RSS(live) + RAMBREAK + pool từng tab.
+        auto breakdown = [&](const char* where) {
+            const long long cm = commitMB();
+            if (cm > commitMax) commitMax = cm;
+            if (cm > 3000) noteFail(QStringLiteral("commit %1MB > 3000MB (%2)").arg(cm).arg(where));
+            // 🔴 LƯỢT 31 (B): WS = WorkingSetSize TRUOC trim (working set that),
+            //   rssLive = SAU EmptyWorkingSet (phan da free OS lay lai duoc). commit
+            //   (PrivateUsage) cao hon WS = da free nhung Segment Heap chua tra OS.
+            const long long wsRaw = rssMB();
+            fprintf(stdout, "RAMP %s commit=%lldMB ws=%lldMB rssLive=%lldMB\n", where, cm, wsRaw, rssTrimMB());
+            fprintf(stdout, "%s\n", w.probeRamBreakdown().toLocal8Bit().constData());
+            fprintf(stdout, "RAMP pool %s\n", w.probePoolInfoAll().toLocal8Bit().constData());
+            fflush(stdout);
+        };
+        commitBaseline = commitMB();
+        fprintf(stdout, "RAMP commit_baseline=%lldMB pool_size_env=%s maxPages=%d\n",
+                commitBaseline, qgetenv("TORREADER_POOL_SIZE").constData(), maxPages);
+        fflush(stdout);
+
+        // ── f3: quái vật ──
+        w.openFile(f3); waitDocOpen(1);
+        const int n3 = qBound(1, w.probePageCount(), maxPages);
+        for (int p = 0; p < n3; ++p) {
+            measurePage(p);
+            if (p % 5 == 0 || p == n3 - 1) {
+                char buf[64]; snprintf(buf, sizeof(buf), "f3 p=%d/%d", p, n3);
+                breakdown(buf);
+            }
+        }
+        // zoom 100% vài trang (chủ nhân: ~9 s ở fit zoom — do thêm ở zoom thật)
+        w.probeSetZoom(1.0);
+        for (int p : {3, 10, 20}) { if (p < n3) { measurePage(p); char buf[64]; snprintf(buf, sizeof(buf), "f3 zoom100 p=%d", p); breakdown(buf); } }
+
+        // ── f2: MEP 244 MB ──
+        w.openFile(f2); waitDocOpen(1);
+        const int n2 = qBound(1, w.probePageCount(), 40);
+        for (int p = 0; p < n2; ++p) {
+            measurePage(p);
+            if (p % 5 == 0 || p == n2 - 1) {
+                char buf[64]; snprintf(buf, sizeof(buf), "f2 p=%d/%d", p, n2);
+                breakdown(buf);
+            }
+        }
+
+        // ── CUỐI: đóng TỪNG pool doc RẢNH, đo delta (nghi phạm A). RSS(live) sau
+        //    trim = bộ nhớ THỰC doc đó đang giữ (commit có thể không tụt vì Segment
+        //    Heap giữ segment đã commit). ──
+        spin(3000);   // để thumbnail/worker trả handle về rảnh
+        const int ndocs = w.probeOpenDocCount();
+        for (int d = 0; d < ndocs; ++d) {
+            int closed = 0;
+            for (;;) {
+                const long long c0 = commitMB(), r0 = rssTrimMB();
+                if (!w.probeCloseOneIdlePoolDocTab(d)) break;
+                const long long c1 = commitMB(), r1 = rssTrimMB();
+                ++closed;
+                fprintf(stdout, "RAMP POOLDOC tab=%d #%d commit %lld->%lld (d=%lld) rssLive %lld->%lld (d=%lld)\n",
+                        d, closed, c0, c1, c1 - c0, r0, r1, r1 - r0);
+                fflush(stdout);
+                if (closed > 40) break;
+            }
+            fprintf(stdout, "RAMP POOLDOC tab=%d closed=%d (con ranhg=%d)\n",
+                    d, closed, w.probeIdlePoolDocsAll());
+            fflush(stdout);
+        }
+
+        // ── đóng hết tab ──
+        for (int n = w.probeTabCount(); n > 0; ) {
+            w.probeCloseTab(0);
+            const int n2b = w.probeTabCount();
+            if (n2b >= n) break;
+            n = n2b;
+        }
+        spin(3000);
+        // 🔴 LƯỢT 30 (thử): khi idle (mọi tab đóng), huỷ + init lại PDFium để giải
+        // phóng CACHE TOÀN CỤC (CPDF_PageModule ảnh/font) chỉ được trả ở DestroyLibrary.
+        // Đo xem commit có về gần mức khởi động không (Segment Heap có thể vẫn giữ).
+        if (qEnvironmentVariableIsSet("TORREADER_REINIT_IDLE")) {
+            const long long c0 = commitMB();
+            const bool done = PdfDocument::libReinitIdle();
+            spin(500);
+            fprintf(stdout, "RAMP reinit idle=%d commit %lld->%lldMB\n",
+                    done ? 1 : 0, c0, commitMB());
+            fflush(stdout);
+        }
+        breakdown("sau khi DONG HET tab");
+        {
+            const long long cm = commitMB();
+            const int docMo = g_pdfiumDocOpen.loadRelaxed() - g_pdfiumDocClose.loadRelaxed();
+            if (docMo == 0 && cm > commitBaseline * 3 / 2 + 300)
+                noteFail(QStringLiteral("dong het tab: commit %1MB > 1,5x khoi dong (%2)+300").arg(cm).arg(commitBaseline));
+        }
+        fprintf(stdout, "OWNER3TAB commit_max=%lldMB commit_baseline=%lldMB\n",
+                commitMax, commitBaseline);
+        fflush(stdout);
+        if (allOk) { fprintf(stdout, "RAMP: PASS\n"); fflush(stdout); return 0; }
+        fprintf(stdout, "RAMP: FAIL %s\n", reason.toLocal8Bit().constData());
+        fflush(stdout);
+        return 2;
+    }
+
+    // ── LƯỢT 28 — RERENDER BENCH (VIỆC 1b — rút gọn, loại "tab khác") ──────────
+    //   --rerender-bench <f3> [page=3] [N=4]
+    // MỘT process, MỘT file: mo f3 -> ve trang bang DUNG duong cua app (openFile /
+    // probeScrollToPage / probePageHasImage giong het measurePage cua owner3tab —
+    // ProgressiveRenderTask + pool, cung scale do cua so 1400x900) -> DONG tab ->
+    // lap N lan. Neu ms TANG DON DIEU khi khong co file nao khac mo => loan hoan
+    // "tab khac", guoc tro ve trang thai process (heap). In ms/lan + hp_big_ns +
+    // tom tat heap + commit + peak RSS moi vong. TORREADER_HEAPCOMPACT=1 (Thử A)
+    // co hieu luc o day vi no nam trong closeJob.finished cua MainWindow — duong
+    // dong tab that cua app. Tran cho 1 lan ve 120 s (probe cat o 30 s — can ms
+    // THAT cua lan 2+, khong phai gia tri timeout).
+    if (argc >= 3 && QCoreApplication::arguments().value(1) == QLatin1String("--rerender-bench")) {
+        const QStringList as = QCoreApplication::arguments();
+        int cur = 2;
+        auto nextPath = [&as, &cur]() -> QString {
+            QString v;
+            for (int j = cur; j < as.size(); ++j) {
+                v = v.isEmpty() ? as.value(j) : v + QLatin1Char(' ') + as.value(j);
+                cur = j + 1;
+                if (!(v.startsWith(QLatin1Char('"')) && !v.endsWith(QLatin1Char('"')))) break;
+            }
+            if (v.size() > 1 && v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                v = v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString f3 = nextPath();
+        const int page = (cur < as.size()) ? qMax(0, as.value(cur).toInt()) : 3;
+        const int N    = (cur + 1 < as.size()) ? qMax(1, as.value(cur + 1).toInt()) : 4;
+        if (!QFile::exists(f3)) {
+            fprintf(stdout, "RERENDER: FAIL file khong ton tai: %s\n", f3.toLocal8Bit().constData());
+            fflush(stdout);
+            return 2;
+        }
+        MainWindow w; w.resize(1400, 900); w.show();
+        QCoreApplication::processEvents();
+        auto spin = [&](int ms) {
+            const int loops = qMax(ms / 50, 1);
+            for (int i = 0; i < loops; ++i) { QCoreApplication::processEvents(); QThread::msleep(50); }
+        };
+        auto mem = [](long long& rss, long long& commit, long long& peakRss, long long& peakCommit) {
+            rss = commit = peakRss = peakCommit = -1;
+#ifdef Q_OS_WIN
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+                rss        = (long long)(pmc.WorkingSetSize      / 1048576);
+                commit     = (long long)(pmc.PrivateUsage         / 1048576);
+                peakRss    = (long long)(pmc.PeakWorkingSetSize   / 1048576);
+                peakCommit = (long long)(pmc.PeakPagefileUsage    / 1048576);
+            }
+#endif
+        };
+#ifdef Q_OS_WIN
+        // 0=NT heap, 1=LFH, 2=SegmentHeap — bang chung manifest co noi hay bi Win10 bo qua.
+        DWORD ht = 0;
+        HeapQueryInformation(GetProcessHeap(), HeapCompatibilityInformation, &ht, sizeof(ht), nullptr);
+        fprintf(stdout, "RERENDER: heapType=%lu (0=NT,1=LFH,2=SegmentHeap)\n", (unsigned long)ht);
+        fflush(stdout);
+#endif
+        for (int it = 1; it <= N; ++it) {
+            w.openFile(f3);
+            { QElapsedTimer dt; dt.start();
+              while (dt.elapsed() < 30000 && w.probePageCount() < 21) spin(100); }
+            w.probeActivateTab(w.probeTabCount() - 1); spin(300);
+            w.probeScrollToPage(page);
+            QElapsedTimer et; et.start();
+            int lastRescroll = 0;
+            while (et.elapsed() < 120000) {
+                spin(50);
+                if (w.probePageHasImage(page)) break;
+                if (et.elapsed() - lastRescroll >= 500) {
+                    w.probeScrollToPage(page); lastRescroll = (int)et.elapsed();
+                }
+            }
+            const qint64 ms = et.elapsed();
+            const bool img = w.probePageHasImage(page);
+            long long rss, commit, pRss, pCommit;
+            mem(rss, commit, pRss, pCommit);
+            fprintf(stdout, "RERENDER it=%d page=%d ms=%lld ok=%d rss=%lldMB commit=%lldMB\n",
+                    it, page, (long long)ms, img ? 1 : 0, rss, commit);
+            fflush(stdout);
+            w.probeCloseTab(w.probeTabCount() - 1);
+            { QElapsedTimer ct; ct.start();
+              while (ct.elapsed() < 60000 && w.probeCloseJobs() > 0) spin(100); }
+            spin(1000);   // cho closeJob.finished (HeapCompact neu co co) chay
+            const long long hbig = heapBigNs();
+            long long nh = -1, fk = -1, fb = -1;
+            heapSummary(nh, fk, fb);
+            mem(rss, commit, pRss, pCommit);
+            fprintf(stdout, "RERENDER it=%d sau_dong hp_big_ns=%lld nHeaps=%lld hsFreeKB=%lld hsFreeBlocks=%lld"
+                            " rss=%lldMB commit=%lldMB peakRss=%lldMB peakCommit=%lldMB\n",
+                    it, hbig, nh, fk, fb, rss, commit, pRss, pCommit);
+            fflush(stdout);
+        }
+        fprintf(stdout, "RERENDER: DONE\n"); fflush(stdout);
         return 0;
     }
 
@@ -5370,6 +7307,103 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // usage: --zoomanchor-probe <file.pdf> <page0based> <zoomFrom> <zoomTo> [fx] [fy] [mode] [offY]
+    // mode=0: diem (fx,fy) trong trang; mode=1: con tro trong KHE 12px duoi trang (LOI 1).
+    // offY: lech con tro khoi tam khung nhin (px).
+    // Do lech neo khi Ctrl+zoom o ContinuousView (loi "zoom lam nhay vi tri").
+    if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--zoomanchor-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (!_probeRequireFile(inputPath, "file dau vao")) return 2;
+        const int    page     = QString::fromLocal8Bit(argv[3]).toInt();
+        const double zoomFrom = QString::fromLocal8Bit(argv[4]).toDouble();
+        const double zoomTo   = QString::fromLocal8Bit(argv[5]).toDouble();
+        const double fx = (argc >= 7) ? QString::fromLocal8Bit(argv[6]).toDouble() : 0.5;
+        const double fy = (argc >= 8) ? QString::fromLocal8Bit(argv[7]).toDouble() : 0.4;
+        const int    mode = (argc >= 9) ? QString::fromLocal8Bit(argv[8]).toInt() : 0;
+        const double offY = (argc >= 10) ? QString::fromLocal8Bit(argv[9]).toDouble() : 0.0;
+
+        // Do thang tren ContinuousView, KHONG render (renderer = nullptr) — chi can bo
+        // cuc + page size. Vong lap su kien cua MainWindow tren may khong GPU bi treo
+        // (do duoc: processEvents ket o lan lap 6), ma phep do nay khong can ve.
+        PdfDocument::libAddRef();
+        {
+            PdfDocument doc;
+            if (!doc.open(inputPath)) {
+                fprintf(stderr, "ZOOMANCHOR_FAIL cannot open %s\n", inputPath.toUtf8().constData());
+                PdfDocument::libRelease();
+                return 1;
+            }
+            ContinuousView view;
+            view.resize(1600, 1000);
+            view.viewport()->resize(1600, 1000);
+            view.setDocument(&doc, nullptr, nullptr, nullptr);
+            const QString rep = view.probeZoomAnchor(page, zoomFrom, zoomTo, fx, fy, mode, offY);
+            fputs(rep.toLocal8Bit().constData(), stdout);
+            fflush(stdout);
+        }
+        PdfDocument::libRelease();
+        fprintf(stdout, "ZOOMANCHOR_OK\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    // usage: --scrollpersist-probe <file.pdf> <zoomPercent> [real]
+    // LOI 2 (0921): updateScrollBars ep setValue(hRange/2) moi lan goi (ke ca tu
+    // resizeEvent) => keo splitter/kich thuoc cua so lam mat vi tri cuon ngang cua
+    // nguoi dung. Probe nay dat canvas < vpW, keo ngang lech tam roi goi lai
+    // updateScrollBars; vi tri phai duoc giu, con lan dau dat range van canh giua.
+    // LOI B (0921): them 2 ca DOI vpW (chua keo => canh giua lai; da keo => giu nguyen).
+    // "real": chay them duong CUA SO THAT (show() + thanh cuon) cho LOI A.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--scrollpersist-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        if (!_probeRequireFile(inputPath, "file dau vao")) return 2;
+        const double zoom = QString::fromLocal8Bit(argv[3]).toDouble();
+        const bool realWindow = (argc >= 5) &&
+                                (QString::fromLocal8Bit(argv[4]) == QLatin1String("real"));
+        PdfDocument::libAddRef();
+        {
+            PdfDocument doc;
+            if (!doc.open(inputPath)) {
+                fprintf(stderr, "SCROLLPERSIST_FAIL cannot open %s\n", inputPath.toUtf8().constData());
+                PdfDocument::libRelease();
+                return 1;
+            }
+            ContinuousView view;
+            view.resize(1600, 1000);
+            view.viewport()->resize(1600, 1000);
+            view.setDocument(&doc, nullptr, nullptr, nullptr);
+            const QString rep = view.probeScrollPersist(zoom, realWindow);
+            fputs(rep.toLocal8Bit().constData(), stdout);
+            fflush(stdout);
+        }
+        PdfDocument::libRelease();
+        fprintf(stdout, "SCROLLPERSIST_OK\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    // usage: --gpuview-zoomanchor-probe <zoomFrom> <zoomTo> [panX] [panY]
+    // LOI 3: PdfGpuView::setZoom (nut +/- / o nhap %) phai neo diem tai lieu o TAM
+    // khung nhin, giong duong Ctrl+wheel. Do TRUOC/SAU khi da pan.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--gpuview-zoomanchor-probe")) {
+        const double zFrom = QString::fromLocal8Bit(argv[2]).toDouble();
+        const double zTo   = QString::fromLocal8Bit(argv[3]).toDouble();
+        const double panX  = (argc >= 5) ? QString::fromLocal8Bit(argv[4]).toDouble() : 0.0;
+        const double panY  = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toDouble() : 0.0;
+        PdfGpuView view;
+        view.resize(1200, 900);
+        const QString rep = view.probeZoomAnchor(zFrom, zTo, QPointF(panX, panY));
+        fputs(rep.toLocal8Bit().constData(), stdout);
+        fflush(stdout);
+        fprintf(stdout, "GPUVIEW_ZOOMANCHOR_OK\n");
+        fflush(stdout);
+        return 0;
+    }
+
     if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--scroll-probe")) {
         QString inputPath = QString::fromLocal8Bit(argv[2]);
         if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
@@ -5695,6 +7729,89 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         fprintf(stdout, "CONTVEC_PROBE_OK %s\n", outPng.toLocal8Bit().constData());
+        return 0;
+    }
+
+    // usage: --vecrender-probe <input.pdf> <page1Based> <out.png> [waitMs]
+    // LUOT 38: render LOP VECTOR (net + anh) ra QImage o DUNG huong hien thi (/Rotate),
+    // KHONG dung GL => chung minh duoc ca Single lan Continuous (cung lop du lieu nay),
+    // va doi chieu pixel duoc voi MuPDF. Khong ve fill (chi net + anh).
+    if (argc >= 5 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--vecrender-probe")) {
+        QString inputPath = QString::fromLocal8Bit(argv[2]);
+        if (inputPath.startsWith(QLatin1Char('"')) && inputPath.endsWith(QLatin1Char('"')))
+            inputPath = inputPath.mid(1, inputPath.size() - 2);
+        const int page1 = QString::fromLocal8Bit(argv[3]).toInt();
+        const QString outPng = QString::fromLocal8Bit(argv[4]);
+
+        MainWindow w;
+        w.resize(1200, 800);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(inputPath);
+        auto* tab = w.currentTabForProbe();
+        QElapsedTimer to; to.start();
+        while ((!tab || !tab->doc || !tab->doc->isOpen()) && to.elapsed() < 120000) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            QThread::msleep(20);
+            tab = w.currentTabForProbe();
+        }
+        if (!tab || !tab->doc || !tab->doc->isOpen()) {
+            fprintf(stderr, "VECRENDER: FAIL document not open\n");
+            return 1;
+        }
+        const int page = qBound(0, page1 - 1, tab->doc->pageCount() - 1);
+        w.probeSetView(false, 100, page + 1,
+                       std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::quiet_NaN());
+        for (int i = 0; i < 400; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(50);
+            auto L = tab->vecLayers.value(page);
+            if (L && L->isReady()) break;
+        }
+        auto L = tab->vecLayers.value(page);
+        if (!L) { fprintf(stderr, "VECRENDER: FAIL no vector layer page=%d\n", page); return 1; }
+
+        const int rot = L->rotation() & 3;
+        const double vw = L->pageSizePt().width();
+        const double vh = L->pageSizePt().height();
+        const double dispW = (rot & 1) ? vh : vw;
+        const double dispH = (rot & 1) ? vw : vh;
+        QImage out(qMax(1, (int)std::ceil(dispW)), qMax(1, (int)std::ceil(dispH)),
+                   QImage::Format_ARGB32);
+        out.fill(Qt::white);
+        QPainter p(&out);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QTransform t;
+        switch (rot) {
+            case 1: t.translate(dispW, 0.0);    t.rotate(90.0);  break;
+            case 2: t.translate(dispW, dispH);  t.rotate(180.0); break;
+            case 3: t.translate(0.0, dispH);    t.rotate(270.0); break;
+            default: break;
+        }
+        p.setTransform(t);
+        // Net vector (4 float/doan: x0 y0 x1 y1; 4 byte mau; 1 float be rong).
+        const QVector<float>&   V  = L->verts();
+        const QVector<uint8_t>& C  = L->colors();
+        const QVector<float>&   Wd = L->widths();
+        for (int i = 0, k = 0, ki = 0; i + 3 < V.size(); i += 4, k += 4, ++ki) {
+            QColor c(C[k], C[k+1], C[k+2], C[k+3]);
+            double wpx = Wd.value(ki, 1.0);
+            if (wpx <= 0.0) wpx = 0.5;
+            p.setPen(QPen(c, wpx));
+            p.drawLine(QPointF(V[i], V[i+1]), QPointF(V[i+2], V[i+3]));
+        }
+        // Anh: tile.img da duoc xoay theo ma tran doi tuong (ban sua luot 38).
+        for (const TextTile& tt : L->imageTiles())
+            p.drawImage(tt.rectPt, tt.img);
+        p.end();
+        if (!out.save(outPng, "PNG")) {
+            fprintf(stderr, "VECRENDER: FAIL save %s\n", outPng.toLocal8Bit().constData());
+            return 1;
+        }
+        fprintf(stdout, "VECRENDER_OK %s rot=%d vw=%.1f vh=%.1f segs=%d tiles=%d\n",
+                outPng.toLocal8Bit().constData(), rot, vw, vh, V.size() / 4,
+                L->imageTiles().size());
         return 0;
     }
 
@@ -6984,6 +9101,1342 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // usage: --torcache-probe <input.pdf>
+    // 0927 M1..M6 — harness NGHIEM THU TREN MAY THAT. MainWindow THAT (khong mo
+    // rong, khong gia lap): buoc (a) mo pdf = tab1, (b) mo CUNG pdf = tab2 (phai
+    // ra log `DUNG CHUNG`), (c) dong tab1 (phai ra log `ok=0 loi=conTab=1` va file
+    // .torcache CON), (d) nap lai tab2 qua DUNG `loadTabFile` (log `ly do=taiLai`),
+    // (e) thoat app bang `close()` (log `ly do=thoatApp`). Moi buoc cho ~2 s bang
+    // QTimer — KHONG sleep chan UI, vi sleep se lam `openFile`/thumbnail worker
+    // khong bao gio chay giua chung. In `TCPROBE step=<a..e> exists=<0|1>` = file
+    // .torcache co tren dia hay khong + `torvec=<n>` = so file .torvec con lai.
+    // Chay voi file CO TRANG NANG (vi du PDF CAD) thi moi co .torvec that.
+    // 0927 LUOT 6: het buoc clearCache (nut da bi go han) + them PHAI THOI
+    // `TCPROBE leftover=<n>` dem CHINH trong app sau khi `close()` chay xong
+    // (closeEvent = luc rut cache) ⇒ KY VONG 0.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--torcache-probe")) {
+        const QString inPath = QString::fromLocal8Bit(argv[2]);
+        QTextStream pout(stdout);
+        MainWindow w;
+        w.resize(1280, 800);
+        w.show();
+        const QString cachePath = TileCacheFile::cachePathFor(inPath,
+                                                               TileCacheFile::hashFile(inPath));
+        const QString key = VectorCache::keyFromCachePath(cachePath);
+        auto step = [&](const char* tag) {
+            // In SAU khi buoc do chay: `exists` la ket qua cua chinh buoc do. (c)
+            // `exists=1` ⇒ file .torcache CON sau khi dong tab1; (e) `exists=0` ⇒
+            // thoat app da rut sach cache cua tai lieu do.
+            pout << "TCPROBE step=" << tag << " exists=" << (QFile::exists(cachePath) ? 1 : 0)
+                 << " torvec=" << VectorCache::countForKey(key) << "\n";
+            pout.flush();
+        };
+        int s = 0;
+        auto* timer = new QTimer(&w);
+        QObject::connect(timer, &QTimer::timeout, &w, [&]() {
+            switch (s++) {
+            case 0:  w.openFile(inPath);        step("a_open1");     break;
+            case 1:  w.openFile(inPath);        step("b_open2");     break; // CUNG pdf => DUNG CHUNG
+            case 2:  w.probeCloseOpenDoc(0);    step("c_dong1");     break; // tab1 = openDoc 0
+            case 3:  w.probeLoadTabFile(0);     step("d_taiLai");    break;
+            default: break;
+            }
+        });
+        timer->start(2000);
+        // Buoc (e) sau khi 4 buoc tren da chay: 4 x 2 s + du phong.
+        QTimer::singleShot(4 * 2000 + 3000, &w, [&]() {
+            timer->stop();
+            w.close();                       // thoat BINH THUONG => closeEvent that
+            step("e_thoatApp");
+            // 0927 LUOT 6: dem moi thu con sot cua CHINH tai lieu nay — .torcache,
+            // .lock, .torvec, .torvec.tmp. Ky vong 0.
+            pout << "TCPROBE leftover=" << VectorCache::countForKey(key) << "\n";
+            pout.flush();
+            pout << "TCPROBE_DONE\n";
+            pout.flush();
+            QCoreApplication::quit();
+        });
+        const int rc = app.exec();
+        // 0927 LƯỢT 11: TCPROBE_DONE đã in xong ⇒ thoát nhanh, y hệt app thật
+        // (nếu không, probe này đi qua ~MainWindow và không còn phản ánh đường
+        // thoát đã vá).
+        trThoatNhanh(rc, &w);
+        return rc;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 0927 BƯỚC 1 — HARNESS TEXT NHIỀU DÒNG (SPEC_TEXT_NHIEU_DONG_0927 §3).
+    // Khối RIÊNG, không sửa probe cũ. Cùng kiểu các --*-probe sẵn có:
+    // nhận tham số dòng lệnh, in kết quả ra stdout, trả 0/2.
+    // Mục đích: người chấm kiểm KHÔNG cần chuột vẫn nghiệm thu được.
+
+    // ── Dem so dong /AP that cua mot FreeText CUA TA (dung chung 2 probe) ──
+    // Doc lai chinh file vua luu, lay /AP cua annot, dem so cap <hex> Tj.
+    // Dem theo CACH DUY NHAT ma nguoi cham dung: so dong theo toa do y cua
+    // renderer doc lap. O day chi dem lenh Tj ⇒ phai khop voi renderer.
+    // 🔴 0927 LƯỢT 3 — DẸP BẾ TREO 60 s. onSaveFile() báo lỗi bằng QMessageBox
+    // MODAL; probe bơm processEvents nên hộp thoại bật lên và treo vô hạn
+    // (đúng triệu chứng CEO thấy: log có [inote] SetAP ok nhưng không có dòng
+    // FTMULTI). Ở đây ta đóng MỌI hộp thoại modal sau mỗi vòng bơm event, để
+    // lỗi hiện ra rồi đi tiếp thay vì treo. Chỉ dùng trong harness.
+    auto _dismissModals = []() {
+        for (int guard = 0; guard < 8; ++guard) {
+            QWidget* w = QApplication::activeModalWidget();
+            if (!w) break;
+            if (auto* mb = qobject_cast<QMessageBox*>(w)) {
+                QTextStream e(stderr);
+                e << "HARNESS_MODAL " << mb->text().toUtf8().constData() << "\n";
+                e.flush();
+            }
+            w->close();
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        }
+    };
+    auto _ftApLineCount = [](const QString& path, int pageIndex, int annotIndex,
+                             QString* apOut) -> int {
+        PdfDocument::libAddRef();
+        int lines = 0;
+        {
+            PdfDocument doc;
+            if (!doc.open(path)) { PdfDocument::libRelease(); return -1; }
+            {
+                QMutexLocker lock(&s_pdfiumMutex);
+                FPDF_PAGE p = FPDF_LoadPage(doc.raw(), pageIndex);
+                if (p) {
+                    // annotIndex < 0 ⇒ tự dò annot FreeText đầu tiên trên trang
+                    // (probe 0927: sau khi lưu, chỉ số có thể đổi vì /Annots
+                    // được QPDF viết lại — không được hard-code 0).
+                    int idx = annotIndex;
+                    if (idx < 0) {
+                        const int n = FPDFPage_GetAnnotCount(p);
+                        for (int i = 0; i < n; ++i) {
+                            FPDF_ANNOTATION c = FPDFPage_GetAnnot(p, i);
+                            if (!c) continue;
+                            const bool isFreeText =
+                                (FPDFAnnot_GetSubtype(c) == FPDF_ANNOT_FREETEXT);
+                            FPDFPage_CloseAnnot(c);
+                            if (isFreeText) { idx = i; break; }
+                        }
+                        if (idx < 0) { FPDF_ClosePage(p); PdfDocument::libRelease(); return -2; }
+                    }
+                    FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, idx);
+                    if (a) {
+                        unsigned long len = FPDFAnnot_GetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+                                                           nullptr, 0);
+                        QString ap;
+                        if (len > 1) {
+                            std::vector<unsigned short> buf(len / 2 + 1, 0);
+                            FPDFAnnot_GetAP(a, FPDF_ANNOT_APPEARANCEMODE_NORMAL,
+                                            reinterpret_cast<FPDF_WCHAR*>(buf.data()), len);
+                            ap = QString::fromUtf16(
+                                reinterpret_cast<const char16_t*>(buf.data()));
+                        }
+                        if (apOut) *apOut = ap;
+                        // Số dòng /AP = số lệnh <hex> Tj trong khối BT/ET
+                        // (mỗi dòng 1 Tj theo đường dựng mới). Đây là con số
+                        // phải KHỚP với renderer độc lập đếm theo toạ độ y.
+                        {
+                            int inBT = 0;
+                            for (const QString& rawLn : ap.split(QLatin1Char('\n'))) {
+                                const QString t = rawLn.trimmed();
+                                if (t.startsWith(QLatin1String("BT"))) inBT = 1;
+                                else if (t.startsWith(QLatin1String("ET"))) inBT = 0;
+                                else if (inBT && t.endsWith(QLatin1String("Tj"))) ++lines;
+                            }
+                        }
+                        FPDFPage_CloseAnnot(a);
+                    }
+                    FPDF_ClosePage(p);
+                }
+            }
+        }
+        PdfDocument::libRelease();
+        return lines;
+    };
+    // usage: --ftmulti-probe <in.pdf> <out.pdf>
+    // Tao tren trang 1 mot FreeText CUA TA, o rong 200pt, chu 3 dong cung +
+    // 1 doan phai tu ngat mem, luu ra out.pdf, in
+    //   FTMULTI lines=<so dong /AP> rect=<w>x<h>
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftmulti-probe")) {
+        auto stripQ = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString inPath  = stripQ(QString::fromLocal8Bit(argv[2]));
+        const QString outPath = stripQ(QString::fromLocal8Bit(argv[3]));
+        QTextStream out(stdout);
+        if (!QFile::exists(inPath)) {
+            out << "FTMULTI FAIL: file dau vao khong ton tai: " << inPath << "\n";
+            out.flush(); return 2;
+        }
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) {
+            out << "FTMULTI FAIL: khong copy duoc sang " << outPath << "\n";
+            out.flush(); return 2;
+        }
+        // 🔴 0927 LƯỢT 3: nhớ KÍCH THƯỚC + checksum tệp SAU khi copy, để sau
+        // khi lưu mà báo "ok" thì ta biết thật sự tệp có đổi. Lượt 2 báo
+        // guiSave ok=true trong khi out.pdf vẫn y hệt tệp gốc (2928 byte) —
+        // dấu hiệu lớn nhất của việc "thành công giả". Giờ ta tự đối chiếu.
+        const qint64 sizeBefore = QFileInfo(outPath).size();
+        QFile::remove(outPath + ".prebak");
+        QFile::copy(outPath, outPath + ".prebak");
+        // 3 ngắt cứng + đoạn phải ngắt mềm vì vượt bề rộng ô 200pt.
+        // UTF-8 THẬT (không \uXXXX: QStringLiteral không giải escape unicode).
+        const QString multi = QString::fromUtf8(
+            "Dòng một\n"
+            "Dòng hai tiếng Việt có dấu\n"
+            "Dòng ba rất dài để buộc phải tự ngắt mềm vì vượt bề rộng ô hai trăm điểm");
+        const float  fontSize = 12.0f;
+        const double boxW = 200.0, boxH = 40.0;
+        double rectW = boxW, rectH = boxH;
+        int lines = 0;
+        // 🔴 0927 LƯỢT 2: đi qua MainWindow + đường Save THẬT (onSaveFile),
+        // đúng như lúc người dùng bấm Ctrl+S. Lượt trước probe tự mở
+        // PdfDocument rồi gọi mgr.saveDocument() — KHÔNG phải đường đó, nên
+        // không materialize pagesNeedGenerate, không giải phóng handle
+        // PDFium, không replaceFileAtomically ⇒ tệp ra không giống tệp thật.
+        MainWindow w;
+        w.resize(1280, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(outPath);
+        for (int i = 0; i < 240; ++i) {          // chờ trang 1 vẽ xong
+            QCoreApplication::processEvents();
+            QThread::msleep(25);
+            _dismissModals();
+            if (i > 40 && w.probePageCount() > 0) break;
+        }
+        {
+            auto* tb = w.currentTabForProbe();
+            if (!tb || !tb->annotMgr) {
+                out << "FTMULTI FAIL: khong mo duoc tab\n"; out.flush(); return 1;
+            }
+            const QRectF fit = trFreeTextFitRect(
+                QRectF(60.0, 600.0, boxW, boxH), multi, fontSize);
+            rectW = fit.width(); rectH = fit.height();
+            if (!tb->annotMgr->createInlineNote(0, fit, multi, QStringLiteral("ftmulti"),
+                                                false, QColor(0, 0, 0), fontSize)) {
+                out << "FTMULTI FAIL: createInlineNote=" << tb->annotMgr->lastError() << "\n";
+                out.flush(); return 1;
+            }
+        }
+        QString saveErr;
+        const bool saved = w.probeSaveViaGuiAsync(&saveErr);
+        const qint64 sizeAfter = QFileInfo(outPath).size();
+        qWarning().noquote() << "[ftmulti-probe] guiSave ok=" << saved
+                             << " err=" << saveErr
+                             << " sizeBefore=" << sizeBefore
+                             << " sizeAfter=" << sizeAfter;
+        if (!saved) {
+            out << "FTMULTI FAIL: save qua onSaveFile that bai: " << saveErr << "\n";
+            out.flush(); return 1;
+        }
+        // 🔴 0927 LƯỢT 3: TỰ ĐÓNG cửa sổ TRƯỚC khi đọc lại tệp. onSaveFile
+        // gọi loadTabFile mở lại tệp ⇒ PDFium còn giữ handle trên out.pdf;
+        // đọc bằng doc thứ hai lúc đó có thể đọc trúng dữ liệu CŨ trong
+        // cache. Đóng hẳn MainWindow (giải phóng handle + pool) rồi MỞ LẠI
+        // tệp đã lưu bằng PDFium MỚI, đếm số lệnh <hex> Tj trong /AP/N.
+        w.close();
+        for (int i = 0; i < 80; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        QString apText;
+        lines = _ftApLineCount(outPath, 0, -1, &apText);
+        const bool hasAp = !apText.isEmpty();
+        // Đối chiếu tệp THẬT SỰ đã đổi (phòng "thành công giả" lần nữa).
+        const bool changed = (sizeAfter != sizeBefore) || (QFileInfo(outPath + ".prebak").size() != sizeAfter);
+        // 🔴 0927 LƯỢT 3 — ĐỌC LẠI BẰNG ĐÚNG ĐƯỜNG MỞ CỦA APP, và trả lời
+        // câu hỏi mục 3: "hình trên màn hình lấy từ overlay hay từ /AP?"
+        // Ta mở MainWindow thật, nạp tệp ĐÃ LƯU, đọc /Contents mà app đọc được,
+        // rồi vẽ CHÍNH overlay của app (drawFreeTextOverlay) ra QImage và ĐẾM
+        // SỐ DÒNG CÓ NÉT ĐEN. Đếm ở tầng app, không phải bằng trình đọc ngoài.
+        int reopenLines = -1, reopenBlackPx = 0, paintByOverlay = -1;
+        {
+            MainWindow w2;
+            w2.resize(1280, 900);
+            w2.show();
+            QCoreApplication::processEvents();
+            w2.openFile(outPath);
+            for (int i = 0; i < 240; ++i) {
+                QCoreApplication::processEvents();
+                QThread::msleep(25);
+                if (i > 40 && w2.probePageCount() > 0) break;
+            }
+            auto* tb2 = w2.currentTabForProbe();
+            if (tb2 && tb2->annotMgr) {
+                const QList<AnnotInfo> list = tb2->annotMgr->loadPage(0);
+                QString reopened;
+                for (const AnnotInfo& ai : list)
+                    if (ai.type == QLatin1String("FreeText") && !ai.text.isEmpty())
+                        reopened = ai.text;
+                reopenLines = trWrapFreeText(reopened, 192.0,
+                                             QFontMetricsF(trDejaVuFontAtPixelSize(12.0))).size();
+                // paintByOverlay của annot vừa đọc: quyết định chữ do
+                // overlay hay do ảnh nền (raster) vẽ. Dùng CHÍNH hàm app dùng.
+                bool capable2 = true;
+                const QList<AnnotVisual> vis =
+                    tb2->annotMgr->loadPageVisuals(0, &capable2);
+                for (const AnnotVisual& av : vis)
+                    if (!av.text.isEmpty()) paintByOverlay = av.paintByOverlay ? 1 : 0;
+                // Vẽ overlay thật của app rồi đếm nét đen theo từng dòng y.
+                QImage img(420, 200, QImage::Format_ARGB32);
+                img.fill(Qt::white);
+                {
+                    QPainter pp(&img);
+                    drawFreeTextOverlay(pp, QRectF(10, 10, 200, 77.8438), reopened,
+                                        12.0f, 1.0, QColor(0, 0, 0));
+                }
+                for (int y = 0; y < img.height(); ++y) {
+                    bool rowHasInk = false;
+                    for (int x = 0; x < img.width() && !rowHasInk; ++x)
+                        if (qGray(img.pixel(x, y)) < 128) rowHasInk = true;
+                    if (rowHasInk) ++reopenBlackPx;
+                }
+            }
+            w2.close();
+            for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        }
+        out << "FTMULTI lines=" << lines << " hasAP=" << (hasAp ? 1 : 0)
+            << " rect=" << rectW << "x" << rectH
+            << " saved=" << (saved ? 1 : 0)
+            << " changed=" << (changed ? 1 : 0)
+            << " size=" << sizeAfter
+            << " reopenLines=" << reopenLines
+            << " paintByOverlay=" << paintByOverlay
+            << " overlayInkRows=" << reopenBlackPx
+            << "\n";
+        out.flush();
+        QFile::remove(outPath + ".prebak");
+        return (lines >= 4 && hasAp && changed) ? 0 : 1;  // 3 ngắt cứng + >=1 mềm
+    }
+
+    // usage: --textdlg-probe <in.pdf> [out.pdf]
+    // Mo MainWindow + hộp nhập Text NHƯ LÚC NGƯỜI DÙNG KÉO Ô (rect cố định
+    // trang 1). Người chấm gõ phím THẬT: Dong 1{ENTER}Dong 2^{ENTER}
+    // rồi bấm OK. Probe chờ hộp thoại đóng, rồi in ra log + stdout:
+    //   TEXTDLG contents=<...> lines=<n>
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--textdlg-probe")) {
+        auto stripQ2 = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString inPath = stripQ2(QString::fromLocal8Bit(argv[2]));
+        const QString savePath = (argc >= 4) ? stripQ2(QString::fromLocal8Bit(argv[3]))
+                                            : inPath + QStringLiteral(".textdlg.pdf");
+        QTextStream out(stdout);
+        if (!QFile::exists(inPath)) {
+            out << "TEXTDLG FAIL: file dau vao khong ton tai: " << inPath << "\n";
+            out.flush(); return 2;
+        }
+        QFile::remove(savePath);
+        if (!QFile::copy(inPath, savePath)) {
+            out << "TEXTDLG FAIL: khong copy duoc sang " << savePath << "\n";
+            out.flush(); return 2;
+        }
+
+        MainWindow w;
+        w.resize(1280, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(savePath);
+        for (int i = 0; i < 240; ++i) {           // cho trang 1 ve xong
+            QCoreApplication::processEvents();
+            QThread::msleep(25);
+            if (i > 40 && w.probePageCount() > 0) break;
+        }
+        // Mở hộp nhập Text ĐÚNG đường GUI: bắn tín hiệu textBoxRequested y
+        // như lúc người dùng kéo ô trên trang 1 (rect cố định, 200pt).
+        auto* tab = w.currentTabForProbe();
+        if (!tab || !tab->view) {
+            out << "TEXTDLG FAIL: khong mo duoc tab\n"; out.flush(); return 1;
+        }
+        // 🔴 0927 LƯỢT 3 — CÁCH ĐÚNG: bắn tín hiệu rồi bơm QEventLoop THẬT để
+        // hộp NoteInputDialog (mở bằng QDialog::exec() — vòng event lồng) hiện
+        // lên và nhận phím như lúc người dùng ngồi gõ tay.
+        // KHÔNG dùng Qt::DirectConnection ở đây: invokeMethod theo TÊN TÍN HIỆU
+        // với DirectConnection sẽ phát lại chính tín hiệu đó (đệ quy vô hạn).
+        // invokeMethod mặc định (Queued) là đúng; chỉ cần vòng chờ bơm event thật.
+        // 🔴 0927 LƯỢT 4 — SỬA LỖI TREO (đo 27/09: chạy >100 s không in TEXTDLG).
+        // NGUYÊN NHÂN: processEvents() gọi ở dưới CHẠY VÀO exec() LỒNG của
+        // NoteInputDialog (MainWindow mở hộp bằng dlg.exec()). exec() lồng chặn
+        // processEvents() ⇒ đoạn "tạo waitLoop" ở dưới KHÔNG BAO GIỜ chạy. Hộp
+        // hiện (người chấm gõ được) nhưng sau khi bấm OK, poll chưa từng thấy
+        // modal nên `sawDialog` mãi = false ⇒ waitLoop chờ trọn 600 s rồi mới
+        // thoát. Đúng triệu chứng: treo, không in TEXTDLG.
+        //
+        // CÁCH SỬA: dựng waitLoop + timer TRƯỚC, rồi mới bắn tín hiệu. Nested
+        // exec() lồng vào waitLoop là cách bình thường: hộp hiện, nhận phím thật,
+        // và khi nó đóng control quay lại waitLoop ⇒ poll thấy modal biến mất ⇒
+        // quit. MainWindow đã tạo xong annot trước khi ta đọc lại.
+        const bool autoType = !qEnvironmentVariableIsEmpty("TORREADER_TEXTDLG_AUTOTYPE");
+        {
+            QEventLoop waitLoop;
+            // Người chấm gõ tay: 600 s. Tự điền: 30 s là đủ, hết là treo ⇒ báo
+            // FAIL + thoát thay vì treo vô hạn.
+            QTimer::singleShot(autoType ? 30000 : 600000, &waitLoop, &QEventLoop::quit);
+            bool sawDialog = false;
+            QTimer poll;
+            poll.setInterval(100);
+            // 🔴 KHÔNG dựa vào activeModalWidget(): trong vòng exec() LỒNG trên
+            // Windows nó có thể NULL ⇒ poll không bao giờ thấy hộp ⇒ treo (đã đo
+            // 27/09). Dò trực tiếp cửa sổ con đang MỞ thay vì hỏi "modal không".
+            QObject::connect(&poll, &QTimer::timeout, [&]() {
+                // Dò hộp nhập nhiều dòng: có QPlainTextEdit + tiêu đề chứa
+                // "text" (MainWindow đặt "Add text"). isVisible() có thể chưa
+                // đúng lúc trong vòng exec() lồng ⇒ KHÔNG dựa vào nó.
+                QWidget* dlgNow = nullptr;
+                for (QWidget* w : QApplication::topLevelWidgets()) {
+                    if (!w->isWindow()) continue;
+                    if (!w->findChild<QPlainTextEdit*>()) continue;
+                    if (!w->windowTitle().contains(QStringLiteral("text"), Qt::CaseInsensitive)) continue;
+                    dlgNow = w; break;
+                }
+                if (dlgNow) sawDialog = true;
+                else if (sawDialog) { waitLoop.quit(); return; }
+                if (!dlgNow || !autoType) return;
+                QPlainTextEdit* ed = dlgNow->findChild<QPlainTextEdit*>();
+                if (!ed) { qWarning() << "[textdlg] khong tim thay QPlainTextEdit"; return; }
+                ed->setFocus();
+                // Đi đúng đường sự kiện bàn phím: Enter = XUỐNG DÒNG, đúng như
+                // người dùng gõ tay. Dùng QKeyEvent có text() chứ không dùng
+                // setPlainText — phải chứng minh bàn phím thật chạy.
+                auto tap = [ed](QEvent::Type ty, int key, Qt::KeyboardModifiers m, const QString& t) {
+                    QApplication::sendEvent(ed, new QKeyEvent(ty, key, m, t));
+                };
+                for (QChar c : QStringLiteral("Dong 1")) {
+                    tap(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+                    tap(QEvent::KeyRelease, 0, Qt::NoModifier, QString(c));
+                }
+                tap(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
+                tap(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
+                for (QChar c : QStringLiteral("Dong 2")) {
+                    tap(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+                    tap(QEvent::KeyRelease, 0, Qt::NoModifier, QString(c));
+                }
+                qWarning().noquote() << "[textdlg] da go 2 dong, text=" << ed->toPlainText();
+                // Ctrl+Enter = OK (QShortcut bắt ở mức cửa sổ).
+                tap(QEvent::KeyPress, Qt::Key_Return, Qt::ControlModifier, QString());
+                tap(QEvent::KeyRelease, Qt::Key_Return, Qt::ControlModifier, QString());
+            });
+            poll.start();
+
+            fprintf(stdout, "TEXTDLG: hay go 'Dong 1{ENTER}Dong 2^{ENTER}' roi bam OK\n");
+            fflush(stdout);
+
+            // Bắn tín hiệu SAU khi waitLoop đã sẵn sàng. Queued (mặc định) là
+            // đúng: DirectConnection sẽ phát lại chính tín hiệu đó (đệ quy vô hạn).
+            QMetaObject::invokeMethod(tab->view, "textBoxRequested",
+                                      Q_ARG(int, 0),
+                                      Q_ARG(QRectF, QRectF(60.0, 600.0, 200.0, 40.0)));
+            waitLoop.exec();
+            poll.stop();
+            if (!sawDialog) {
+                fprintf(stdout, "TEXTDLG FAIL: hop thoai khong mo (het thoi gian)\n");
+                fflush(stdout);
+                return 1;
+            }
+        }
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+
+        // Đọc /Contents + số dòng /AP. Lấy HAI bản: bản app đọc được (đã
+        // chuẩn hoá \n) và bản THÔ trong file (phải có \r) — để chấm thấy
+        // ngay cả hai vế của đề 5.
+        QString contentsRaw, contentsApp;
+        int lines = 0;
+        {
+            auto* tb = w.currentTabForProbe();
+            if (tb && tb->annotMgr) {
+                const QList<AnnotInfo> list = tb->annotMgr->loadPage(0);
+                for (const AnnotInfo& ai : list)
+                    if (ai.type == QLatin1String("FreeText") && !ai.text.isEmpty())
+                        contentsApp = ai.text;
+            }
+        }
+        // 🔴 0927 LƯỢT 3: LƯU QUA ĐÚNG ĐƯỜNG CỦA NÚT SAVE (onSaveFile) — có
+        // materialize pagesNeedGenerate, giải phóng handle PDFium, vá /AP rồi
+        // replaceFileAtomically. Gọi saveDocument() trực tiếp (lượt trước) KHÔNG
+        // đi qua các bước đó ⇒ tệp ra không giống tệp người dùng thật sự lưu.
+        QString saveErr;
+        const bool saved = w.probeSaveViaGuiAsync(&saveErr);
+        if (!saved) {
+            fprintf(stdout, "TEXTDLG FAIL: save that bai: %s\n",
+                    saveErr.toUtf8().constData());
+            fflush(stdout);
+        }
+        w.close();   // đóng hẳn trước khi đọc lại tệp, giải phóng handle
+        for (int i = 0; i < 80; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        QString apText;
+        lines = _ftApLineCount(savePath, 0, -1, &apText);
+        const bool hasAp = !apText.isEmpty();
+        {   // /Contents THÔ trong file (đọc PDFium không qua readAnnotString).
+            PdfDocument::libAddRef();
+            PdfDocument d2;
+            if (d2.open(savePath)) {
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_PAGE p2 = FPDF_LoadPage(d2.raw(), 0);
+                if (p2) {
+                    // 🔴 0927 LƯỢT 3: tự dò annot FreeText, không hard-code 0 —
+                    // /Annots do QPDF viết lại nên thứ tự có thể đổi.
+                    FPDF_ANNOTATION a2 = nullptr;
+                    const int n2 = FPDFPage_GetAnnotCount(p2);
+                    for (int i2 = 0; i2 < n2; ++i2) {
+                        FPDF_ANNOTATION c2 = FPDFPage_GetAnnot(p2, i2);
+                        if (!c2) continue;
+                        const bool isFree = (FPDFAnnot_GetSubtype(c2) == FPDF_ANNOT_FREETEXT);
+                        FPDFPage_CloseAnnot(c2);
+                        if (isFree) { a2 = FPDFPage_GetAnnot(p2, i2); break; }
+                    }
+                    if (a2) {
+                        unsigned long n = FPDFAnnot_GetStringValue(a2, "Contents", nullptr, 0);
+                        if (n > 2) {
+                            std::vector<char16_t> b2(n / 2 + 1, 0);
+                            FPDFAnnot_GetStringValue(a2, "Contents",
+                                                     reinterpret_cast<FPDF_WCHAR*>(b2.data()), n);
+                            contentsRaw = QString::fromUtf16(b2.data());
+                        }
+                        FPDFPage_CloseAnnot(a2);
+                    }
+                    FPDF_ClosePage(p2);
+                }
+            }
+            PdfDocument::libRelease();
+        }
+        auto flatOf = [](QString v) {
+            v.replace(QLatin1Char('\r'), QLatin1String("\\r"));
+            v.replace(QLatin1Char('\n'), QLatin1String("\\n"));
+            return v;
+        };
+        // 🔴 0927 LUOT 4 (VIEC B): in DUNG khuon yeu cau cua owner —
+        //   TEXTDLG contents=<escape \n> lines=<n> hasAP=<0|1>
+        // đồng thứ tự rồi, luôn in ra ca hai dấng (stdout + log).
+        const QString flat = flatOf(contentsRaw);
+        fprintf(stdout, "TEXTDLG contents=%s lines=%d hasAP=%d\n",
+                flat.toUtf8().constData(), lines, hasAp ? 1 : 0);
+        fflush(stdout);
+        qWarning().noquote() << "TEXTDLG contents=" << flat
+                             << "appRead=" << flatOf(contentsApp)
+                             << "lines=" << lines << "hasAP=" << (hasAp ? 1 : 0);
+        return (lines >= 2 && hasAp && !contentsRaw.isEmpty()) ? 0 : 1;
+    }
+
+    // usage: --ftngoai-edit-probe <in.pdf> <out.pdf> <page> <index> <text>
+    // 🔴 0927 LUOT 6 / VIEC 1 (SPEC 0927 BUOC 2) - sua FreeText cua PHAN MEM
+    // KHAC bang DUNG DUONG CHUOT PHAI nguoi dung (chuot phai -> "Edit text…" ->
+    // hop nhap nhieu dong -> OK), LU bang DUNG DUONG Save that, roi DOC LAI
+    // tep da luu de in ket qua. KHONG tu khai "dat" - chi in so do.
+    // `text` dung "\n" LITERAL (hai ky tu) cho xuong dong.
+    // In: FTNGOAI ok=<0|1> lines=<n> hasAP=<0|1> origKept=<0|1> rcRemoved=<0|1>
+    // Ca am: go len annot Ink ngoai => FTNGOAI ok=0 lyDo=<...>
+    if (argc >= 7 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--ftngoai-edit-probe")) {
+        auto stripQ7 = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString inPath  = stripQ7(QString::fromLocal8Bit(argv[2]));
+        const QString outPath = stripQ7(QString::fromLocal8Bit(argv[3]));
+        const int pageIndex   = QString::fromLocal8Bit(argv[4]).toInt();
+        const int listIndex   = QString::fromLocal8Bit(argv[5]).toInt();
+        // "\n" LITERAL -> xuong dong that. Dung QStringLiteral("\\n") de tranh
+        // trinh bien dich C++ an chieu "\n" thanh newline.
+        QString newText = QString::fromUtf8(argv[6]);
+        newText.replace(QLatin1String("\\n"), QLatin1String("\n"));
+        QTextStream out(stdout);
+        if (!QFile::exists(inPath)) {
+            out << "FTNGOAI ok=0 lyDo=khong ton tai tep dau vao\n"; out.flush(); return 2;
+        }
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) {
+            out << "FTNGOAI ok=0 lyDo=khong copy duoc sang tep dau ra\n"; out.flush(); return 2;
+        }
+
+        // ---- ĐO LOẠI ANNOT mục tiêu TRƯỚC khi mở app (đọc tệp gốc, không
+        // tin lời). Cần biết annot có phải FreeText ngoài không để kết luận
+        // đúng (ca âm Ink/Square/Line/PolyLine phải bị TỪ CHỐI).
+        QString tgtType;
+        bool tgtForeign = false, tgtIsFreeText = false;
+        {
+            PdfDocument::libAddRef();
+            PdfDocument d0;
+            if (d0.open(inPath)) {
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_PAGE p0 = FPDF_LoadPage(d0.raw(), pageIndex);
+                if (p0) {
+                    FPDF_ANNOTATION a0 = FPDFPage_GetAnnot(p0, listIndex);
+                    if (a0) {
+                        switch (FPDFAnnot_GetSubtype(a0)) {
+                            case FPDF_ANNOT_FREETEXT: tgtType = "FreeText"; tgtIsFreeText = true; break;
+                            case FPDF_ANNOT_INK:      tgtType = "Ink";      break;
+                            case FPDF_ANNOT_SQUARE:   tgtType = "Square";   break;
+                            case FPDF_ANNOT_LINE:     tgtType = "Line";     break;
+                            case FPDF_ANNOT_TEXT:     tgtType = "Note";     break;
+                            default:                  tgtType = "Khac";     break;
+                        }
+                        tgtForeign = !(FPDFAnnot_HasKey(a0, "TRUID") || FPDFAnnot_HasKey(a0, "TRID"));
+                        FPDFPage_CloseAnnot(a0);
+                    }
+                    FPDF_ClosePage(p0);
+                }
+            }
+            PdfDocument::libRelease();
+        }
+
+        MainWindow w;
+        w.resize(1280, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(outPath);
+        for (int i = 0; i < 240; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(25);
+            _dismissModals();
+            if (i > 40 && w.probePageCount() > 0) break;
+        }
+        // ---- ĐI ĐÚNG ĐƯỜNG CHUOT PHAI: sửa qua probe gọi editSelectedAnnot.
+        QString guiErr;
+        const QString r = w.probeEditAnnotViaGui(pageIndex, listIndex, newText, &guiErr);
+        for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); _dismissModals(); }
+        if (!r.isEmpty()) {
+            out << "FTNGOAI ok=0 lyDo=" << guiErr << " (loai=" << tgtType
+                << ")\n"; out.flush();
+            w.close();
+            for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+            QFile::remove(outPath);   // that bai => khong de lai rac
+            return 1;
+        }
+        // ---- LƯU bằng DUNG ĐƯỜNG Save thật (onSaveFile), không mgr.saveDocument.
+        QString saveErr;
+        const bool saved = w.probeSaveViaGuiAsync(&saveErr);
+        w.close();
+        for (int i = 0; i < 80; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        if (!saved) {
+            out << "FTNGOAI ok=0 lyDo=save that bai: " << saveErr << "\n"; out.flush();
+            QFile::remove(outPath);
+            return 1;
+        }
+        // ---- ĐỌC LẠI tệp đã lưu: /Contents, /AP, /TR_AP_ORIG, /RC.
+        int savedLines = 0;
+        bool savedHasAp = false, origKept = false, rcRemoved = false, foundFreeText = false;
+        QString savedContents;
+        {
+            PdfDocument::libAddRef();
+            PdfDocument d2;
+            if (d2.open(outPath)) {
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_PAGE p2 = FPDF_LoadPage(d2.raw(), pageIndex);
+                if (p2) {
+                    const int n2 = FPDFPage_GetAnnotCount(p2);
+                    for (int i2 = 0; i2 < n2; ++i2) {
+                        FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(p2, i2);
+                        if (!a2) continue;
+                        if (FPDFAnnot_GetSubtype(a2) != FPDF_ANNOT_FREETEXT) { FPDFPage_CloseAnnot(a2); continue; }
+                        // Tim FreeText nào co /TR_CONTENTS_ORIG (= cai da sua).
+                        if (!FPDFAnnot_HasKey(a2, "TR_CONTENTS_ORIG")) { FPDFPage_CloseAnnot(a2); continue; }
+                        foundFreeText = true;
+                        origKept = FPDFAnnot_HasKey(a2, "TR_AP_ORIG") ? true : false;
+                        rcRemoved = FPDFAnnot_HasKey(a2, "RC") ? false : true;
+                        unsigned long n2c = FPDFAnnot_GetStringValue(a2, "Contents", nullptr, 0);
+                        if (n2c > 2) {
+                            std::vector<char16_t> b2c(n2c / 2 + 1, 0);
+                            FPDFAnnot_GetStringValue(a2, "Contents",
+                                reinterpret_cast<FPDF_WCHAR*>(b2c.data()), n2c);
+                            savedContents = QString::fromUtf16(b2c.data());
+                        }
+                        FPDFPage_CloseAnnot(a2);
+                        if (foundFreeText) break;
+                    }
+                    FPDF_ClosePage(p2);
+                }
+            }
+            PdfDocument::libRelease();
+        }
+        // So dong /Contents (chu hoa \r -> \n nhu app doc) va dong /AP that.
+        {
+            QString t = savedContents;
+            t.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+            savedLines = t.count(QLatin1Char('\n')) + 1;
+        }
+        QString apTxt;
+        _ftApLineCount(outPath, pageIndex, -1, &apTxt);
+        savedHasAp = !apTxt.isEmpty();
+        const int apLines = _ftApLineCount(outPath, pageIndex, -1, nullptr);
+        const bool ok = foundFreeText && savedHasAp && origKept && rcRemoved;
+        auto flatS7 = [](QString v) {
+            v.replace(QLatin1Char('\r'), QLatin1String("\\r"));
+            v.replace(QLatin1Char('\n'), QLatin1String("\\n"));
+            return v;
+        };
+        // 🔎 0927 LUOT 7: do khop khung DOC LAI TU /AP DA LUU (khong dung
+        // so tinh luc dung). rectBefore = /Rect cua tep DAU VAO.
+        double rectBefore[4] = {0, 0, 0, 0};
+        {
+            // Doc /Rect GOC tu tep dau vao (de in rectBefore).
+            PdfDocument::libAddRef();
+            PdfDocument d0m;
+            if (d0m.open(inPath)) {
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_PAGE p0m = FPDF_LoadPage(d0m.raw(), pageIndex);
+                if (p0m) {
+                    FPDF_ANNOTATION a0m = FPDFPage_GetAnnot(p0m, listIndex);
+                    if (a0m && FPDFAnnot_GetSubtype(a0m) == FPDF_ANNOT_FREETEXT) {
+                        FS_RECTF r0{};
+                        if (FPDFAnnot_GetRect(a0m, &r0)) {
+                            // 🔎 0927 LUOT 7 (sau review): PHẢI cùng thứ tự
+                            // với rectAfter (thô /Rect = x0,y0,x1,y1, y LÊN).
+                            // FS_RECTF là (left, top, right, bottom) với top =
+                            // maxY ⇒ hoán [0]=x0 [1]=y0 [2]=x1 [3]=y1.
+                            rectBefore[0] = qMin(r0.left, r0.right);
+                            rectBefore[1] = qMin(r0.top, r0.bottom);
+                            rectBefore[2] = qMax(r0.left, r0.right);
+                            rectBefore[3] = qMax(r0.top, r0.bottom);
+                        }
+                        FPDFPage_CloseAnnot(a0m);
+                    }
+                    FPDF_ClosePage(p0m);
+                }
+            }
+            PdfDocument::libRelease();
+        }
+        ForeignApFit fitM;
+        const bool fitOk = trMeasureForeignApFit(outPath, pageIndex, -1, &fitM);
+        auto rectStr = [](const double* r) {
+            return QString::number(r[0], 'f', 2) + QLatin1Char(',') +
+                   QString::number(r[1], 'f', 2) + QLatin1Char(',') +
+                   QString::number(r[2], 'f', 2) + QLatin1Char(',') +
+                   QString::number(r[3], 'f', 2);
+        };
+        out << "FTNGOAI ok=" << (ok ? 1 : 0)
+            << " lines=" << savedLines
+            << " hasAP=" << (savedHasAp ? 1 : 0)
+            << " origKept=" << (origKept ? 1 : 0)
+            << " rcRemoved=" << (rcRemoved ? 1 : 0)
+            << " apLines=" << apLines
+            << " contents=" << flatS7(savedContents).toUtf8().constData()
+            << " rectBefore=" << rectStr(rectBefore)
+            << " rectAfter=" << (fitOk ? rectStr(fitM.rectAfter) : QStringLiteral("0,0,0,0"))
+            << " maxLineW=" << QString::number(fitOk ? fitM.maxLineW : 0.0, 'f', 2)
+            << " innerW="   << QString::number(fitOk ? fitM.innerW   : 0.0, 'f', 2)
+            << " textH="    << QString::number(fitOk ? fitM.textH    : 0.0, 'f', 2)
+            << " innerH="   << QString::number(fitOk ? fitM.innerH   : 0.0, 'f', 2)
+            << " clipped="  << (fitOk ? fitM.clipped : 0)
+            << "\n";
+        out.flush();
+        fprintf(stdout, "FTNGOAI ok=%d lines=%d hasAP=%d origKept=%d rcRemoved=%d\n",
+                ok ? 1 : 0, savedLines, savedHasAp ? 1 : 0, origKept ? 1 : 0, rcRemoved ? 1 : 0);
+        fflush(stdout);
+        return ok ? 0 : 1;
+    }
+
+    // usage: --sidebar-edit-probe <in.pdf> <out.pdf>
+    // 🔴 0927 LƯỢT 4 (VIỆC C) — nghiệm thu ô SỬA COMMENT ở sidebar:
+    //   1) tạo FreeText CỦA TA 1 dòng "Ngan" + FreeText 3 dòng (có dấu)
+    //   2) mở MainWindow thật, tab Comments
+    //   3) đo: hàng 1 editable tại chỗ = 1, hàng 2 readOnly tại chỗ + nút ⤢
+    //   4) mở popup hàng 2 bằng ĐÚNG ĐƯỜNG bấm (click giả lập) → in popup/preLines
+    //   5) đặt chữ 4 dòng vào popup rồi accept() → lưu → đọc lại → in saved
+    // KHÔNG tự khai "đạt" thay người chấm: chỉ in số đo.
+    if (argc >= 4 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--sidebar-edit-probe")) {
+        auto stripS = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString inPath  = stripS(QString::fromLocal8Bit(argv[2]));
+        const QString outPath = stripS(QString::fromLocal8Bit(argv[3]));
+        QTextStream out(stdout);
+        if (!QFile::exists(inPath)) {
+            out << "SIDEBAR FAIL: file dau vao khong ton tai: " << inPath << "\n";
+            out.flush(); return 2;
+        }
+        QFile::remove(outPath);
+        if (!QFile::copy(inPath, outPath)) {
+            out << "SIDEBAR FAIL: khong copy duoc sang " << outPath << "\n";
+            out.flush(); return 2;
+        }
+        // Hàng 1 = chữ NGẮN 1 dòng (sửa tại chỗ được).
+        // Hàng 2 = chữ 3 DÒNG có dấu (bắt buộc chỉ-hiển-thị + nút ⤢).
+        const QString shortTxt = QString::fromUtf8("Ngan");
+        const QString multiTxt = QString::fromUtf8(
+            "Dong mot tieng Viet co dau\nDong hai cung co dau\nDong ba ket thuc");
+        const QString new4Lines = QString::fromUtf8(
+            "Sua dong 1\nSua dong 2 co dau\nSua dong 3\nSua dong 4 het");
+
+        MainWindow w;
+        w.resize(1280, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        w.openFile(outPath);
+        for (int i = 0; i < 240; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(25);
+            _dismissModals();
+            if (i > 40 && w.probePageCount() > 0) break;
+        }
+        // Tạo 2 FreeText CỦA TA trên trang 1 qua đúng đường app (annotMgr).
+        int idxShort = -1, idxMulti = -1;
+        {
+            auto* tb = w.currentTabForProbe();
+            if (!tb || !tb->annotMgr) {
+                out << "SIDEBAR FAIL: khong mo duoc tab\n"; out.flush(); return 1;
+            }
+            const float fs = 12.0f;
+            if (!tb->annotMgr->createInlineNote(
+                    0, trFreeTextFitRect(QRectF(60, 700, 220, 30), shortTxt, fs),
+                    shortTxt, QStringLiteral("sb"), false, QColor(0, 0, 0), fs)) {
+                out << "SIDEBAR FAIL: tao FreeText 1 dong that bai\n"; out.flush(); return 1;
+            }
+            if (!tb->annotMgr->createInlineNote(
+                    0, trFreeTextFitRect(QRectF(60, 640, 220, 30), multiTxt, fs),
+                    multiTxt, QStringLiteral("sb"), false, QColor(0, 0, 0), fs)) {
+                out << "SIDEBAR FAIL: tao FreeText 3 dong that bai\n"; out.flush(); return 1;
+            }
+            const QList<AnnotInfo> lst = tb->annotMgr->loadPage(0);
+            for (const AnnotInfo& ai : lst) {
+                if (ai.type != QLatin1String("FreeText")) continue;
+                if (idxShort < 0 && !ai.text.contains(QLatin1Char('\n'))) idxShort = ai.indexInPage;
+                if (idxMulti < 0 &&  ai.text.contains(QLatin1Char('\n'))) idxMulti = ai.indexInPage;
+            }
+        }
+        // Mở tab Comments THẬT (nút sidebar), rồi nạp danh sách chú thích.
+        w.probeSelectSidebarTab(2);
+        for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        w.probeRefreshComments(0);
+        for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+
+        auto* panel = w.probeThumbPanel();
+        if (!panel) { out << "SIDEBAR FAIL: khong lay duoc sidebar\n"; out.flush(); return 1; }
+        out << "SIDEBAR rows=" << panel->probeCommentRowCount()
+            << " idxShort=" << idxShort << " idxMulti=" << idxMulti << "\n";
+        out.flush();
+
+        // ── ĐO HÀNG 1: chữ ngắn 1 dòng ⇒ sửa TẠI CHỖ được (đề 1).
+        const auto r1 = panel->probeCommentRow(0, idxShort);
+        // ── ĐO HÀNG 2: chữ nhiều dòng ⇒ CHỈ-HIỂN-THỊ + nút ⤢ (đề 2 + 3).
+        const auto r2 = panel->probeCommentRow(0, idxMulti);
+
+        out << "SIDEBAR row1 exists=" << (r1.exists ? 1 : 0)
+            << " editableInPlace=" << (r1.editableInPlace ? 1 : 0)
+            << " tooltipAll=" << (r1.tooltipHasAllText ? 1 : 0) << "\n";
+        out << "SIDEBAR row2 exists=" << (r2.exists ? 1 : 0)
+            << " readOnlyInPlace=" << (r2.displayOnly ? 1 : 0)
+            << " hasExpandBtn=" << (r2.hasExpandBtn ? 1 : 0)
+            << " tooltipAll=" << (r2.tooltipHasAllText ? 1 : 0)
+            << " shownText=" << r2.text.toUtf8().constData() << "\n";
+        out.flush();
+
+        // ── MỞ POPUP hàng 2 bằng ĐÚNG ĐƯỜNG bấm: QPushButton::click() trên nút ⤢.
+        const bool opened = panel->probeOpenCommentPopup(0, idxMulti, -1, QString::fromUtf8("\xE2\xA4\xA2"));
+        int preLines = -1;
+        if (opened) {
+            const auto rp = panel->probeCommentRow(0, idxMulti);
+            preLines = rp.popupLines;
+        }
+        out << "SIDEBAR popup=" << (opened ? 1 : 0) << " preLines=" << preLines << "\n";
+        out.flush();
+        if (!opened) {
+            out << "SIDEBAR FAIL: khong mo duoc popup\n"; out.flush(); return 1;
+        }
+        // ── Đặt chữ 4 DÒNG rồi accept() đúng đường OK ⇒ emit commentTextEdited.
+        if (!panel->probeSetPopupTextAndAccept(new4Lines)) {
+            out << "SIDEBAR FAIL: khong dat duoc text vao popup\n"; out.flush(); return 1;
+        }
+        for (int i = 0; i < 40; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+
+        // ── LƯU qua đúng đường nút Save (onSaveFile), rồi đóng để nhả handle.
+        QString saveErr;
+        const bool saved = w.probeSaveViaGuiAsync(&saveErr);
+        if (!saved) {
+            out << "SIDEBAR FAIL: save that bai: " << saveErr << "\n"; out.flush(); return 1;
+        }
+        w.close();
+        for (int i = 0; i < 80; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+
+        // ── ĐỌC LẠI /Contents + /AP từ tệp đã lưu (tầng app, không phải tin lời).
+        int savedLines = 0;
+        bool savedHasAp = false;
+        QString savedContents;
+        {
+            PdfDocument::libAddRef();
+            PdfDocument d2;
+            if (d2.open(outPath)) {
+                QMutexLocker lk(&s_pdfiumMutex);
+                FPDF_PAGE p2 = FPDF_LoadPage(d2.raw(), 0);
+                if (p2) {
+                    const int n2 = FPDFPage_GetAnnotCount(p2);
+                    for (int i2 = 0; i2 < n2; ++i2) {
+                        FPDF_ANNOTATION c2 = FPDFPage_GetAnnot(p2, i2);
+                        if (!c2) continue;
+                        const bool isFree = (FPDFAnnot_GetSubtype(c2) == FPDF_ANNOT_FREETEXT);
+                        FPDFPage_CloseAnnot(c2);
+                        if (!isFree) continue;
+                        FPDF_ANNOTATION a2 = FPDFPage_GetAnnot(p2, i2);
+                        if (!a2) continue;
+                        // Doc /Contents goc trong file (PDFium, KHONG qua ham
+                        // tinh cua app) roi chuan hoa \r -> \n nhu app doc.
+                        unsigned long n2c = FPDFAnnot_GetStringValue(a2, "Contents", nullptr, 0);
+                        if (n2c > 2) {
+                            std::vector<char16_t> b2c(n2c / 2 + 1, 0);
+                            FPDFAnnot_GetStringValue(a2, "Contents",
+                                                     reinterpret_cast<FPDF_WCHAR*>(b2c.data()), n2c);
+                            QString t = QString::fromUtf16(b2c.data());
+                            t.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+                            if (t.contains(QLatin1Char('\n'))) { savedContents = t; FPDFPage_CloseAnnot(a2); break; }
+                        }
+                        FPDFPage_CloseAnnot(a2);
+                    }
+                    FPDF_ClosePage(p2);
+                }
+            }
+            PdfDocument::libRelease();
+            savedLines = savedContents.count(QLatin1Char('\n')) + 1;
+        }
+        QString apTxt;
+        _ftApLineCount(outPath, 0, -1, &apTxt);
+        savedHasAp = !apTxt.isEmpty();
+        auto flatS = [](QString v) {
+            v.replace(QLatin1Char('\r'), QLatin1String("\\r"));
+            v.replace(QLatin1Char('\n'), QLatin1String("\\n"));
+            return v;
+        };
+        out << "SIDEBAR saved lines=" << savedLines
+            << " hasAP=" << (savedHasAp ? 1 : 0)
+            << " contents=" << flatS(savedContents).toUtf8().constData() << "\n";
+        out.flush();
+        return 0;
+    }
+
+    // usage: --sidebar-popup-hold <in.pdf> [giay] [dark]
+    // 🔴 0927 LUOT 5 (LOI 3) - giu popup mo <giay> giay de CEO CHUP ANH.
+    // 🔴 0927 LUOT 6 / VIEC 2: them tham so TUY CHON "dark" de BAT
+    // Dark Mode truoc khi mo popup (CEO chup ca hai nen de so). Tham so nao
+    // nhan dang theo TEN, nen cau lenh cu co van chay: --sidebar-popup-hold
+    // <in.pdf> <giay> van y het nhu truoc.
+    // Giong het --sidebar-edit-probe, KHAC o cho: sau khi mo popup hang nhieu
+    // dong (bang DUNG duong bam nut, QPushButton::click) thi GIU NGUYEN popup
+    // mot khoang thoi gian cho den khi lenh het - dung QTimer, KHONG sleep
+    // (sleep se lam 1 event loop khong chay => cua so dong va khong ve).
+    // In ra: SIDEBAR hold popupGeom=<x,y,w,h> rowGeom=<x,y,w,h> screen=<w,h>
+    // Roi huy popup va thoat app.
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--sidebar-popup-hold")) {
+        auto stripH = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString inPath = stripH(QString::fromLocal8Bit(argv[2]));
+        // Vong 2 (aider-review): holdSec <= 0 se quit TRUOC khi cua so ve =>
+        // anh chup ra man hinh trong. San toi thieu 1 giay cho event loop.
+        // 🔴 0927 LUOT 6: tach theo TEN cac tham so tuy chon de cau
+        // "--sidebar-popup-hold <pdf> 5" cu khong doi y nghia. Chi nhan "dark"
+        // (khong phan biet hoa thuong) — thu khong ro thi im, co gi se bao loi.
+        double holdSec = 5.0;
+        bool wantDark = false;
+        for (int ai = 3; ai < argc; ++ai) {
+            const QString a = stripH(QString::fromLocal8Bit(argv[ai])).trimmed();
+            if (a.compare(QLatin1String("dark"), Qt::CaseInsensitive) == 0) wantDark = true;
+            else {
+                bool okNum = false;
+                const double v = a.toDouble(&okNum);
+                if (okNum) holdSec = v;
+            }
+        }
+        holdSec = qMax(1.0, holdSec);
+        QTextStream out(stdout);
+        if (!QFile::exists(inPath)) {
+            out << "SIDEBAR FAIL: file dau vao khong ton tai: " << inPath << "\n";
+            out.flush(); return 2;
+        }
+        // Ban sao rieng: KHONG ghi vao tep dau vao (CEO cap anh, khong sua).
+        const QString workPath = inPath + QStringLiteral(".holdwork.pdf");
+        QFile::remove(workPath);
+        // 0927 LUOT 5: xoa ban lam viec khi app CHET GIUA CHUNG (dong cua so
+        // / may tat) — tai cua so khong chay. Xoa file nay tren phan nhanh
+        // trong %TEMP% cua chinh may CEO dang dung, KHONG phai tep goc.
+        struct HoldWorkGuard {
+            QString p;
+            ~HoldWorkGuard() { if (!p.isEmpty()) QFile::remove(p); }
+        } holdGuard{ workPath };
+        if (!QFile::copy(inPath, workPath)) {
+            out << "SIDEBAR FAIL: khong copy duoc sang " << workPath << "\n";
+            out.flush(); return 2;
+        }
+        // Hang nhieu dong - dung 3 dong co dau nhu phan nghiem thu truoc.
+        const QString multiTxt = QString::fromUtf8(
+            "Dong mot tieng Viet co dau\nDong hai cung co dau\nDong ba ket thuc");
+        const QString shortTxt = QString::fromUtf8("Ngan");
+
+        MainWindow w;
+        w.resize(1280, 900);
+        w.show();
+        QCoreApplication::processEvents();
+        // 🔴 0927 LUOT 6 / VIEC 2: bat Dark Mode TRUOC khi mo tep va truoc
+        // khi mo popup, de popup lay dung theme ma CEO dang chup.
+        if (wantDark && !w.probeSetDarkMode(true)) {
+            out << "SIDEBAR FAIL: khong bat duoc Dark Mode\n"; out.flush(); return 1;
+        }
+        w.openFile(workPath);
+        for (int i = 0; i < 240; ++i) {
+            QCoreApplication::processEvents();
+            QThread::msleep(25);
+            _dismissModals();
+            if (i > 40 && w.probePageCount() > 0) break;
+        }
+        int idxMulti = -1;
+        {
+            auto* tb = w.currentTabForProbe();
+            if (!tb || !tb->annotMgr) {
+                out << "SIDEBAR FAIL: khong mo duoc tab\n"; out.flush(); return 1;
+            }
+            const float fs = 12.0f;
+            if (!tb->annotMgr->createInlineNote(
+                    0, trFreeTextFitRect(QRectF(60, 700, 220, 30), shortTxt, fs),
+                    shortTxt, QStringLiteral("sb"), false, QColor(0, 0, 0), fs) ||
+                !tb->annotMgr->createInlineNote(
+                    0, trFreeTextFitRect(QRectF(60, 640, 220, 30), multiTxt, fs),
+                    multiTxt, QStringLiteral("sb"), false, QColor(0, 0, 0), fs)) {
+                out << "SIDEBAR FAIL: tao FreeText that bai\n"; out.flush(); return 1;
+            }
+            const QList<AnnotInfo> lst = tb->annotMgr->loadPage(0);
+            for (const AnnotInfo& ai : lst) {
+                if (ai.type != QLatin1String("FreeText")) continue;
+                if (idxMulti < 0 && ai.text.contains(QLatin1Char('\n'))) idxMulti = ai.indexInPage;
+            }
+        }
+        w.probeSelectSidebarTab(2);
+        for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+        w.probeRefreshComments(0);
+        for (int i = 0; i < 60; ++i) { QCoreApplication::processEvents(); QThread::msleep(25); }
+
+        auto* panel = w.probeThumbPanel();
+        if (!panel) {
+            out << "SIDEBAR FAIL: khong lay duoc sidebar\n"; out.flush(); return 1;
+        }
+        // MO POPUP bang DUNG DUONG BAM NUT (QPushButton::click), nhu nguoi dung.
+        if (!panel->probeOpenCommentPopup(0, idxMulti)) {
+            out << "SIDEBAR FAIL: khong mo duoc popup\n"; out.flush(); return 1;
+        }
+        // Vong 2 (aider-review "KHONG CHAC"): openCommentPopup() goi dlg->move()
+        // theo sizeHint TRUOC khi widget duoc polish/layout xong, nen geometry
+        // doc o day co the lech so voi hinh CEO chup. Bom vong event de layout
+        // chay cho xong ROI moi lay toa do.
+        for (int i = 0; i < 6; ++i) { QCoreApplication::processEvents(); QThread::msleep(30); }
+        QRect pg, rg;
+        if (!panel->probePopupGeometry(&pg, &rg)) {
+            out << "SIDEBAR FAIL: popup khong con mo\n"; out.flush(); return 1;
+        }
+        QScreen* scr = QApplication::primaryScreen();
+        const QSize sc = scr ? scr->size() : QSize(0, 0);
+        out << "SIDEBAR hold dark=" << (wantDark ? 1 : 0)
+            << " popupGeom=" << pg.x() << "," << pg.y() << "," << pg.width() << "," << pg.height()
+            << " rowGeom=" << rg.x() << "," << rg.y() << "," << rg.width() << "," << rg.height()
+            << " screen=" << sc.width() << "," << sc.height() << "\n";
+        out.flush();
+
+        // QTimer chay het event loop => cua so con ve, chu khong dung lai.
+        QTimer::singleShot(static_cast<int>(holdSec * 1000.0), qApp, []() {
+            QCoreApplication::quit();
+        });
+        const int rc = app.exec();
+        panel->closeCommentPopupIfOpen();
+        return rc;   // holdGuard xoa ban lam viec
+    }
+
+    // usage: --markup-mouse-probe <pdf> [page1Based=1]
+    // 🔴 LƯỢT 39p (Sonnet — PROBE TEST-ONLY, KHONG doi hanh vi app): tai hien DUNG
+    // duong CHUOT THAT nguoi dung di khi ve markup o Single view ("View Quality &
+    // Edit Comments", tuc probeSetFastMode(false) — noi DUY NHAT PdfGpuView nhan
+    // mouseMoveEvent de ve markup, xem PdfGpuView::mousePressEvent/mouseMoveEvent/
+    // mouseReleaseEvent). Muc dich: CHUNG MINH hay BAC BO loi "sau khi ve markup,
+    // overlay khong duoc dung lai" (MainWindow::refreshAnnotVisuals, cong `coAnh`
+    // — xem MainWindow.cpp.bak-r39-0930 cho logic TRUOC sua).
+    // Gui QMouseEvent qua QApplication::sendEvent toi probeCurrentView() — KHONG
+    // goi tat probeCreateNote/probeCreateText — de di DUNG duong tao shapeCommit/
+    // textBoxRequested ma nguoi dung that di qua.
+    // In (khuon co dinh, doc bang script):
+    //   MOUSEPROBE step=<n> tool=<ten> annots=<probeAnnotCount> visuals=<probeVisualCount(page)>
+    //               ok=<0|1> t=<0s|3s|10s>
+    //   MOUSEPROBE select tool=<ten> selected=<0|1>
+    //   MOUSEPROBE step=stress tool=Rectangle6x annots=<n> visuals=<n> ok=<0|1>
+    //   MOUSEPROBE step=afterzoom tool=- annots=<n> visuals=<n> ok=<0|1>
+    //   MOUSEPROBE: PASS   |   MOUSEPROBE: FAIL <ly do buoc dau tien that bai>
+    if (argc >= 3 && QString::fromLocal8Bit(argv[1]) == QLatin1String("--markup-mouse-probe")) {
+        auto stripQ3 = [](QString v) {
+            if (v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+                return v.mid(1, v.size() - 2);
+            return v;
+        };
+        const QString pdfPath = stripQ3(QString::fromLocal8Bit(argv[2]));
+        const int page1Based = (argc >= 4) ? QString::fromLocal8Bit(argv[3]).toInt() : 1;
+        const int pageIdx = qMax(0, page1Based - 1);
+        if (!_probeRequireFile(pdfPath, "file PDF")) return 2;
+
+        QTextStream out(stdout);
+        bool overallOk = true;
+        QString failReason;
+        auto noteFail = [&](const QString& r) {
+            if (overallOk) { overallOk = false; failReason = r; }
+        };
+
+        MainWindow w;
+        w.resize(1600, 1000);
+        w.show();
+        QCoreApplication::processEvents();
+
+        auto spin = [](int ms) {
+            for (int i = 0; i < qMax(1, ms / 25); ++i) {
+                QCoreApplication::processEvents();
+                QThread::msleep(25);
+            }
+        };
+
+        w.openFile(pdfPath);
+        // Buoc 1: cho tai lieu mo + trang hien ra (toi da 240s — file MEP
+        // file MEP mau nang 255MB, 60s khong du theo ghi chu
+        // --owner3tab-probe ve file nay).
+        {
+            const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 240000;
+            while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+                QThread::msleep(25);
+                _dismissModals();
+                auto* tb0 = w.probeCurrentTab();
+                if (tb0 && tb0->doc && tb0->doc->isOpen() && w.probePageCount() > 0) break;
+            }
+        }
+        {
+            auto* tb0 = w.probeCurrentTab();
+            if (!tb0 || !tb0->doc || !tb0->doc->isOpen()) {
+                out << "MOUSEPROBE: FAIL tai lieu khong mo duoc trong 60s\n"; out.flush();
+                return 2;
+            }
+        }
+        spin(2000);   // trang render lan dau
+
+        // Buoc 2: Single view ("View Quality & Edit Comments") — noi DUY NHAT
+        // PdfGpuView nhan chuot de ve markup moi (Continuous KHONG ve markup moi).
+        w.probeSetFastMode(false);
+        spin(1500);
+        w.probeSetPage(pageIdx);
+        spin(1500);
+
+        auto* view = qobject_cast<PdfGpuView*>(w.probeCurrentView());
+        if (!view) {
+            out << "MOUSEPROBE: FAIL khong lay duoc PdfGpuView (probeCurrentView null)\n"; out.flush();
+            return 2;
+        }
+        const QSizeF pageSz = view->pageSizePt();
+        if (pageSz.isEmpty()) {
+            out << "MOUSEPROBE: FAIL pageSizePt rong — trang chua san sang\n"; out.flush();
+            return 2;
+        }
+        const double W = pageSz.width(), H = pageSz.height();
+
+        // sendClick: gui press -> N move (giu LeftButton) -> release toi DUNG
+        // widget cua PdfGpuView, toa do quy doi bang pdfToWidget (page-local,
+        // Y-down — CUNG he quy chieu ma PdfGpuView::widgetToPdf dung noi bo,
+        // KHONG phai PDF-Y-len-tu-day; xem PdfGpuView::mouseReleaseEvent).
+        auto sendClick = [&](QPointF startPagePt, QPointF endPagePt, int moves) {
+            const QPointF a = view->pdfToWidget(startPagePt);
+            const QPointF b = view->pdfToWidget(endPagePt);
+            const QPointF g0 = view->mapToGlobal(a.toPoint());
+            QMouseEvent press(QEvent::MouseButtonPress, a, g0,
+                              Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(view, &press);
+            for (int i = 1; i <= moves; ++i) {
+                const QPointF p = a + (b - a) * (double(i) / moves);
+                const QPointF g = view->mapToGlobal(p.toPoint());
+                QMouseEvent mv(QEvent::MouseMove, p, g,
+                              Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+                QApplication::sendEvent(view, &mv);
+                QCoreApplication::processEvents();
+            }
+            const QPointF gb = view->mapToGlobal(b.toPoint());
+            QMouseEvent release(QEvent::MouseButtonRelease, b, gb,
+                                Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+            QApplication::sendEvent(view, &release);
+        };
+
+        // 4 cong cu: id = static_cast<int>(PdfGpuView::ViewTool) (xem PdfGpuView.h:40
+        // va MainWindow::probeSelectAnnotTool). Rectangle=4, Cloud=6, Line=2, FreeText=7.
+        struct ToolDef { int id; const char* name; QPointF a, b; };
+        const QVector<ToolDef> tools = {
+            { 4, "Rectangle", QPointF(0.08 * W, 0.10 * H), QPointF(0.25 * W, 0.22 * H) },
+            { 6, "Cloud",     QPointF(0.35 * W, 0.10 * H), QPointF(0.52 * W, 0.22 * H) },
+            { 2, "Line",      QPointF(0.62 * W, 0.10 * H), QPointF(0.80 * W, 0.22 * H) },
+            { 7, "FreeText",  QPointF(0.08 * W, 0.30 * H), QPointF(0.30 * W, 0.36 * H) },
+        };
+        QVector<QPointF> centers;
+
+        int step = 0;
+        for (const ToolDef& td : tools) {
+            ++step;
+            w.probeSelectAnnotTool(td.id);
+            spin(200);
+
+            if (td.id == 7) {
+                // FreeText: mouseReleaseEvent goi textBoxRequested -> MainWindow mo
+                // NoteInputDialog::exec() (VONG EVENT LONG). Phai dung vong poll SAN
+                // SANG TRUOC khi gui su kien release (cung ky thuat --textdlg-probe
+                // da chung minh chay duoc o file nay, xem khoi --textdlg-probe o tren):
+                // timer duoc Qt xu ly NGAY CA khi dang trong exec() long.
+                QTimer poll;
+                poll.setInterval(80);
+                bool sawDialog = false, typed = false, committed = false;
+                int polls = 0;
+                QObject::connect(&poll, &QTimer::timeout, [&]() {
+                    if (++polls > 150) {   // 12s tran — dung de treo vo han
+                        for (QWidget* tw : QApplication::topLevelWidgets()) {
+                            if (auto* d = qobject_cast<QDialog*>(tw)) {
+                                if (d->isWindow() && d->findChild<QPlainTextEdit*>()
+                                    && d->windowTitle().contains(QStringLiteral("text"), Qt::CaseInsensitive)) {
+                                    d->reject();
+                                    break;
+                                }
+                            }
+                        }
+                        poll.stop();
+                        return;
+                    }
+                    QWidget* dlgNow = nullptr;
+                    for (QWidget* tw : QApplication::topLevelWidgets()) {
+                        if (!tw->isWindow()) continue;
+                        if (!tw->findChild<QPlainTextEdit*>()) continue;
+                        if (!tw->windowTitle().contains(QStringLiteral("text"), Qt::CaseInsensitive)) continue;
+                        dlgNow = tw; break;
+                    }
+                    if (!dlgNow) return;
+                    sawDialog = true;
+                    if (typed) return;
+                    auto* ed = dlgNow->findChild<QPlainTextEdit*>();
+                    if (!ed) return;
+                    ed->setFocus();
+                    auto tap = [ed](QEvent::Type ty, int key, Qt::KeyboardModifiers mo, const QString& t) {
+                        QApplication::sendEvent(ed, new QKeyEvent(ty, key, mo, t));
+                    };
+                    // Go that: "abc" <Enter=xuong dong> "def" roi Ctrl+Enter = OK
+                    // (QShortcut cua NoteInputDialog, xem NoteInputDialog.h).
+                    for (QChar c : QStringLiteral("abc")) {
+                        tap(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+                        tap(QEvent::KeyRelease, 0, Qt::NoModifier, QString(c));
+                    }
+                    tap(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
+                    tap(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r"));
+                    for (QChar c : QStringLiteral("def")) {
+                        tap(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+                        tap(QEvent::KeyRelease, 0, Qt::NoModifier, QString(c));
+                    }
+                    typed = true;
+                    tap(QEvent::KeyPress, Qt::Key_Return, Qt::ControlModifier, QString());
+                    tap(QEvent::KeyRelease, Qt::Key_Return, Qt::ControlModifier, QString());
+                    committed = true;
+                });
+                poll.start();
+                sendClick(td.a, td.b, 4);   // release nay se mo QDialog::exec() long
+                poll.stop();
+                if (!sawDialog) {
+                    out << "MOUSEPROBE step=" << step << " tool=FreeText FAIL hop nhap khong mo\n";
+                    noteFail(QStringLiteral("FreeText: hop nhap khong mo (bo qua rieng FreeText)"));
+                } else if (!committed) {
+                    out << "MOUSEPROBE step=" << step << " tool=FreeText FAIL khong go/commit duoc\n";
+                    noteFail(QStringLiteral("FreeText: khong go/commit duoc hop nhap"));
+                }
+            } else {
+                sendClick(td.a, td.b, 4);
+            }
+            centers.append((td.a + td.b) / 2.0);
+            spin(300);
+
+            auto printCheck = [&](const char* tSuffix) {
+                // LƯỢT 40: dùng per-page count thay vì toàn bộ document
+                const int annotsN = w.probeAnnotCountPerPage(pageIdx);
+                const int visualsN = w.probeVisualCount(pageIdx);
+                const bool okN = (visualsN >= annotsN);
+                out << "MOUSEPROBE step=" << step << " tool=" << td.name
+                    << " annots=" << annotsN << " visuals=" << visualsN
+                    << " ok=" << (okN ? 1 : 0) << " t=" << tSuffix << "\n";
+                out.flush();
+                if (!okN) noteFail(QStringLiteral("step %1 tool=%2 t=%3 visuals(%4)<annots(%5)")
+                                       .arg(step).arg(QLatin1String(td.name)).arg(QLatin1String(tSuffix)).arg(visualsN).arg(annotsN));
+            };
+            printCheck("0s");
+            spin(3000);
+            printCheck("3s");
+            spin(7000);   // tong ~10s ke tu luc ve xong
+            printCheck("10s");
+        }
+
+        // Buoc chon: chuyen Pan (id=0), bam giua tung markup vua tao, doc co
+        // duoc CHON hay khong qua getter chi-doc probeHasSelection() (LUOT 39p).
+        // 🔴 LƯỢT 40 (fix): yêu cầu bấm lần 1 PHẢI chọn được — không còn retry.
+        // Hàm onAnnotPick giờ dùng visuals fallback khi lock ban, nên không nên
+        // bị bỏ sót click nữa. Nếu vẫn sót thì là lỗi thực, cần fix thêm.
+        w.probeSelectAnnotTool(0);
+        spin(1500);
+        for (int i = 0; i < centers.size() && i < tools.size(); ++i) {
+            auto clickCenter = [&]() {
+                const QPointF wpt = view->pdfToWidget(centers[i]);
+                const QPointF g = view->mapToGlobal(wpt.toPoint());
+                QMouseEvent press(QEvent::MouseButtonPress, wpt, g, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                QApplication::sendEvent(view, &press);
+                QMouseEvent release(QEvent::MouseButtonRelease, wpt, g, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                QApplication::sendEvent(view, &release);
+            };
+            clickCenter();
+            spin(300);
+            bool selectedFirst = w.probeHasSelection();
+            out << "MOUSEPROBE select tool=" << tools[i].name << " selected_first=" << (selectedFirst ? 1 : 0) << "\n";
+            out.flush();
+            if (!selectedFirst) noteFail(QStringLiteral("select tool=%1 khong chon duoc LAN 1 (fix chưa hết)")
+                                              .arg(QLatin1String(tools[i].name)));
+        }
+
+        // Buoc nhoi (nhu owner mo ta): 6 markup nua that nhanh, roi zoom in/out
+        // that (probeSetZoomSingle — cung API nut +/- Single dung), roi dem lai.
+        w.probeSelectAnnotTool(4);   // Rectangle
+        spin(100);
+        for (int i = 0; i < 6; ++i) {
+            const double rowY = 0.45 + (i % 3) * 0.10;
+            const double colX = 0.08 + (i / 3) * 0.45;
+            sendClick(QPointF(colX * W, rowY * H), QPointF(colX * W + 0.15 * W, rowY * H + 0.08 * H), 3);
+            spin(100);
+        }
+        spin(500);
+        {
+            // LƯỢT 40: dùng per-page count
+            const int annotsN = w.probeAnnotCountPerPage(pageIdx);
+            const int visualsN = w.probeVisualCount(pageIdx);
+            const bool okN = (visualsN >= annotsN);
+            out << "MOUSEPROBE step=stress tool=Rectangle6x annots=" << annotsN
+                << " visuals=" << visualsN << " ok=" << (okN ? 1 : 0) << "\n";
+            out.flush();
+            if (!okN) noteFail(QStringLiteral("stress visuals(%1)<annots(%2)").arg(visualsN).arg(annotsN));
+        }
+
+        w.probeSetZoomSingle(2.0);
+        spin(1500);
+        w.probeSetZoomSingle(1.0);
+        spin(1500);
+        {
+            // LƯỢT 40: dùng per-page count
+            const int annotsN = w.probeAnnotCountPerPage(pageIdx);
+            const int visualsN = w.probeVisualCount(pageIdx);
+            const bool okN = (visualsN >= annotsN);
+            out << "MOUSEPROBE step=afterzoom tool=- annots=" << annotsN
+                << " visuals=" << visualsN << " ok=" << (okN ? 1 : 0) << "\n";
+            out.flush();
+            if (!okN) noteFail(QStringLiteral("afterzoom visuals(%1)<annots(%2)").arg(visualsN).arg(annotsN));
+        }
+
+        if (overallOk) out << "MOUSEPROBE: PASS\n";
+        else out << "MOUSEPROBE: FAIL " << failReason << "\n";
+        out.flush();
+        return overallOk ? 0 : 1;
+    }
+
+    g_trRealAppPath = true;   // LƯỢT 36: đường app thật — thoát như cũ, KHÔNG fast-kill
     MainWindow window;
     window.setWindowTitle("TorReader PDF");
     window.resize(1280, 800);
@@ -6993,10 +10446,46 @@ int main(int argc, char* argv[]) {
     // Use QCoreApplication::arguments() (Qt uses GetCommandLineW on Windows,
     // preserving Unicode) instead of argv, which is ANSI codepage (CP1258) and
     // breaks Vietnamese two-sign filenames like "TRIẾN".
-    const QStringList cliArgs = QCoreApplication::arguments();
+    // 0927 LƯỢT 12: Qt trên Windows TỰ DỰNG LẠI argv từ GetCommandLineW ⇒ dù đã bỏ
+    // cờ khỏi argv ở đầu main, nó VẪN còn ở arguments(); lọc ở đây để cửa sổ vẫn mở
+    // đúng tệp. Không có cờ ⇒ removeAll là no-op, hành vi y như cũ.
+    QStringList cliArgs = QCoreApplication::arguments();
+    cliArgs.removeAll(QLatin1String("--pool-lock"));     // cờ đã gỡ — vẫn lọc cho tệp cũ
+    cliArgs.removeAll(QLatin1String("--pool-song-par"));  // cờ tái hiện của LƯỢT 12
+    // 0927 LƯỢT 11: bỏ MỌI cờ trong bảng 0927 (--no-*, --thoat-cham) chứ không chỉ
+    // --pool-lock — nếu không, `--thoat-cham` còn trong arguments() và app cứ
+    // thử mở một tệp tên "--thoat-cham". Cùng cơ chế với chỗ bỏ cờ khỏi argv.
+    {
+        int nFlags = 0;
+        const TrBisectFlag* flags = trBisectFlags(&nFlags);
+        for (int f = 0; f < nFlags; ++f) cliArgs.removeAll(QLatin1String(flags[f].cli));
+    }
     if (cliArgs.size() > 1)
         window.openFile(cliArgs.at(1));
 #endif
 
-    return app.exec();
+    // 0927 LƯỢT 11 — điểm đặt THOÁT NHANH của app thật. exec() trả về ⇔ cửa sổ đã
+    // đóng và closeEvent đã chạy hết (nếu user bấm Cancel thì cửa sổ không đóng và
+    // exec() không trả về) ⇒ mọi việc bắt buộc xong, an toàn để huỷ tiến trình.
+    // `window` là biến cục bộ ⇒ lệnh này CỐ TÌNH chạy TRƯỚC hàm huỷ của nó.
+    const int rc = app.exec();
+    trThoatNhanh(rc, &window);
+    return rc;
+}
+
+// 🔴 LƯỢT 36 (mục 0) — wrapper: probe về tới đây là CÒN task nền sống ⇒ giết tiến
+// trình sau khi flush, không chạy hàm huỷ (xem g_trRealAppPath ở đầu file).
+int main(int argc, char* argv[]) {
+    const int rc = trMainImpl(argc, argv);
+    if (g_trRealAppPath) return rc;   // app thật: trThoatNhanh đã xử lý (hoặc --thoat-cham)
+    fflush(nullptr);                  // stdout+stderr của probe → file .txt của bat
+    QSettings().sync();               // settings probe vừa đổi (dark mode…) không mất
+    g_logFile.flush();
+    g_logFile.close();
+#ifdef Q_OS_WIN
+    if (!::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(rc))) ::_exit(rc);
+#else
+    _exit(rc);
+#endif
+    return rc;   // không tới được
 }

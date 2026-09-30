@@ -5,6 +5,7 @@
 #include "../core/PageCache.h"
 #include "../core/OcrEngine.h"
 #include "../core/PdfiumLock.h"
+#include "../core/DocTaskGate.h"
 
 #include <QSettings>
 #include <QFileInfo>
@@ -305,7 +306,23 @@ void OcrPanel::ensureHasTextKnown() {
     FPDF_DOCUMENT d = raw;
     const int pg = page;
     QPointer<OcrPanel> self(this);
-    (void)QtConcurrent::run([d, pg, self]() {
+    // 🔴 0928 LƯỢT 22 (reviewer mục 2): token ĐĂNG KÝ LÚC SPAWN + RAII move —
+    // beginClose thấy cả task còn xếp hàng.
+    // 0928 LƯỢT 14: token sổ việc nền — tryAcquireTextPage() mượn TEXTPAGE của
+    // doc; `(void)` nghĩa là QFuture bị bỏ rơi hoàn toàn, không chờ được.
+    trdoc::Task task(d, "ocrPanel/hoiCoText");
+    (void)QtConcurrent::run([task = std::move(task), d, pg, self]() {
+        // 🔴 0928 LƯỢT 13 — đây là việc NỀN thuần (chỉ hỏi trang này có text hay
+        // không), KHÔNG hiện gì cho người dùng. Log khoachung cho thấy nó chờ
+        // khoá PDFium 337 lần, tới 2915 ms, chính vì không ai nhường. Nay trang
+        // đang hiển thị đang chờ thì nhường; ô "có text" sẽ hỏi lại ở nhịp retry
+        // sẵn có (armHasTextRetry) — trễ 1 s, không ai thấy.
+        if (pdfiumUrgentPending()) {
+            QMetaObject::invokeMethod(qApp, [self, pg]() {
+                if (self) { self->m_hasTextChecking.remove(pg); self->armHasTextRetry(); }
+            }, Qt::QueuedConnection);
+            return;
+        }
         bool done = false, has = false;
         {
             TimedPdfiumLock lk(__FILE__, __LINE__);

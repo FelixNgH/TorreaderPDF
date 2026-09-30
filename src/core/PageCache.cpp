@@ -1,13 +1,379 @@
 #include "PageCache.h"
 #include "PdfCoords.h"
 #include "PdfiumLock.h"
+#include "DocTaskGate.h"
+#include "Bisect.h"
 #include <fpdf_edit.h>
+#include <fpdf_text.h>
 #include <QMutexLocker>
 #include <QtConcurrent>
 #include <QElapsedTimer>
+#include <QAtomicInteger>
 #include <QDebug>
+#include <QFile>
+#include <QDir>
+#include <QDateTime>
+#include <QThread>
 
 extern QMutex s_pdfiumMutex;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [closeorder] 0927 LƯỢT 2 — dem handle PDFium con song theo tung FPDF_DOCUMENT.
+// La NUT GI: chi giu khoa rieng, khong bao gio goi PageCache/PDFium. Vì vậy an
+// toan khi bi goi tu noi dang giu PageCache::s_mutex (closeEntry).
+// ═══════════════════════════════════════════════════════════════════════════════
+namespace {
+struct CloseCount { int pages = 0; int texts = 0; int renders = 0; };
+QMutex                s_traceMutex;
+QHash<FPDF_DOCUMENT, CloseCount> s_trace;
+QSet<FPDF_DOCUMENT>   s_traceDocs;
+QAtomicInteger<quint64> s_traceSeq{0};
+
+// ── [closeorder] LƯỢT 7: SỔ KHAI THÁC handle PDFium (xem PageCache.h) ──────────
+// Nhớ handle ĐÃ đóng + nơi đóng lần đầu, để phát hiện đóng 2 lần / dùng sau khi
+// đóng — đúng thứ mà bộ đếm theo-doc của lượt 2-6 không nhìn thấy.
+QHash<FPDF_PAGE,     const char*> s_closedPage;
+QHash<FPDF_TEXTPAGE, const char*> s_closedText;
+// Render tiến trình còn treo, theo (doc,page).
+QHash<FPDF_PAGE, QPair<FPDF_DOCUMENT, int>> s_renderDepth;
+
+bool closeOrderOn() {
+    static const bool on = qgetenv("TORREADER_CLOSEORDER") != QByteArray("0");
+    return on;
+}
+// So thu tu toan cuc: nhieu luong ve cung luc, phai duy nhat de doc lai hieu dung.
+quint64 nextSeq() { return s_traceSeq.fetchAndAddOrdered(1) + 1; }
+
+// ── FILE BANG CHUNG: %TEMP%\torreader_closeorder.log ──────────────────────────
+// 0927 LƯỢT 2: log chinh (torreader.log) co the MAT DONG CUOI khi tien trinh
+// chet trong pdfium.dll — do la thu duoc xac nhan (khong thay DOC-CLOSE nao).
+// File nay mo Append + FLUSH TUNG DONG nen luon doc duoc toi dong chet.
+// Dat duong dan bang TORREADER_CLOSEORDER_LOG de ghi ra cho khac.
+void closeOrderFile(const QString& line) {
+    static QMutex   fMutex;
+    static QFile    f;
+    static bool     tried = false;
+    QMutexLocker lk(&fMutex);
+    if (!tried) {
+        tried = true;
+        QString path = QString::fromLocal8Bit(qgetenv("TORREADER_CLOSEORDER_LOG"));
+        if (path.isEmpty())
+            path = QDir::tempPath() + QLatin1String("/torreader_closeorder.log");
+        f.setFileName(path);
+        f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
+    }
+    if (!f.isOpen()) return;
+    f.write(line.toUtf8());
+    f.write("\n");
+    f.flush();          // BAT BUOC: dong chet phai con san o dia
+}
+
+// GHI RA HAI NOI: file rieng (luon) + log chinh (theo co). `tid=` la MA LUONG
+// — 0927 LƯỢT 2: biet thu tu ma khong biet luong nao la vung chet thi vo dung.
+void sink(quint64 seq, const QString& body, bool warn) {
+    const QString line = QStringLiteral("[closeorder] #%1 %2 tid=%3")
+                             .arg(seq, 6, 10, QLatin1Char('0'))
+                             .arg(body)
+                             .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16);
+    closeOrderFile(line);
+    if (!closeOrderOn()) return;
+    if (warn) qWarning().noquote() << line;
+    else      qDebug().noquote()   << line;
+}
+} // namespace
+
+void PdfCloseTrace::docOpen(FPDF_DOCUMENT d, const char* where) {
+    if (!d) return;
+    PageCache::documentOpened(d);   // 0927 LƯỢT 7: bỏ cờ "doc đã dọn" của PageCache
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        s_traceDocs.insert(d);
+        s_trace[d];
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("DOC-OPEN  doc=%1 tai=%2 pages=0 texts=0")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(QString::fromLatin1(where)), false);
+}
+
+void PdfCloseTrace::docCloseBegin(FPDF_DOCUMENT d, const char* where) {
+    if (!d) return;
+    CloseCount c;
+    bool known = false;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_trace.constFind(d);
+        if (it != s_trace.constEnd()) { c = it.value(); known = true; }
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("DOC-CLOSE-BEGIN doc=%1 tai=%2 pages=%3 texts=%4 %5 taiLieuDangSong=%6")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(QString::fromLatin1(where))
+                   .arg(known ? c.pages : -1)
+                   .arg(known ? c.texts : -1)
+                   .arg(known && (c.pages || c.texts)
+                            ? QStringLiteral("<<< CON SOT: %1 page / %2 textpage CHUA DONG")
+                                  .arg(c.pages).arg(c.texts)
+                            : QStringLiteral("sach"))
+                   .arg(liveDocs()),
+         true);
+}
+
+void PdfCloseTrace::docCloseDone(FPDF_DOCUMENT d, const char* where) {
+    if (!d) return;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        s_trace.remove(d);
+        s_traceDocs.remove(d);
+        seq = nextSeq();
+    }
+    // Sau lenh FPDF_CloseDocument: neu co dong nay thi lenh do da ve; thieu dong
+    // nay ⇒ chet NGAY TRONG FPDF_CloseDocument.
+    sink(seq, QStringLiteral("DOC-CLOSE-DONE  doc=%1 tai=%2 (da qua FPDF_CloseDocument)")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(QString::fromLatin1(where)), true);
+}
+
+void PdfCloseTrace::pageOpen(FPDF_DOCUMENT d, int pageIndex, const char* where) {
+    if (!d) return;
+    int total = 0;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        total = ++s_trace[d].pages;
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("PAGE-OPEN  doc=%1 page=%2 tai=%3 docPageDangMo=%4")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(pageIndex)
+                   .arg(QString::fromLatin1(where))
+                   .arg(total), false);
+}
+
+void PdfCloseTrace::pageClose(FPDF_DOCUMENT d, FPDF_PAGE p, const char* where) {
+    if (!d) return;
+    int left = 0;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_trace.find(d);
+        if (it != s_trace.end() && it->pages > 0) { --it->pages; left = it->pages; }
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("PAGE-CLOSE doc=%1 p=%2 tai=%3 conLai=%4")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                   .arg(QString::fromLatin1(where))
+                   .arg(left), false);
+}
+
+void PdfCloseTrace::textOpen(FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where) {
+    if (!d) return;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        ++s_trace[d].texts;
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("TEXT-OPEN  doc=%1 tp=%2 tai=%3")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(t), 0, 16)
+                   .arg(QString::fromLatin1(where)), false);
+}
+
+void PdfCloseTrace::textClose(FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where) {
+    if (!d) return;
+    int left = 0;
+    quint64 seq;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_trace.find(d);
+        if (it != s_trace.end() && it->texts > 0) { --it->texts; left = it->texts; }
+        seq = nextSeq();
+    }
+    sink(seq, QStringLiteral("TEXT-CLOSE doc=%1 tp=%2 tai=%3 conLai=%4")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(t), 0, 16)
+                   .arg(QString::fromLatin1(where))
+                   .arg(left), false);
+}
+
+void PdfCloseTrace::note(const char* kind, const QString& detail) {
+    sink(nextSeq(), QStringLiteral("%1 %2").arg(QString::fromLatin1(kind), detail), true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [closeorder] LƯỢT 7 — SO DAY KHAI THAC. Xem giai thich trong PageCache.h.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void PdfCloseTrace::openPage(FPDF_DOCUMENT d, FPDF_PAGE p, int pageIndex, const char* where) {
+    if (!p) return;
+    const char* firstClose = nullptr;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_closedPage.constFind(p);
+        if (it != s_closedPage.constEnd()) firstClose = it.value();
+    }
+    if (firstClose)
+        // DUNG HANDLE DA DONG ⇒ chắc chắn se lam PDFium CHECK 0x80000003.
+        sink(nextSeq(), QStringLiteral("PAGE-MO-SAU-KHI-DONG doc=%1 p=%2 page=%3 tai=%4 (lanDongDau=%5)")
+                       .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                       .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                       .arg(pageIndex)
+                       .arg(QString::fromLatin1(where))
+                       .arg(QString::fromLatin1(firstClose)), true);
+    pageOpen(d, pageIndex, where);
+}
+
+void PdfCloseTrace::openTextPage(FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where) {
+    if (!t) return;
+    const char* firstClose = nullptr;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_closedText.constFind(t);
+        if (it != s_closedText.constEnd()) firstClose = it.value();
+    }
+    if (firstClose)
+        sink(nextSeq(), QStringLiteral("TEXT-MO-SAU-KHI-DONG doc=%1 tp=%2 tai=%3 (lanDongDau=%4)")
+                       .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                       .arg(reinterpret_cast<quintptr>(t), 0, 16)
+                       .arg(QString::fromLatin1(where))
+                       .arg(QString::fromLatin1(firstClose)), true);
+    textOpen(d, t, where);
+}
+
+void PdfCloseTrace::closePage(FPDF_DOCUMENT d, FPDF_PAGE p, const char* where) {
+    if (!p) return;
+    const char* firstClose = nullptr;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_closedPage.constFind(p);
+        if (it != s_closedPage.constEnd()) firstClose = it.value();
+        else                                s_closedPage.insert(p, where);
+    }
+    int rdepth = 0;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_renderDepth.find(p);
+        if (it != s_renderDepth.end()) rdepth = it.value().second;
+    }
+    pageClose(d, p, where);
+    if (firstClose) {
+        // ⛔ ĐÃ ĐÓNG RỒI. pdfium se CHECK 0x80000003 khi tha object lan hai — bo qua
+        // lenh dong (giu bang chung, khong giet tien trinh).
+        sink(nextSeq(), QStringLiteral("PAGE-CLOSE-LAI doc=%1 p=%2 tai=%3 (lanDongDau=%4) renderConTreo=%5 — BO QUA FPDF_ClosePage")
+                       .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                       .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                       .arg(QString::fromLatin1(where))
+                       .arg(QString::fromLatin1(firstClose))
+                       .arg(rdepth), true);
+        return;
+    }
+    if (rdepth)
+        sink(nextSeq(), QStringLiteral("PAGE-CLOSE renderConTreo doc=%1 p=%2 tai=%3 soLan=%4 — thieu FPDF_RenderPage_Close")
+                       .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                       .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                       .arg(QString::fromLatin1(where))
+                       .arg(rdepth), true);
+    FPDF_ClosePage(p);
+    g_pdfiumPageClose.fetchAndAddOrdered(1);
+    // ĐÃ QUA FPDF_ClosePage: thieu dong nay ⇒ chet NGAY TRONG lenh nay.
+    sink(nextSeq(), QStringLiteral("PAGE-CLOSE-XONG doc=%1 p=%2 tai=%3")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                   .arg(QString::fromLatin1(where)), false);
+}
+
+void PdfCloseTrace::closeTextPage(FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where) {
+    if (!t) return;
+    const char* firstClose = nullptr;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_closedText.constFind(t);
+        if (it != s_closedText.constEnd()) firstClose = it.value();
+        else                                s_closedText.insert(t, where);
+    }
+    textClose(d, t, where);
+    if (firstClose) {
+        sink(nextSeq(), QStringLiteral("TEXT-CLOSE-LAI doc=%1 tp=%2 tai=%3 (lanDongDau=%4) — BO QUA FPDFText_ClosePage")
+                       .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                       .arg(reinterpret_cast<quintptr>(t), 0, 16)
+                       .arg(QString::fromLatin1(where))
+                       .arg(QString::fromLatin1(firstClose)), true);
+        return;
+    }
+    FPDFText_ClosePage(t);
+    sink(nextSeq(), QStringLiteral("TEXT-CLOSE-XONG doc=%1 tp=%2 tai=%3")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(t), 0, 16)
+                   .arg(QString::fromLatin1(where)), false);
+}
+
+void PdfCloseTrace::renderOpen(FPDF_DOCUMENT d, FPDF_PAGE p, const char* where) {
+    if (!d || !p) return;
+    int n = 0;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto& v = s_renderDepth[p];
+        n = ++v.second;
+        v.first = d;
+        ++s_trace[d].renders;
+    }
+    sink(nextSeq(), QStringLiteral("RENDER-OPEN  doc=%1 p=%2 tai=%3 soLan=%4")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                   .arg(QString::fromLatin1(where))
+                   .arg(n), false);
+}
+void PdfCloseTrace::renderClose(FPDF_DOCUMENT d, FPDF_PAGE p, const char* where) {
+    if (!p) return;
+    int n = 0;
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_renderDepth.find(p);
+        if (it == s_renderDepth.end()) n = -1;          // Close ma chua co Start
+        else if (--it.value().second <= 0) s_renderDepth.erase(it);
+    }
+    {
+        QMutexLocker lk(&s_traceMutex);
+        auto it = s_trace.find(d);
+        if (it != s_trace.end() && it->renders > 0) --it->renders;
+    }
+    sink(nextSeq(), QStringLiteral("RENDER-CLOSE doc=%1 p=%2 tai=%3 conLai=%4")
+                   .arg(reinterpret_cast<quintptr>(d), 0, 16)
+                   .arg(reinterpret_cast<quintptr>(p), 0, 16)
+                   .arg(QString::fromLatin1(where))
+                   .arg(n), n < 0);
+}
+int PdfCloseTrace::renderDepth(FPDF_DOCUMENT d, FPDF_PAGE p) {
+    Q_UNUSED(d);
+    if (!p) return 0;
+    QMutexLocker lk(&s_traceMutex);
+    auto it = s_renderDepth.constFind(p);
+    return it == s_renderDepth.constEnd() ? 0 : it.value().second;
+}
+
+int PdfCloseTrace::pages(FPDF_DOCUMENT d) {
+    if (!d) return 0;
+    QMutexLocker lk(&s_traceMutex);
+    auto it = s_trace.constFind(d);
+    return it == s_trace.constEnd() ? -1 : it->pages;
+}
+int PdfCloseTrace::texts(FPDF_DOCUMENT d) {
+    if (!d) return 0;
+    QMutexLocker lk(&s_traceMutex);
+    auto it = s_trace.constFind(d);
+    return it == s_trace.constEnd() ? -1 : it->texts;
+}
+int PdfCloseTrace::liveDocs() { QMutexLocker lk(&s_traceMutex); return s_traceDocs.size(); }
+void PdfCloseTrace::reset() {
+    QMutexLocker lk(&s_traceMutex);
+    s_trace.clear(); s_traceDocs.clear();
+    s_closedPage.clear(); s_closedText.clear(); s_renderDepth.clear();
+}
 
 QMutex  PageCache::s_mutex;
 QHash<PageCache::Key, PageCache::Entry> PageCache::s_entries;
@@ -19,6 +385,15 @@ QSet<PageCache::Key>   PageCache::s_inflight;
 QHash<FPDF_DOCUMENT, quint64> PageCache::s_epoch;
 FPDF_DOCUMENT PageCache::s_activeDoc = nullptr;
 qint64 PageCache::s_totalBytes = 0;
+QSet<FPDF_DOCUMENT> PageCache::s_dead;
+
+void PageCache::documentOpened(FPDF_DOCUMENT doc) {
+    if (!doc) return;
+    QMutexLocker lk(&s_mutex);
+    if (s_dead.remove(doc))
+        qDebug().noquote() << "[pagecache] doc MO LAI doc=" << reinterpret_cast<quintptr>(doc)
+                           << "— tiep tuc phuc vu trang";
+}
 
 void PageCache::touch_locked(const Key& k) {
     s_lru.removeAll(k);
@@ -26,8 +401,20 @@ void PageCache::touch_locked(const Key& k) {
 }
 
 void PageCache::closeEntry(Entry& e) {
-    if (e.tp)   FPDFText_ClosePage(e.tp);
-    if (e.page) { FPDF_ClosePage(e.page); g_pdfiumPageClose.fetchAndAddOrdered(1); }
+    // 🔴 [closeorder] LƯỢT 7 — đây là NÚT THẮT DUY NHẤT đóng trang. Mọi thứ còn
+    // bám vào FPDF_PAGE (text page, render tiến trình) phải ĐÓNG/HUỶ Ở ĐÂY TRƯỚC,
+    // rồi mới FPDF_ClosePage — vì objdump trên pdfium.dll cho thấy CHECK 0x80000003
+    // của lượt này là `CFX_RetainablePtr::Reset()` bắt "refcount đã bằng 0", tức
+    // thả 2 lần; thả thừa 1 lần là do còn thứ giữ chặt.
+    if (e.borrow > 0 || (e.page && PdfCloseTrace::renderDepth(e.doc, e.page) > 0))
+        PdfCloseTrace::note("PAGE-NUT THAT",
+            QStringLiteral("doc=%1 p=%2 borrow=%3 renderConTreo=%4")
+                .arg(reinterpret_cast<quintptr>(e.doc), 0, 16)
+                .arg(reinterpret_cast<quintptr>(e.page), 0, 16)
+                .arg(e.borrow)
+                .arg(e.page ? PdfCloseTrace::renderDepth(e.doc, e.page) : 0));
+    if (e.tp)   PdfCloseTrace::closeTextPage(e.doc, e.tp,   "PageCache::closeEntry");
+    if (e.page) PdfCloseTrace::closePage   (e.doc, e.page, "PageCache::closeEntry");
     s_totalBytes -= e.bytes;   // SPEC_PAGECACHE_THRASH_2026-08-31: giam bo nho proxy
     e = Entry();
 }
@@ -125,15 +512,26 @@ void PageCache::sweepOrphans_locked() {
 FPDF_PAGE PageCache::loadAndRegister(FPDF_DOCUMENT doc, int pageIndex) {
     // GIA DINH: caller giu s_pdfiumMutex.
     if (!doc || pageIndex < 0) return nullptr;
+    {   // 🔴 LƯỢT 7: doc đã bị forgetDocument ⇒ TUỔI ĐỘNG, không được hồi sinh.
+        QMutexLocker lk(&s_mutex);
+        if (s_dead.contains(doc)) {
+            qWarning().noquote() << "[pagecache] TUOI doc=" << reinterpret_cast<quintptr>(doc)
+                                 << "page=" << pageIndex
+                                 << "— doc da forgetDocument, KHONG nap lai";
+            return nullptr;
+        }
+    }
     QElapsedTimer t; t.start();
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) return nullptr;
     g_pdfiumPageOpen.fetchAndAddOrdered(1);
+    PdfCloseTrace::openPage(doc, page, pageIndex, "PageCache::loadAndRegister");
     qDebug().noquote() << "[pagecache] LOAD page=" << pageIndex << "ms=" << t.elapsed();
     qDebug().noquote() << "[pageload] doc=" << reinterpret_cast<quintptr>(doc)
                        << "page=" << pageIndex << "by=cache ms=" << t.elapsed();
 
     Entry e;
+    e.doc  = doc;
     e.page = page;
     e.rot  = FPDFPage_GetRotation(page) & 3;
     e.box  = pdfBoxOrigin(page);
@@ -281,6 +679,11 @@ void PageCache::setActiveDoc(FPDF_DOCUMENT doc) {
     s_activeDoc = doc;
 }
 
+FPDF_DOCUMENT PageCache::activeDoc() {
+    QMutexLocker lk(&s_mutex);
+    return s_activeDoc;
+}
+
 FPDF_PAGE PageCache::tryAcquire(FPDF_DOCUMENT doc, int pageIndex) {
     if (!doc || pageIndex < 0) return nullptr;
     const Key k(doc, pageIndex);
@@ -293,6 +696,11 @@ FPDF_PAGE PageCache::tryAcquire(FPDF_DOCUMENT doc, int pageIndex) {
 
 FPDF_TEXTPAGE PageCache::textPage(FPDF_DOCUMENT doc, int pageIndex) {
     // GIA DINH: caller giu s_pdfiumMutex. Trang phai da co trong dem.
+    // 0927 LƯỢT 10 (--no-textpage): KHONG tao FPDF_TEXTPAGE cho TAI LIEU CHINH ⇒
+    // TextSelection (TextSelection::pageFor), MainWindow::pageHasTextSync va
+    // OcrPanel::ensureHasTextKnown deu nhan nullptr. KHONG vao vong khoa s_mutex,
+    // KHONG goi FPDFText_LoadPage ⇒ khong sinh them mot doi tuong dem-tham-chieu.
+    if (trNoTextPage()) return nullptr;
     const Key k(doc, pageIndex);
     FPDF_TEXTPAGE tp;
     {
@@ -302,6 +710,7 @@ FPDF_TEXTPAGE PageCache::textPage(FPDF_DOCUMENT doc, int pageIndex) {
         if (it->tp) return it->tp;
         tp = FPDFText_LoadPage(it->page);
         it->tp = tp;
+        PdfCloseTrace::openTextPage(doc, tp, "PageCache::textPage");
         return tp;
     }
 }
@@ -327,6 +736,24 @@ bool PageCache::metaFor(FPDF_DOCUMENT doc, int pageIndex, PageMeta& out) {
 
 void PageCache::prefetch(FPDF_DOCUMENT doc, int pageIndex) {
     if (!doc || pageIndex < 0) return;
+    // 🔴 LƯỢT 33b (J — tab nặng chặn tab mới): tab NỀN không được mượn khoá PDFium
+    // để prefetch — loadAndRegister giữ s_pdfiumMutex 1–2 s/trang nặng, chặn đúng
+    // lúc tab vừa mở cần FPDF_LoadMemDocument + trang đầu. Tab nền đứng lại; khi nó
+    // thành tab hiện hành, onPageChanged/schedulePagePrefetch lại nạp tiếp.
+    {
+        const FPDF_DOCUMENT a = activeDoc();
+        // 🔴 LƯỢT 33d (J): thêm nhánh null-activeDoc + khẩn đang chờ — khoảng trống
+        // tab mới đang mở (raw=null tới lúc open xong) là lúc cần khoá nhất; đo
+        // r33b: nền prefetch lọt qua chốt cũ đúng cửa sổ này.
+        if ((a && doc != a) || (!a && pdfiumUrgentPending())) return;
+        // 🔴 LƯỢT 33e (mục 5 — J): cửa sổ "trang đầu đang chờ ảnh" (g_pdfiumUrgentPage
+        // do mở tab đặt, xóa lúc ACCEPT) — prefetch trang KHÔNG phải trang khẩn đứng
+        // lại lượt này. Đo r33d: lượt LoadPage của prefetch chen giữa cửa sổ f2 vừa
+        // mở xong, đúng lúc raster trang 0 của f2 cần khoá.
+        const int up = g_pdfiumUrgentPage().load(std::memory_order_acquire);
+        if (up >= 0 && pageIndex != up && QDateTime::currentMSecsSinceEpoch()
+            <= g_pdfiumUrgentPageDeadline().load(std::memory_order_acquire)) return;
+    }
     const Key k(doc, pageIndex);
     quint64 capturedEpoch = 0;
     {
@@ -337,7 +764,15 @@ void PageCache::prefetch(FPDF_DOCUMENT doc, int pageIndex) {
         capturedEpoch = s_epoch.value(doc);
         s_inflight.insert(k);
     }
-    QtConcurrent::run([doc, pageIndex, capturedEpoch] {
+    // 🔴 0928 LƯỢT 22 (reviewer mục 2): token ĐĂNG KÝ LÚC SPAWN (thread gọi
+    // prefetch — thường là UI) rồi RAII move vào lambda. Bản cũ đăng ký trong
+    // thân task ⇒ beginClose thấy 0 khi task còn xếp hàng ⇒ doc đóng, prefetch
+    // chạy với `doc` đã free.
+    trdoc::Task task(doc, "PageCache::prefetch");
+    // 0928 LƯỢT 14: prefetch là task nền mượn trang của doc qua
+    // loadAndRegister() nhưng QFuture bị bỏ rơi ⇒ không chờ được. Token sổ
+    // đảm nhiệm: close() chờ nó về 0 trước FPDF_CloseDocument.
+    QtConcurrent::run([task = std::move(task), doc, pageIndex, capturedEpoch] {
         TimedPdfiumLock pdf(__FILE__, __LINE__);
         {
             QMutexLocker lk(&PageCache::s_mutex);
@@ -413,6 +848,9 @@ void PageCache::forgetDocument(FPDF_DOCUMENT doc) {
     int closed = 0;
     QMutexLocker lk(&s_mutex);
     s_epoch.remove(doc);
+    // 🔴 LƯỢT 7: đánh dấu "doc đã bị dọn" — acquire/loadAndRegister/prefetch từ
+    // đây trở đi KHÔNG được nạp trang của doc này nữa (xem s_dead ở PageCache.h).
+    s_dead.insert(doc);
     // Go pin cua doc nay TRUOC (R1 muc 5)— khong giu con tro sau khi dong handle.
     for (auto it = s_pinOrder.begin(); it != s_pinOrder.end(); ) {
         if (it->first == doc) it = s_pinOrder.erase(it);
@@ -457,9 +895,36 @@ void PageCache::forgetDocument(FPDF_DOCUMENT doc) {
     }
     qDebug().noquote() << "[pagecache] forgetDocument doc=" << reinterpret_cast<quintptr>(doc)
                        << "entries=" << closed;
+    // [closeorder] 0927 LƯỢT 2: cùng thông tin nhưng vào FILE BANG CHUNG + có tid.
+    // `conMuonLon=` > 0 ⇒ còn người đang giữ FPDF_PAGE của doc này lúc
+    // FPDF_CloseDocument chạy ⇒ đúng cái CHECK 0x80000003.
+    PdfCloseTrace::note("FORGET-DOC",
+        QStringLiteral("doc=%1 daDong=%2 conMuonLon=%3 taiLieuDangSong=%4")
+            .arg(reinterpret_cast<quintptr>(doc), 0, 16)
+            .arg(closed)
+            .arg(PdfCloseTrace::pages(doc))
+            .arg(PdfCloseTrace::liveDocs()));
 }
 
 int PageCache::size() {
     QMutexLocker lk(&s_mutex);
     return s_entries.size();
+}
+
+// 🔴 LƯỢT 27 (săn rò): doc so handle còn SỐNG trong PageCache mà KHONG cham
+// s_pdfiumMutex. doomed + orphan > 0 sau khi docMo=0 ⇒ FPDF_PAGE của tab đã đóng
+// chưa được FPDF_ClosePage (ro handle). deadDocs = số doc đã forgetDocument.
+int PageCache::doomedCount() {
+    QMutexLocker lk(&s_mutex);
+    int n = 0;
+    for (const Entry& e : s_entries) if (e.doomed) ++n;
+    return n;
+}
+int PageCache::orphanCount() {
+    QMutexLocker lk(&s_mutex);
+    return s_orphans.size();
+}
+int PageCache::deadDocCount() {
+    QMutexLocker lk(&s_mutex);
+    return s_dead.size();
 }

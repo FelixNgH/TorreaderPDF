@@ -2,6 +2,7 @@
 #include "AnnotationManager.h"
 #include "../core/PdfCoords.h"
 #include "../core/PageCache.h"
+#include "../core/Bisect.h"
 #include <fpdf_edit.h>
 #include <fpdf_text.h>
 #include <QString>
@@ -301,7 +302,9 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         float r = static_cast<float>(qMax(pa.x(), pb.x()));
         float t = static_cast<float>(qMax(pa.y(), pb.y()));
 
-        FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+        // 0927 LƯỢT 10 (--no-textpage): bo qua text page ⇒ highlight ve theo /Rect
+        // (nhanh `hasQuads` cu o :306 van chay, chi khong co QuadPoints tu ky tu).
+        FPDF_TEXTPAGE textPage = trNoTextPage() ? nullptr : FPDFText_LoadPage(page);
         bool hasQuads = false;
         if (textPage) {
             int charCount = FPDFText_CountChars(textPage);
@@ -344,7 +347,10 @@ void AnnotationLayer::commitAnnotation(int pageIndex, AnnotTool tool, const Anno
         // ponytail: guard against degenerate rect — min 6pt height, skip if near-zero area
         float rw = r - l, rh = t - b;
         if (rw < 1.0f && rh < 1.0f) {
-            FPDFText_ClosePage(textPage);
+            // 🔴 0927 LƯỢT 7: `textPage` ĐÃ đóng ở trên (ngay sau khối `if (textPage)`).
+            // Đóng lần hai ở đây = thả handle PDFium 2 lần ⇒ đúng loại CHECK
+            // 0x80000003 mà objdump chỉ ra ở pdfium RVA 0x1754b
+            // (CFX_RetainablePtr::Reset() bắt "refcount đã bằng 0").
             m_lastCreatedIndex = -1;
             m_lastCreatedSnapshot = AnnotSnapshot();
             FPDFPage_CloseAnnot(annot);

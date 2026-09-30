@@ -7,6 +7,7 @@
 #include <QTextStream>
 #include <QDir>
 #include <QLineEdit>
+#include <QWidget>
 
 // Chan log phim/IME tam cho QLineEdit khi TORREADER_KEYLOG=1 — khong anh huong
 // ban phat hanh (mac dinh tat). Ghi vao %TEMP%\torreader_keylog.txt (app GUI,
@@ -65,8 +66,11 @@ private:
     QFile m_f;
 };
 
-// Cai probe len mot QLineEdit. Khong lam gi ca khi thieu TORREADER_KEYLOG.
-inline void installKeylogProbe(QLineEdit* edit) {
+// Cai probe len mot widget bat ky (QLineEdit, QPlainTextEdit...). Khong lam gi ca
+// khi thieu TORREADER_KEYLOG. 0927 LƯỢT 3: doi QLineEdit* thanh QWidget* de
+// ô nhieu dong (FreeText) cung duoc probe — SPEC đề 1 yeu cau giu probe cho
+// ô moi. QWidget::installEventFilter la virtual, nen moi widget deu nhan duoc.
+inline void installKeylogProbe(QWidget* edit) {
     if (!edit || qEnvironmentVariableIsEmpty("TORREADER_KEYLOG")) return;
     auto* probe = new KeylogProbe(edit);
     edit->installEventFilter(probe);

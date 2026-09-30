@@ -2,6 +2,7 @@
 #include "PdfCoords.h"
 #include "PageCache.h"
 #include "PdfiumLock.h"
+#include "DocTaskGate.h"
 #include <fpdf_doc.h>
 #include <fpdf_edit.h>
 #include <QtConcurrent>
@@ -128,7 +129,11 @@ void PdfLinks::requestPage(FPDF_DOCUMENT doc, int pageIndex) {
         ep = s_epoch;
     }
 
-    QtConcurrent::run([doc, pageIndex, k, ep] {
+    // 🔴 0928 LƯỢT 22 (reviewer mục 2): token đăng ký LÚC SPAWN, RAII move vào
+    // lambda — beginClose thấy cả task còn xếp hàng.
+    // 0928 LƯỢT 14: computePage() mượn trang qua PageCache, QFuture bị bỏ rơi.
+    trdoc::Task task(doc, "PdfLinks::requestPage");
+    QtConcurrent::run([task = std::move(task), doc, pageIndex, k, ep] {
         QVector<PdfLink> links;
         PdfLinks::PageInfo info;
         {
@@ -137,7 +142,8 @@ void PdfLinks::requestPage(FPDF_DOCUMENT doc, int pageIndex) {
             TimedPdfiumLock lk(__FILE__, __LINE__);
             {
                 QMutexLocker ck(&PdfLinks::s_mutex);
-                if (ep != PdfLinks::s_epoch || !PdfLinks::s_pending.contains(k)) {
+                if (ep != PdfLinks::s_epoch || !PdfLinks::s_pending.contains(k)
+                    || task.cancelled()) {
                     PdfLinks::s_pending.remove(k);
                     return;
                 }

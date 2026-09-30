@@ -16,6 +16,7 @@
 #include <fpdf_annot.h>
 
 class QPainter;
+class QFontMetricsF;
 
 // ── FreeText: MOT cong thuc duy nhat cho ca HAI view ( PdfGpuView +
 // ContinuousView) ───────────────────────────────────────────────────────────
@@ -25,6 +26,48 @@ class QPainter;
 // DejaVu (giong /AP) va mot le/wrap — lech la chu nhay khi doi che do.
 QFont trDejaVuFontAtPixelSize(double px);
 QRectF trFreeTextFitRect(const QRectF& dispRect, const QString& text, float fontSizePt);
+
+// Lề trái-phải mà /AP đặt chữ (x = apPad trong lệnh Td đầu). Ô tự nóng dùng
+// ĐÚNG số này để suy ra số dòng ⇒ số dòng trên màn hình LUÔN bằng số dòng
+// trong /AP. Đổi hằng này là đổi cả hai cùng lúc — không tách.
+constexpr double kTrFreeTextWrapPad = 4.0;
+
+// Hàm ngắt dòng cho FreeText CỦA TA. Một hàm, một nguồn sự thật: ô tự nóng
+// (trFreeTextFitRect) VÀ mọi đường dựng /AP (createInlineNote_locked, kể cả
+// đường đi qua rebuildTextNote/retextNote) đều gọi nó ⇒ màn hình và file lệch
+// nhau. Tách cứng theo ‘\n’, ngắt mềm theo wrapW tại dấu cách, từ quá dài
+// thì ngắt theo ký tự. Cùng QFontMetricsF với /AP (trDejaVuFontAtPixelSize).
+QStringList trWrapFreeText(const QString& text, double wrapW, const QFontMetricsF& fm);
+
+// Chuẩn hoá xuống dòng cho /Contents: ghi \r (quy ước Acrobat cho
+// FreeText) ⇒ đọc ra chuẩn hoá về ‘\n’ (để màn hình + overlay
+// + trWrapFreeText cùng thấy đúng dòng).
+QString trContentsToCr(const QString& text);
+QString trUnescapeContents(const QString& text);
+
+// 🔎 0927 LUOT 7: SO DO khop khung FreeText NGOAI, do TOI /AP DA LUU DOC LAI
+// (khong dung so tinh luc dung). Harness --ftngoai-edit-probe goi ham nay de in
+// rectBefore/rectAfter/maxLineW/innerW/textH/innerH/clipped.
+// `annotIndex` < 0 ⇒ tu do FreeText dau tien tren trang. Khuong do duoc
+// (khong tim thay /Rect, /BBox hoac noi dung) ⇒ ok=false, cac truong = 0.
+struct ForeignApFit {
+    bool   ok = false;
+    double rectBefore[4] = {0, 0, 0, 0};
+    double rectAfter[4]  = {0, 0, 0, 0};
+    double maxLineW = 0.0;
+    double innerW   = 0.0;
+    double textH    = 0.0;
+    double innerH   = 0.0;
+    int    nLines   = 0;
+    int    clipped  = 0;
+    double fontSize = 0.0;
+    double lead     = 0.0;
+    double bboxH    = 0.0;
+    double bboxY0   = 0.0;
+    QString reason;      // ly do khuong do duoc
+};
+bool trMeasureForeignApFit(const QString& path, int pageIndex, int annotIndex,
+                           ForeignApFit* out);
 void   drawFreeTextOverlay(QPainter& p, const QRectF& dRect, const QString& text,
                            float fontSizePt, double zoom, const QColor& penColor);
 
@@ -39,6 +82,7 @@ struct AnnotInfo {
     QColor  color;
     bool isDraft = false;
     QString uid;
+    bool isOwn = false;   // có /TRUID hoặc /TRID ⇒ annot CỦA TA (xem isOwnAnnot)
 };
 
 Q_DECLARE_METATYPE(AnnotInfo)
@@ -105,8 +149,17 @@ class AnnotationManager : public QObject {
 public:
     explicit AnnotationManager(QObject* parent = nullptr);
     ~AnnotationManager() override;
+    // 🔴 0929 LƯỢT 33h: phần nặng của dtor (flush pending gen + PageCache::forgetDocument
+    // trên doc CHÍNH) chạy trên LUỒNG NỀN (closeJob) TRƯỚC khi doc->close(); ~AnnotationManager
+    // gọi lại → no-op (guard). bản thân mgr là QObject affinity UI ⇒ chết TRÊN UI.
+    void shutdownHeavy();
 
     void setDocument(FPDF_DOCUMENT doc, const QString& filePath);
+    // 0928 LƯỢT 14: đọc FPDF_DOCUMENT để task nền gọi mgr (loadAllStreaming /
+    // loadPageVisuals / loadPage) cầm token trdoc::Task — close() chờ token về 0
+    // trước FPDF_CloseDocument. KHÔNG tự thêm getter này thì task nền phải chốt
+    // doc bên ngoài, dễ sót tab.
+    FPDF_DOCUMENT document() const { return m_doc; }
 
     // Read all annotations from one page (fast, called per-page).
     // outOk (optional): when provided, loadPage MUST NOT block the GUI — it uses
@@ -125,8 +178,14 @@ public:
     void loadAllStreaming(int pageCount, int startPage = 0);
 
     // Read annotations as overlay visuals for one page.
+    // 🔴 LƯỢT 33e (mục 1): `aborted` — BO DE VIEN (tab nen / khoa ban / trang hong),
+    // KHONG phai ket qua that. Ben goi PHAI vui tam, KHONG duoc ghi cache — danh sach
+    // rong bi cache la loi mat markup khi tab quay lai (reviewer 33d loi 1).
     QList<AnnotVisual> loadPageVisuals(int page, bool* outOverlayCapable,
-                                       bool* hasForeign = nullptr);
+                                       bool* hasForeign = nullptr,
+                                       bool* aborted = nullptr,
+                                       bool* unloadable = nullptr,
+                                       bool heavyPage = false);
 
     // Build one AnnotVisual from an already-open annot. Returns false if not overlay-drawable.
     // Caller must hold s_pdfiumMutex and have `page` open.
@@ -145,9 +204,8 @@ public:
                           QColor textColor = Qt::black,
                           float fontSize = 11.0f);
 
-    // Update the Contents string of an existing annotation in place.
-    // Saves the document to disk.
-    bool updateNote(int pageIndex, int annotIndex, const QString& newText);
+    // A4 (0921): updateNote da bi XOA HAN — ma chet (khong noi goi nao) va ghi /Contents
+    // vao BAT KY annot nao roi tu saveDocument(). Khong con trong API.
 
     bool removeAnnot(int pageIndex, int index);
     int removeNotePageObjects(int pageIndex, unsigned int noteId);
@@ -179,6 +237,24 @@ public:
 
     // Annot cua TorReader co TRUID (moi) hoac TRID (note cu). Khong co ca hai = cua phan mem khac.
     bool isOwnAnnot(int pageIndex, int index);
+
+    // ── VIỆC 1 (0921): MỘT CỬA DUY NHẤT cho mọi đường GHI vào annot ──────────
+    // Trước 0921, quyền sở hữu chỉ là vài chốt rải rác theo từng hàm; vòng chấm
+    // độc lập tìm ra 9 đường ghi khác nhau chạm vào annot của phần mềm khác. Từ
+    // đây, MỌI hàm ghi phải gọi guardWrite(...) TRƯỚC lệnh ghi đầu tiên.
+    //   • annot có /TRUID hoặc /TRID  ⇒ CỦA TA ⇒ cho qua mọi loại ghi.
+    //   • annot không có cả hai        ⇒ CỦA PHẦN MỀM KHÁC ⇒ TỪ CHỐI, trừ:
+    //       – Delete: owner chốt "backup rồi xoá" (caller có trách nhiệm backup);
+    //       – Contents: 🔴 0927 LƯỢT 6 (SPEC 0927 BƯỚC 2) MỞ KHOÁ cho GUI —
+    //         FreeText / FreeTextCallout ngoài sửa được qua chuột phải →
+    //         "Edit text…". An toàn vì retextNote() nhánh ngoài KHÔNG xoá
+    //         annot: chỉ ghi /Contents + /TR_AP_REBUILD, /AP được vá lúc
+    //         save (rebuildForeignFreeTextAp) với /TR_AP_ORIG +
+    //         /TR_CONTENTS_ORIG ghi đúng MỘT lần. Style/Rect/Geometry
+    //         (nhánh default) vẪN TỪ CHỐI; Ink/Square/Line/PolyLine không
+    //         có đường sửa chữ nên không bao giờ đi qua đây.
+    enum class AnnotWrite { Contents, Style, Rect, Geometry, Delete, Uid };
+    bool guardWrite(int pageIndex, int index, AnnotWrite what, QString* whyNot = nullptr);
 
     // Dem so annot tren mot trang (nhanh hon loadPage vi khong parse tung cai).
     int annotCount(int pageIndex);
@@ -223,6 +299,49 @@ public:
     void flushAllPendingGenerate();
 
     bool saveDocument();
+    // 📐 NẤC 1 (0921): vá `/AP/N` cho FreeText NGOÀI (không TRUID) đã đánh dấu
+    // `/TR_AP_REBUILD`. QPDF lưu `/AP` gốc vào `/TR_AP_ORIG` và `/RC` gốc vào
+    // `/TR_RC_ORIG`, thay khối text bằng bản DejaVu ngắt dòng lại, xoá `/RC`.
+    // Trả về số annot đã vá (>=0), hoặc -1 nếu có annot cần vá mà không vá được
+    // (mất font / không parse được /AP / lỗi QPDF / ghi tệp) — khi đó save phải thất bại.
+    // 🔴 0927 LƯợT 2: vá `/AP` cho FreeText CỦA TA — `FPDFAnnot_SetAP`
+    // trá false (PDFium bug #1381) ⇒ file lưu ra không có `/AP`, không renderer
+    // độc lập nào vẽ được chủ. Nội dung `/AP` ghi tạm vào sidecar
+    // `.traownap` để QPDF dựng lại `/AP/N` thật lúc save. Trả số đã vá,
+    // -1 = có trang cần vá mà không vá được (save phải thát bại).
+    int patchOwnNoteAp(const QString& path);
+    int rebuildForeignFreeTextAp(const QString& path);
+    // 🔴 P1 (0921): đường HOÀN TÁC — PHẠM VI: trả `/AP/N` từ `/TR_AP_ORIG`,
+    // `/Contents` từ `/TR_CONTENTS_ORIG`, `/RC` từ `/TR_RC_ORIG`. KHÔNG phải hoàn tác
+    // thẳng: vật thể neo font DejaVu trong nội dung trang vẫn còn. Trả false + đặt
+    // m_lastError nếu thiếu khoá gốc hoặc ghi tệp thất bại (tệp giữ nguyên).
+    bool restoreForeignAp(int pageIndex, int index);
+
+    // ── VIỆC 3-A3 (0921): "backup rồi xoá" cho annot NGOÀI ────────────────────
+    // Owner chốt: vẫn cho xoá annot phần mềm khác, nhưng phải sao lưu nguyên vẹn để
+    // Ctrl+Z dựng lại BYTE-BẰNG (mọi khoá + stream: /AP, /Contents, /RC, /Rect, hình
+    // học, khoá riêng). Cách làm: flush trạng thái in-memory xuống m_path rồi CHÉP
+    // NGUYÊN TỆP ra sidecar; lúc hoàn tác, QPDF trích đúng object annot từ sidecar và
+    // chèn lại vào /Annots (deep-copy giữ nguyên stream). Trả đường dẫn sidecar, hoặc
+    // rỗng nếu không sao lưu được (khi đó người gọi PHẢI TỪ CHỐI xoá).
+    QString backupAnnotForDelete(int pageIndex, int index);
+    // Dựng lại annot từ sidecar vào đúng vị trí `insertAt`. Thao tác ở tầng QPDF trên
+    // m_path (tự flush trước). Trả false + m_lastError nếu hỏng (tệp giữ nguyên).
+    bool restoreAnnotFromBackup(int pageIndex, int insertAt, const QString& backupPath);
+    // Xoá sidecar sau khi dùng xong.
+    void discardAnnotBackup(const QString& backupPath);
+
+    // ⚠️ 0927 LƯỢT 6: KHÔNG còn cần bật để sửa FreeText ngoài từ GUI (đã mở
+    // khoá chính thức ở guardWrite/retextNote). Giữ lại setter + cờ để
+    // harness cũ `--ftngoai-ap` và các ca đo 21/09 chạy tiếp được; cờ KHÔNG
+    // còn thay đổi hành vi nào. Chỉ còn `m_allowTestStampUid` là công tắc
+    // thật (harness mô phỏng annot CỦA TA; GUI không bao giờ bật).
+    void setAllowForeignFreeTextEdit(bool on) { m_allowForeignFreeTextEdit = on; }
+    // ⚠️ CHỈ harness: cho phép `setAnnotUid` ghi /TRUID lên annot CHƯA có uid, để mô
+    // phỏng "annot của ta" trong phép thử âm/dương. GUI KHÔNG BAO GIỜ bật; mặc định
+    // false ⇒ trong sản phẩm, setAnnotUid vẫn TỪ CHỐI annot ngoài. Đây không phải
+    // đường sản phẩm nên không tính là "cửa sau" của luật sở hữu.
+    void setAllowTestStampUid(bool on) { m_allowTestStampUid = on; }
     QString lastError() const { return m_lastError; }
     QString lastCreatedUid() const { return m_lastCreatedUid; }
     int lastCreatedIndex() const { return m_lastCreatedIndex; }
@@ -245,6 +364,16 @@ private:
 
     // ⚠️ _locked: caller must hold s_pdfiumMutex and have `page` open.
     // No lock, no LoadPage/ClosePage, no GenerateContent, no emit.
+    // VIỆC 1: bản _locked của guardWrite — KHÔNG tự lấy khoá (tránh deadlock khi
+    // gọi từ trong vùng đã khoá). Dùng cho các helper _locked có lệnh ghi PDFium.
+    bool guardWrite_locked(FPDF_ANNOTATION annot, AnnotWrite what, QString* whyNot = nullptr);
+    // 0927 LUOT 6 (VIEC 1) - moc 1 object chu " " bang font DejaVu vao noi dung
+    // trang de PDFium NHUNG font khi save. Bat buoc cho MOI duong danh dau
+    // /TR_AP_REBUILD (retextNote VA setAnnotContents): rebuildForeignFreeTextAp()
+    // goi findDejaVuFont(page); trang chua tung co FreeText cua ta thi /Resources
+    // khong co DejaVu => save that bai. Giu khoa m_apAnchorPages nen moi trang
+    // chi moc MOT lan. GOI khi da giu s_pdfiumMutex + da mo trang.
+    void ensureDejaVuFontAnchor_locked(FPDF_PAGE page, int pageIndex);
     int  removeNotePageObjects_locked(FPDF_PAGE page, unsigned int noteId);
     int  translateNotePageObjects_locked(FPDF_PAGE page, int pageIndex,
                                          unsigned int noteId, double dx, double dy);
@@ -272,9 +401,33 @@ private:
 
     std::atomic<bool> m_stopScan{false};
     std::atomic<bool> m_userBusy{false};
+    bool              m_heavyShutdown = false;   // L33h: shutdownHeavy đã chạy (idempotent)
     QHash<int, quint32> m_pageRev;
     QSet<int> m_pendingGenerate;
     QSet<int> m_pendingGen;                  // trang co page object doi, chua sinh noi dung
+    bool      m_hasForeignApEdits = false;   // co FreeText ngoai cho vá /AP luc save
+    // 🔴 0927 LƯỢT 2: FreeText CỦA TA cũng cần vá /AP ở tầng FILE.
+    // Đo được 27/09: FPDFAnnot_SetAP trả FALSE (log `[inote] SetAP returned=false`,
+    // apLenAfter=2) ⇒ /AP KHÔNG bao giờ vào file ⇒ PyMuPDF/khác không thấy chữ.
+    // Cùng lý do PDFium bug #1381 mà NẤC 1 đã gặp với FreeText ngoài. Ta ghi
+    // /TR_AP_OWN_PEND + lưu nội dung /AP vào sidecar, lúc save thì QPDF dựng
+    // /AP/N thật rồi XOÁ khoá tạm (file sạch, không rò khoá nội bộ).
+    QSet<int> m_apOwnPending;                // trang co FreeText cua ta can va /AP
+    bool      m_ownApFailed = false;         // co trang va /AP that bai ⇒ save that bai
+    // 🔴 0927 LƯỢT 3 — SỬA GỐC RỄ (đo 27/09, đây là lý do probe treo 60 s và
+    // out.pdf bị 2928 byte = y hệt tệp gốc). Sidecar ".traownap" từng là nguồn
+    // /AP DUY NHẤT cho patchOwnNoteAp, nhưng nó được ghi theo `m_path` lúc TẠO
+    // annot (= tệp gốc) và đọc theo `m_path` lúc SAVE (= bản nhập trong %TEMP%)
+    // ⇒ hai đường dẫn KHÁC NHAU ⇒ file sidecar không bao giờ tồn tại ⇒
+    // patchOwnNoteAp trả -1 ⇒ saveDocument false ⇒ onSaveFile bật QMessageBox
+    // MODAL ⇒ probe bơm processEvents nên treo vô hạn. Sidecar vẫn giữ làm
+    // bản ghi phục (crash giữa chừng), nhưng nguồn sự thật lúc vá là bộ nhớ này.
+    // key = "page:trid" — cùng khoá với dòng sidecar.
+    QHash<QString, QByteArray> m_ownApInMem; // /AP (nguyên byte) cho từng annot CUA TA
+    QHash<QString, QSizeF>     m_ownApBox;   // kích thước ô (w,h) theo /BBox cần
+    bool      m_allowForeignFreeTextEdit = false;  // 0927 L6: da GOI (GUI mo khoa), giu lai cho harness
+    bool      m_allowTestStampUid = false;         // chi harness bat; de mo phong annot cua ta
+    QSet<int> m_apAnchorPages;               // trang da dat moc neo font DejaVu
     QHash<QPair<int,quint32>, QVector<int>> m_noteObjIdxCache;
 
     // Livelock fix (2026-08-31): dem so lan tryLock truot LIEN TIEP theo trang cho

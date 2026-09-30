@@ -1,5 +1,7 @@
 #include "VectorLayer.h"
 #include "PageCache.h"
+#include "Bisect.h"
+#include "PdfiumLock.h"   // 0928: logKhoaSlice (ghi moi lat giu khoa >= 50 ms)
 #include <fpdf_edit.h>
 #include <fpdf_transformpage.h>
 #include <fpdfview.h>
@@ -8,6 +10,7 @@
 #include <QElapsedTimer>
 #include <QDebug>
 #include <QDataStream>
+#include <QTransform>
 #include <QVarLengthArray>
 #include <QThread>
 #include <QCoreApplication>
@@ -27,11 +30,18 @@ extern QMutex s_pdfiumMutex;
 // Dung hinh KHONG tang theo do dai lat (vi luong chinh khong con doi khoa pdfium o
 // giai doan nay nua), nen chon lat du dai de build nhanh ma van con nhuong dinh ky.
 // Chinh theo luot bang bien moi truong TORREADER_VECTOR_SLICE_MS.
+//
+// 🔴 0928 LƯỢT 13: doi mac dinh 250 -> 40 ms. Do lau, muc tieu cua CEO la
+// "khong lat nao giu khoa > 100 ms"; 250 ms lat no cat qua nhung ke do (log
+// khoachung: [lockwait] ms= 2905 cho trang DANG XEM). Lat ngan hon = trang dang
+// xem vao duoc khoa som hon, tong thoi gian build thay doi khong dang ke
+// (do o tren: 100ms -> 5295ms so voi 250ms -> 3992ms, cham hon 33% nhung chi
+// cong thêm ~1,3 s tren MOT trang; dem 114 trang = 143 s nen do la thu yeu).
 static int vecSliceMsFromEnv() {
     static const int v = [] {
         bool ok = false;
         int p = qgetenv("TORREADER_VECTOR_SLICE_MS").toInt(&ok);
-        int r = (ok && p > 0) ? p : 250;
+        int r = (ok && p > 0) ? p : 40;
         qDebug().noquote() << "[vector] sliceMs=" << r;
         return r;
     }();
@@ -71,15 +81,48 @@ void VectorLayer::clear() {
 
 // ── Serialize .torvec (SPEC_PERF_HEAVYPAGE) ────────────────────────────────
 // Dinh dang: tat ca little-endian, ghi thang khong nen. Magic 8 byte
-// "TORVEC01" + quint32 formatVersion(=1) + cac truong vo huong + cac mang POD.
+// "TORVEC01" + quint32 formatVersion(=2) + cac truong vo huong + cac mang POD.
 // KHONG ghi m_uid: uid la MOI moi lan nap (uid dinh danh the hien trong phien,
 // khong phai du lieu cache). Anh tile ghi theo TUNG DONG (constScanLine +
 // bytesPerLine) — KHONG gia dinh stride hai ben bang nhau.
 namespace {
 const char   kTorvecMagic[9] = "TORVEC01";   // 8 byte + NUL
-const quint32 kTorvecVersion = 1;
+const quint32 kTorvecVersion = 2;
 
 constexpr qint64 kRawChunk = 1 << 20;
+
+// LUOT 38: FPDFImageObj_GetBitmap() BO QUA ma tran doi tuong (xem fpdf_edit.h).
+// Anh dat bang ma tran co xoay (PDF24: JPEG goc 90 do) se bi ep sai huong thanh
+// vach doc. Ham nay tra goc can xoay NOI DUNG anh cho khop hop bao truc rectPt:
+//   0 = khong xoay, 1 = xoay CCW 90, 2 = 180, 3 = xoay CW 90, -1 = khong truc chuan.
+// Goc duoc xac dinh bang goc nao cua anh (theo toa do hien thi, y xuong) roi vao
+// goc TRAI-TREN cua hop bao. det < 0 (co lat guong) khong the xoay => -1.
+static int imageMatrixQuadrant(const FS_MATRIX& m, double originX, double topY) {
+    // Truong hop pho bien: anh chi scale duong, khong xoay -> giu nguyen native.
+    if (m.a > 0.0 && std::fabs(m.b) < 1e-9 && std::fabs(m.c) < 1e-9 && m.d > 0.0)
+        return 0;
+    const double det = m.a * m.d - m.b * m.c;
+    if (det <= 0.0) return -1;   // suy bien hoac lat guong (khong xoay duoc)
+    auto vx = [&](double u, double v) { return m.a * u + m.c * v + m.e - originX; };
+    auto vy = [&](double u, double v) { return topY - (m.b * u + m.d * v + m.f); };
+    // Anh: hang 0 (tren) ung v = 1. Goc theo unit square.
+    const double xTL = vx(0, 1), yTL = vy(0, 1);
+    const double xTR = vx(1, 1), yTR = vy(1, 1);
+    const double xBL = vx(0, 0), yBL = vy(0, 0);
+    const double xBR = vx(1, 0), yBR = vy(1, 0);
+    const double minX = qMin(qMin(xTL, xTR), qMin(xBL, xBR));
+    const double minY = qMin(qMin(yTL, yTR), qMin(yBL, yBR));
+    const double span = std::fabs(m.a) + std::fabs(m.b) + std::fabs(m.c) + std::fabs(m.d) + 1.0;
+    const double eps = 1e-4 * span;
+    auto at = [&](double x, double y) {
+        return std::fabs(x - minX) <= eps && std::fabs(y - minY) <= eps;
+    };
+    if (at(xTL, yTL)) return 0;
+    if (at(xTR, yTR)) return 1;   // CCW 90
+    if (at(xBR, yBR)) return 2;   // 180
+    if (at(xBL, yBL)) return 3;   // CW 90
+    return -1;                    // khong truc chuan (shear/xoay le)
+}
 
 bool wrRaw(QIODevice& dev, const char* p, qint64 n) {
     qint64 done = 0;
@@ -345,8 +388,32 @@ static bool pointInTri(const QPointF& p, const QPointF& a, const QPointF& b, con
     return !(neg && pos);
 }
 
-bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
+bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex,
+                        const std::function<bool()>& shouldCancel) {
     clear();
+    // 0927 LƯỢT 10 (--no-vector): KHONG dung lop vector. Day la PHAI DUY NHAT cho
+    // ca 3 noi goi (MainWindow::buildVectorLayer :2109/:4440/:5093/:6289,
+    // ContinuousView::ensureVectorLayers :1737, buildPrimaryVectorLayer :1835) ⇒
+    // khong con 41 lenh FPDFPage_*/FPDFTextObj_* nao cua lop vector.
+    if (trNoVector()) return false;
+    // 🔴 LƯỢT 33b (J): tab NỀN không dựng vector — build giữ s_pdfiumMutex theo lát,
+    // giành với tab vừa mở. Trang nền sẽ dựng lại khi tab thành hiện hành.
+    {
+        const FPDF_DOCUMENT a = PageCache::activeDoc();
+        // 🔴 LƯỢT 33d (J): thêm nhánh null-activeDoc + khẩn chờ (như render/scan/
+        // prefetch) — cửa sổ tab mới ĐANG mở là lúc build nền phải đứng lại.
+        if (doc && ((a && doc != a) || (!a && pdfiumUrgentPending()))) {
+            qDebug().noquote() << "[vector] build BO page=" << pageIndex
+                               << "reason=tab-nen";
+            return false;
+        }
+    }
+    // 0928: huy TRUOC khi xin khoa — trang da bi bo roi thi khong duoc bat dau.
+    if (shouldCancel && shouldCancel()) {
+        qDebug().noquote() << "[vector] build HUY som page=" << pageIndex
+                           << "reason=stale-truoc-khoa";
+        return false;
+    }
     QElapsedTimer t;
     t.start();
     // Ben goi KHONG duoc giu s_pdfiumMutex; ham nay tu khoa va NHA theo lat.
@@ -357,7 +424,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     if (_w.elapsed() > 300)
         qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
                            << "at VectorLayer::build acquire" << "main="
-                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
+                           << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0)
+                           << "trang=" << pageIndex;
     FPDF_PAGE page = PageCache::acquire(doc, pageIndex);
     if (!page) return false;
     // R1: cap doi acquire() — tu dong release o moi duong thoat (return som giua chung).
@@ -700,7 +768,21 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
     QElapsedTimer sliceTimer; sliceTimer.start();
     for (int oi = 0; oi < nObj; ++oi) {
         if (sliceTimer.elapsed() >= kVecSliceMs) {
+            const qint64 _held = sliceTimer.elapsed();
             lk.reset();                     // nha s_pdfiumMutex
+            logKhoaSlice(_held, "VectorLayer::build", pageIndex);
+            // 🔴 0928 LƯỢT 13 — RACH LAT LA RANH GIOI HUY. Sau khi nha khoa thi
+            // hoi `shouldCancel`: trang da khong con la trang nguoi dung xem
+            // ⇒ BO ngan, khong lan thu xep lai vao hang doi khoa. Do la thu goc
+            // cua 17 giay: 26 trang nguoi dung da luot qua (349..324) deu xay
+            // "build BAT DAU" va giu khoa 0,5-7 s moi trang TRONG KHI trang
+            // dang xem cho 2905 ms (log khoachung_nhay239.txt).
+            if (shouldCancel && shouldCancel()) {
+                qDebug().noquote() << "[vector] build HUY page=" << pageIndex
+                                   << "sau=" << oi << "/" << nObj << "doi tuong"
+                                   << "ms=" << t.elapsed();
+                return false;   // PageBorrow + QMutexLocker tu nha theo pham vi
+            }
             // NGU 1ms chu khong yield: QMutex khong cong bang (barging), yield xong ta lay
             // lai khoa ngay va ke dang xep hang van doi mai (da DO: yields=13 ma luong chinh
             // van cho 3556ms). Ngu that moi nhuong duoc.
@@ -710,7 +792,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             if (_w.elapsed() > 300)
                 qDebug().noquote() << "[lockwait] ms=" << _w.elapsed()
                                    << "at VectorLayer::build slice" << "main="
-                                   << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0);
+                                   << ((QThread::currentThread() == QCoreApplication::instance()->thread()) ? 1 : 0)
+                                   << "trang=" << pageIndex;
             sliceTimer.restart();
             ++dbgYields;
         }
@@ -888,6 +971,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
             FPDF_BITMAP bmp = nullptr;
             bool fromNative = false;
             bool rbUsed = false;
+            bool haveMtx = false;   // da doc duoc ma tran doi tuong
+            int  rotQuad = -1;   // goc xoay NOI DUNG anh theo ma tran doi tuong
             {
                 // Do phan giai cua GetRenderedBitmap bam theo ma tran doi tuong (co tren trang).
                 // Anh mat na bi thu nho nhieu lan => alpha loang => chu nhat. Tam phong ma tran
@@ -901,6 +986,8 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                     }
                     FS_MATRIX om{};
                     const bool haveM = FPDFPageObj_GetMatrix(obj, &om) != 0;
+                    haveMtx = haveM;
+                    if (haveM) rotQuad = imageMatrixQuadrant(om, originX, topY);
                     rb = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
                     if (rb && haveM && natW > 0 && natH > 0) {
                         const int rw0 = FPDFBitmap_GetWidth(rb);
@@ -936,6 +1023,18 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                     bmp = rb;
                     rbUsed = true;
                     ++imgsMasked;
+                } else if (haveMtx && rotQuad < 0) {
+                    // Ma tran doi tuong khong truc chuan (xoay le/shear/lat): GetBitmap
+                    // bo qua ma tran nen pixel goc se sai huong -> giu rb da ap ma tran.
+                    if (rb) {
+                        bmp = rb;
+                        fromNative = false;
+                    } else {
+                        bmp = FPDFImageObj_GetBitmap(obj);
+                        fromNative = (bmp != nullptr);
+                        if (fromNative) ++imgsNative; else ++imgsFallback;
+                        if (!bmp) bmp = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                    }
                 } else {
                     if (rb) FPDFBitmap_Destroy(rb);
                     bmp = FPDFImageObj_GetBitmap(obj);
@@ -958,6 +1057,15 @@ bool VectorLayer::build(FPDF_DOCUMENT doc, int pageIndex) {
                             FPDFBitmap_GetStride(bmp), qfmt);
                 TextTile tile;
                 tile.img = view.convertToFormat(QImage::Format_ARGB32);
+                if (fromNative && rotQuad > 0) {
+                    // Anh goc chua xoay: xoay NOI DUNG cho khop hop bao truc rectPt
+                    // (chu khong xoay khung). 90/270 = hoan vi w/h => het ep meo.
+                    QTransform tf;
+                    if (rotQuad == 1)      tf.rotate(-90.0);   // CCW 90
+                    else if (rotQuad == 2) tf.rotate(180.0);
+                    else                   tf.rotate(90.0);    // CW 90
+                    tile.img = tile.img.transformed(tf);
+                }
                 {   // DO: ghi 2 anh dau tien co mat na ra file de doi chieu mau
                     static int _nd = 0;
                     static const QByteArray _dd = qgetenv("TORREADER_FBDUMP");

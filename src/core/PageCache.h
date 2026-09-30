@@ -6,6 +6,7 @@
 #include <QList>
 #include <QSet>
 #include <QPair>
+#include <QString>
 #include <fpdfview.h>
 #include <fpdf_text.h>
 
@@ -108,6 +109,9 @@ public:
     // Doc dang hien hanh (tab dang xem) — duoi cache uu tien doc KHONG hien hanh truoc.
     // MainWindow goi khi doi tab. Doc null = khong co tab nao (het cache, duoi tu do).
     static void setActiveDoc(FPDF_DOCUMENT doc);
+    // 🔴 LƯỢT 33b (J): doc dang hien hanh de viec NEN (prefetch/vector/annot scan)
+    // tu huy khi khong phai tab dang xem — mot chot doc, khong ghi de.
+    static FPDF_DOCUMENT activeDoc();
 
     // CHI doc dem, KHONG nap. Dung o duong giao dien / di chuot. Khoa mutex noi bo
     // cua cache (khong cham s_pdfiumMutex). Tra nullptr neu trang chua co.
@@ -131,6 +135,15 @@ public:
     static qint64 totalBytes();   // bai do bo nho
     static int    entryCount();
 
+    // 🔴 LƯỢT 27 (săn rò): sổ handle còn SỐNG thật, đọc được khi KHÔNG giu
+    // s_pdfiumMutex (chi khoa s_mutex noi bo). doomed = entry cho dong con borrow>0
+    // (forgetDocument/invalidate danh dau ma CHUA FPDF_ClosePage); orphan = entry da
+    // tach khoi map doi borrow ve 0; deadDocs = doc da forgetDocument (s_dead).
+    // Khong lech = moi FPDF_PAGE cua doc dong tab deu duoc FPDF_ClosePage that.
+    static int doomedCount();
+    static int orphanCount();
+    static int deadDocCount();
+
     // Sửa MARKUP (thêm/xoá/sửa annot): FPDFPage_CreateAnnot/RemoveAnnot sửa TRỰC TIẾP
     // đối tượng trang mà FPDF_PAGE trong cache đang trỏ tới ⇒ handle vẫn hợp lệ và đã phản
     // ánh thay đổi (SPEC_MARKUP_FIX_2026-08-31). Chỉ tăng bộ đếm thế hệ annot cho (doc,page)
@@ -149,6 +162,12 @@ public:
 
     static int size();
 
+    // [closeorder] 0927 LƯỢT 7: doc vừa được MỞ LẠI (sau FPDF_LoadDocument) thì bỏ
+    // cờ "đã ngưng phục vụ" của PageCache. Điểm neo là PdfCloseTrace::docOpen — mọi
+    // lần mở doc trong app đều đi qua đó, nên cờ KHÔNG bao giờ bị sót (địa chỉ
+    // FPDF_DOCUMENT thường được dùng lại ngay sau FPDF_CloseDocument).
+    static void documentOpened(FPDF_DOCUMENT doc);
+
     // Thong tin trang dem duoc (tu Entry da nap) — tra false neu trang chua co.
     struct PageMeta {
         int     rot = 0;
@@ -160,6 +179,7 @@ public:
 private:
     using Key = QPair<FPDF_DOCUMENT, int>;
     struct Entry {
+        FPDF_DOCUMENT doc  = nullptr; // [closeorder] doc chu so huu FPDF_PAGE/tp (de in log)
         FPDF_PAGE     page = nullptr;
         FPDF_TEXTPAGE tp   = nullptr;
         int           rot  = 0;
@@ -189,5 +209,77 @@ private:
     static QList<Key> s_pinOrder;                 // thu tu pin (cu o dau) de bo pin cu nhat
     static QSet<Key>  s_inflight;                 // prefetch dang cho/chay
     static QHash<FPDF_DOCUMENT, quint64> s_epoch; // doc con song; remove khi forgetDocument
+    // 🔴 [closeorder] LƯỢT 7: doc ĐÃ bị forgetDocument. Trước đây `loadAndRegister`
+    // ghi `s_epoch.insert(doc, …)` vô điều kiện ⇒ MỘT TÀI LIỆU ĐÃ ĐÓNG LẠI ĐƯỢC
+    // "hồi sinh": acquire() nạp trang mới, trang đó không còn ai đóng (forgetDocument
+    // đã chạy xong) và sống tới khi FPDF_CloseDocument giật object dưới chân nó ⇒
+    // lần FPDF_ClosePage sau đó thả object đã có refcount = 0 ⇒ CHECK 0x80000003
+    // (đúng lệnh `int3` tại RVA 0x1754b mà objdump chỉ ra trong pdfium.dll).
+    static QSet<FPDF_DOCUMENT> s_dead;            // xem documentOpened()
     static FPDF_DOCUMENT s_activeDoc;             // doc cua tab dang xem
+};
+
+// ── [closeorder] 0927 LƯỢT 2: SO THU TU DONG TAI LIEU ────────────────────────
+// Crash PDFium 0x80000003 (CHECK/__debugbreak) luc dong tai lieu eYACHO. De doc
+// thu tu THAT tren may that, dem FPDF_DOCUMENT / FPDF_PAGE / FPDF_TEXTPAGE /
+// FPDF_ANNOTATION con SONG theo tung doc va in `[closeorder]` o MOI diem goi
+// PDFium tren duong dong tai lieu. LƯỢT 2 them:
+//   • ghi them ra FILE RIENG %TEMP%\torreader_closeorder.log, FLUSH TUNG DONG
+//     (log chinh co the mat dong cuoi khi tien trinh chet giua chung);
+//   • in `tid=` (ma luong) — lan truoc chi biet THU TU, khong biet luong nao chet;
+//   • DOC-CLOSE tach TRUOC (…-BEGIN) va SAU (…-DONE) lenh FPDF_CloseDocument;
+//   • FORM-BEFORECLOSE / FORM-EXIT / ANNOT-CLOSE / LIB-DESTROY (xem note()).
+//
+// CHI LOG — khong doi hanh vi gi, khong giu khoa PDFium, khong bao gio goi nguoc
+// lai PageCache (la nut gi, giu PageCache::s_mutex thi an toan). Tat khi
+// `TORREADER_CLOSEORDER=0` thi CHI dem, khong in log chinh (mac dinh: in);
+// file rieng LUON ghi du khi tat vi no la bang chung.
+class PdfCloseTrace {
+public:
+    static void docOpen      (FPDF_DOCUMENT d, const char* where);
+    static void docCloseBegin(FPDF_DOCUMENT d, const char* where);  // TRUOC FPDF_CloseDocument
+    static void docCloseDone (FPDF_DOCUMENT d, const char* where);  // SAU  FPDF_CloseDocument
+    static void pageOpen     (FPDF_DOCUMENT d, int pageIndex, const char* where);
+    static void pageClose    (FPDF_DOCUMENT d, FPDF_PAGE p, const char* where);
+    static void textOpen     (FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where);
+    static void textClose    (FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where);
+    // Su kien bat bien co ten (FORM-BEFORECLOSE / FORM-EXIT / ANNOT-CLOSE /
+    // LIB-DESTROY / WAIT-ANNOT …) — dung cho lenh khong gan duoc vao mot doc.
+    static void note         (const char* kind, const QString& detail);
+
+    // ── [closeorder] 0927 LƯỢT 7: SO DAY KHAI THAC + PHAT HIEN THA LAI ──────────
+    // Bằng chứng máy test: `objdump` trên chính `third_party/pdfium/bin/pdfium.dll`
+    // (MAJOR=151 MINOR=0 BUILD=7906) cho thấy ngoại lệ 0x80000003 nổ đúng tại RVA
+    // 0x1754b = lệnh `int3` trong hàm CFX_RetainablePtr::Reset():
+    //     mov 0x8(%rcx),%rax ; test %rax,%rax ; je <int3 @0x1754b>
+    // tức là "thả một object có refcount ĐÃ BẰNG 0" = giải phóng lần hai. Nó chỉ
+    // được gọi từ destructor ảo của lớp 104 byte giữ 2 CFX_RetainablePtr — tức
+    // bên trong `FPDF_ClosePage` khi trang bị thả. ⇒ LƯỢT 2-6 đếm PAGE-OPEN ==
+    // PAGE-CLOSE nhưng CHỈ trên tập site ĐÃ truy vết; các `FPDF_ClosePage` khác
+    // trong app KHÔNG được đếm ⇒ cân bằng đó không đủ để loại trừ "đóng 2 lần".
+    // Sửa ở đây: SỔ KHAI THÁC toàn cục + đóng CÓ KIỂM so "đã đóng chưa".
+    //   • `closePage` / `closeTextPage` là ĐƯỜNG ĐÓNG DUY NHÁT — mọi FPDF_ClosePage
+    //     / FPDFText_ClosePage trong app phải đi qua đây (thiếu = sổ sai).
+    //   • Đóng handle đã đóng ⇒ in `PAGE-CLOSE-LAI` / `TEXT-CLOSE-LAI` kèm nơi
+    //     đóng LẦN ĐẦU, rồi BỎ QUA lệnh đóng (pdfium CHECK giết tiến trình, mất
+    //     sạn bằng chứng; bỏ qua thì lỗi vẫn còn nhưng app không chết).
+    //   • Mở handle đã đóng ⇒ in `PAGE-MO-SAU-KHI-DONG` (dùng sau khi đóng).
+    static void closePage    (FPDF_DOCUMENT d, FPDF_PAGE p, const char* where);
+    static void closeTextPage(FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where);
+    static void openPage     (FPDF_DOCUMENT d, FPDF_PAGE p, int pageIndex, const char* where);
+    static void openTextPage (FPDF_DOCUMENT d, FPDF_TEXTPAGE t, const char* where);
+    // Render tiến trình (FPDF_RenderPageBitmap_Start ... _Close) trên trang nào —
+    // ứng viên (a) lượt 7. Số >0 lúc đóng trang = quên FPDF_RenderPage_Close.
+    static void renderOpen  (FPDF_DOCUMENT d, FPDF_PAGE p, const char* where);
+    static void renderClose (FPDF_DOCUMENT d, FPDF_PAGE p, const char* where);
+    static int  renderDepth (FPDF_DOCUMENT d, FPDF_PAGE p);
+
+    // Handle da tung duoc FPDF_ClosePage / FPDFText_ClosePage (nullptr = chua).
+
+    // So handle con SONG cua doc (tru chinh no). 0 = sach => moi FPDF_CloseDocument
+    // an toan. Doc xong ma doc da bi xoa khoi dem => tra -1 (khong con the dem).
+    static int  pages (FPDF_DOCUMENT d);
+    static int  texts (FPDF_DOCUMENT d);
+    static int  liveDocs();
+    static void reset();
 };

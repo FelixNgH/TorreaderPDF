@@ -18,6 +18,7 @@
 #include <QList>
 #include <QPair>
 #include <fpdf_progressive.h>
+#include "DocTaskGate.h"
 #include "PdfDocument.h"
 #include "TileCacheFile.h"
 
@@ -48,16 +49,24 @@ private:
     PdfDocument*                 m_pdfDoc = nullptr;
     RenderRequest                m_req;
     std::shared_ptr<QAtomicInt>  m_genRef;
+    // 🔴 0928 LƯỢT 22: token ĐĂNG KÝ TRONG CTOR (thread spawn — UI), không chờ
+    // run() — pool bão hoà thì task xếp hàng, beginClose phải thấy nó.
+    trdoc::Task                  m_task;
 };
 
 struct ProgressivePauseCtx {
     QElapsedTimer timer;
     static int sliceMsFromEnv();
     int sliceMs = sliceMsFromEnv();
+    // 0928 LƯỢT 23 (DO): PDFium khong bao tien do ve. Mot lan NeedToPauseNow = mot
+    // ranh gioi object cua page, nen so lan dem = luong object lat do "an" xong.
+    // Duoc [lat] in ra de so lap 1 vs lap 2 tren CUNG mot trang.
+    int checks = 0;
 };
 
 inline FPDF_BOOL ProgressiveNeedToPauseNow(IFSDK_PAUSE* pThis) {
     auto* ctx = static_cast<ProgressivePauseCtx*>(pThis->user);
+    ++ctx->checks;
     return ctx->timer.elapsed() >= ctx->sliceMs;
 }
 
@@ -86,6 +95,9 @@ private:
     double                       m_renderScale = 0.0;
     QImage                       m_image;
     QElapsedTimer                m_lastEmitTimer;
+    // 🔴 0928 LƯỢT 22: token ĐĂNG KÝ TRONG CTOR (luồng UI, trước pool->start) —
+    // beginClose thấy cả task còn xếp hàng trong pool.
+    trdoc::Task                  m_task;
     double scaleFactor() const { return m_renderScale; }
 };
 
@@ -113,6 +125,8 @@ private:
     bool                        m_hideOwnAnnots = false;
     FPDF_PAGE                   m_fpdfPage = nullptr;
     FPDF_BITMAP                 m_bmp = nullptr;
+    // 🔴 0928 LƯỢT 22: token ĐĂNG KÝ TRONG CTOR (luồng UI, trước pool->start).
+    trdoc::Task                 m_task;
     int                         m_bmpW = 0;
     int                         m_bmpH = 0;
     int                         m_renderStatus = FPDF_RENDER_READY;
@@ -172,6 +186,11 @@ public:
     void requestTiles(int page, double scale, QRect viewportPx);
     void preloadAdjacent(int pageIndex, double scale);
 void cancelPending();
+    // 0927 LƯỢT 8: CHỜ pool render/thumbnail XONG, có hạn. Phải gọi SAU cancelPending():
+    // task kiểm tra generation ở đầu mỗi slice (~50 ms) nên cắt gần như tức thì, kể cả
+    // trang nặng 14 s. Trả false = hết giờ mà vẫn còn task; lúc đó KHÔNG được đóng
+    // tài liệu (xem MainWindow::shutdownTab).
+    bool waitIdle(int ms);
     // Huy RIENG cac lenh render che do lien tuc dang chay (khong dong toi thumbnail,
     // preload hay tile). Dung khi nguoi dung cuon sang trang khac: viec cu thanh vo nghia.
     void cancelContinuous();
@@ -193,10 +212,35 @@ void cancelPending();
     // MainWindow goi khi lop vector cua trang do ready+complete (suppress=true) va khi
     // lop bi bo / trang doi / build that bai (suppress=false).
     void setSuppressFullQuality(int pageIndex, bool suppress);
+    // 🔴🔴 0928 LƯỢT 22b (reviewer mục 2): gọi TRÊN LUỒNG UI, trước khi closeJob
+    // đẩy `delete t` (⇒ ~PdfRenderer) xuống nền. Con của renderer gồm
+    // QFutureWatcher<void>(this) (1508/1569/1928) + sự kiện Queued
+    // invokeMethod(this,...) (1847/1871) thuộc LUỒNG UI — nếu còn sống khi
+    // ~PdfRenderer chạy ở nền, Qt huỷ object ngay lúc UI đang giao event
+    // ⇒ UAF. Ở đây: cờ closing (chặn spawn mới) + xoá watcher + removePostedEvents.
+    void prepareForClose();
+    // 🔴🔴 0929 LƯỢT 33h (dump r33g): ~PdfRenderer (waitIdle + closeHandlePool ×12
+    // FPDF_CloseDocument) là phần NẶNG nhưng KHÔNG đụng máy móc QObject/event queue.
+    // Chạy nó trên LUỒNG NỀN (closeJob) để UI không đứng hình; ~PdfRenderer gọi lại
+    // → no-op (guard m_heavyShutdown). Renderer (QObject, affinity UI) sau đó mới bị
+    // `delete` TRÊN UI ⇒ hết cảnh ~QObject ở nền đua giao event trên UI (UAF).
+    void shutdownHeavy();
+    bool isClosing() const { return m_closing.load(std::memory_order_acquire); }
     void clearStalePending();
     void clearCache();
     void invalidatePage(int pageIndex);
     void setCurrentPage(int page);
+    // 🔴 LƯỢT 31 (A3 + B5 — reviewer bắt): cửa sổ TRANG ĐANG HIỂN trong Continuous
+    // (first..last). evictCache BẢO VỆ MỌI trang trong [first-2, last+2] (không chỉ
+    // m_currentPage) và đuổi theo KHOẢNG CÁCH tới cửa sổ. Single: view gọi
+    // setCurrentPage (window = [page,page]). Continuous: ContinuousView gọi đây mỗi
+    // lần cuộn. Mặc định (-1,-1) = chưa biết → fallback m_currentPage.
+    void setViewportRange(int first, int last) {
+        m_vpFirst.store(first, std::memory_order_relaxed);
+        m_vpLast.store(last,   std::memory_order_relaxed);
+    }
+    // 0928: trang nào đang có quyền ưu tiên khoá PDFium (đọc được từ luồng nền).
+    int urgentPage() const { return m_urgentPage.load(std::memory_order_acquire); }
     void setTileCache(std::shared_ptr<TileCacheFile> cache);
     void requestRegion(int pageIndex, double scale, QRect regionPx);
     // Like requestPage but only checks memory/disk cache — emits pageReady if hit,
@@ -266,6 +310,12 @@ void cancelPending();
     // Doi theo luot: TORREADER_CONT_DPI=<n>. Mac dinh 150.
     static qint64 globalCacheBytes();   // bai do bo nho
     qint64        tabCacheBytes() const;      // bo dem anh cua RIENG tab nay
+    // 🔴 LƯỢT 30 (VIỆC 1 — DO, nghi phạm A): soi kho POOL doc. probePoolInfo đếm
+    // slot từng vẽ; probeCloseOneIdlePoolDoc đóng MỘT doc RẢNH (không borrow) để
+    // caller đo commit delta = bộ nhớ doc đó đang giữ. Trả false khi không còn doc rảnh.
+    QString probePoolInfo() const;
+    bool    probeCloseOneIdlePoolDoc();
+    int     probeIdlePoolCount() const;   // so doc rảnh co the dong (de lap vong)
     static int    contDpi();
     // So pixel canh dai KY VONG cho mot trang o DPI hien hanh. MOT nguon su that duy nhat —
     // dung cho ca luc RENDER, luc GHI dem va luc DOC dem. Truoc day 3 cho dung 3 cong thuc
@@ -327,9 +377,19 @@ private:
     struct PooledHandle {
         FPDF_DOCUMENT doc = nullptr;
         bool inUse = false;
+        // 🔴 LƯỢT 30 (VIỆC 1 — DO, nghi phạm A): một CPDF_Document khi đã vẽ trang
+        // nào thì GIỮ object cache/stream đã giải mã của trang đó tới lúc nó bị đóng.
+        // everUsed/renders cho biết có bao nhiêu doc đang tích dữ liệu như vậy.
+        bool everUsed = false;
+        int  renders  = 0;
     };
     std::vector<PooledHandle> m_handlePool;
     mutable QMutex m_handlePoolMutex;
+    // 0927 LƯỢT 2: FPDF_DOCUMENT của pool CHƯA đóng được (còn thợ đang mượn) thì
+    // GIỮ LẠI ở đây, KHÔNG quăng bỏ. ~PdfRenderer chờ task xong rồi đóng nốt —
+    // bỏ rơi thì handle đó sống hoài trên buffer mmap đã unmap và làm
+    // FPDF_DestroyLibrary gặp CHECK.
+    QList<FPDF_DOCUMENT> m_orphanPoolDocs;
     // 🔴 2026-08-31: 3 la QUA IT. Do duoc: ~18 tho cung tranh (m_thumbPool 8 luong tren may
     // 16 nhan + m_mainPool 4 + kMaxContinuousRenders 6) ma chi co 3 handle => phan lon phai
     // lui ve s_pdfiumMutex => van NOI TIEP nhu cu, do la vi sao thumbnail lau nhat van ~9,6s.
@@ -340,6 +400,8 @@ private:
     // rang them handle la "re" vi chung vung nho mmap — thuc te PDFium dung CAU TRUC RIENG cho
     // moi handle. 12 handle x 2 tab = 24 ban => no RAM. 4 la du de render song song ma khong phinh.
     static constexpr int kPoolSize = 12;  // moc TOT owner xac nhan 31/08
+    // 0928 LƯỢT 24: A/B qua env TORREADER_POOL_SIZE (doc 1 luc khoi dong, kep 1..12,
+    // mac dinh van 12 — xem poolSize() trong PdfRenderer.cpp).
     // 🔴 HAN MUC RIENG CHO THUMBNAIL (2026-08-31). Da THU va THAT BAI khi khong co han muc:
     // dung san 75 thumbnail cung luc thi chung chiem SACH 12 handle, render trang bi day ve
     // o khoa chung => thumbnail TB 247 -> 1.796 ms, lau nhat 5.250 -> 17.135 ms, so thumbnail
@@ -378,6 +440,15 @@ private:
 
     qint64         m_cacheBytes  = 0;
     int            m_currentPage = 0;
+    // 🔴 LƯỢT 31 (A3): cửa sổ viewport cho evictCache. -1 = chưa biết.
+    std::atomic<int> m_vpFirst{-1};
+    std::atomic<int> m_vpLast{-1};
+    // 🔴 0928 LƯỢT 13: trang đang HIỂN THỊ (đọc được từ luồng render nên phải
+    // atomic — `m_currentPage` chỉ an toàn trên luồng giao diện). Trang này có
+    // quyền ưu tiên khoá PDFium: thumbnail/OCR thấy nó thì nhường (xem
+    // `UrgentPdfiumScope` trong core/PdfiumLock.h). Đây là hàng chờ nhiều mức
+    // rút gọn: mức 0 = trang này, mức 1 = prefetch, mức 2 = thumbnail/OCR.
+    std::atomic<int> m_urgentPage{-1};
     int            m_lastTilePage  = -1;
     double         m_lastTileScale = 0.0;
     int            m_regionInFlightPage = -1;
@@ -385,6 +456,8 @@ private:
     QRect          m_regionInFlightRect;
     std::shared_ptr<TileCacheFile> m_tileCache;
     QSet<int>                   m_writingCache;      // pages currently being written to disk cache
+    std::atomic<bool>           m_closing{false};    // L22b: prepareForClose đã chạy — đừng post thêm
+    bool                        m_heavyShutdown = false;  // L33h: shutdownHeavy đã chạy (idempotent)
 
     // Tile cache for light pages (heavy pages skip tiles entirely)
     static constexpr int        kTileSize       = 512;

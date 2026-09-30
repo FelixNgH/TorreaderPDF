@@ -2,6 +2,7 @@
 #include "OwnAnnotHideGuard.h"
 #include "PageCache.h"
 #include "PdfiumLock.h"
+#include "Bisect.h"
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QMutex>
@@ -96,6 +97,8 @@ bool ForeignAnnotLayer::build(FPDF_DOCUMENT doc, int pageIndex, int maxPx) {
     m_ready = false;
     m_page  = pageIndex;
     m_img   = QImage();
+    // 0927 LƯỢT 10 (--no-fgn): KHÔNG dựng lớp bù — trả false TRƯỚC khi đụng PDFium.
+    if (trNoFgn()) return false;
     if (!doc || maxPx <= 0) return false;
     QElapsedTimer tTotal; tTotal.start();
 
@@ -219,6 +222,8 @@ bool ForeignAnnotLayer::buildRegion(FPDF_DOCUMENT doc, int pageIndex,
     m_regScale = scale;
     m_regRect  = regionPx;
     m_regImg   = QImage();
+    // 0927 LƯỢT 10 (--no-fgn): KHÔNG dựng vùng bù — trả false TRƯỚC khi đụng PDFium.
+    if (trNoFgn()) return false;
     if (!doc || scale <= 0.0 || regionPx.width() <= 0 || regionPx.height() <= 0) return false;
 
     const qint64 px = qint64(regionPx.width()) * qint64(regionPx.height());
