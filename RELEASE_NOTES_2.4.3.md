@@ -3,6 +3,16 @@
 A stability release for working with several large drawings at once — heavy CAD sheets, MEP sets
 of a few hundred megabytes, and many tabs open side by side.
 
+## Smoother mouse interaction
+
+Selecting markups, scrolling and zooming stay fluid on dense CAD drawings — no more long pauses
+while a heavy page is being drawn.
+
+## Fixes for rotated drawings and closing tabs
+
+- Drawings on pages rotated by 90° now show their images the right way up.
+- Closing a file tab no longer crashes the app.
+
 ## Tabs
 
 - Closing a tab no longer crashes the app, including while a very dense page is still being drawn.
